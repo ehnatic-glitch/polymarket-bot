@@ -1,8 +1,9 @@
+from flask import Flask
 import requests
 
-def test_internet():
-    r = requests.get("https://example.com", timeout=10)
-    return r.status_code
+app = Flask(__name__)
 
-if __name__ == "__main__":
-    print("Status:", test_internet())
+@app.route("/")
+def home():
+    r = requests.get("https://example.com", timeout=10)
+    return f"Status: {r.status_code}"
