@@ -101,6 +101,48 @@ def markets_top():
 
     return jsonify(simplified)
 
+@app.route("/events")
+def events():
+    # Základné parametre s rozumnými defaultmi
+    limit = request.args.get("limit", "10")
+    order = request.args.get("order", "volume24hr")
+    active = request.args.get("active", "true")
+    closed = request.args.get("closed", "false")
+
+    params = {
+        "limit": limit,
+        "order": order,
+        "active": active,
+        "closed": closed,
+    }
+
+    url = f"{GAMMA_BASE}/events"
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+
+    simplified = []
+    for e in data:
+        markets = e.get("markets") or []
+        simplified.append({
+            "title": e.get("title"),
+            "slug": e.get("slug"),
+            "active": e.get("active"),
+            "closed": e.get("closed"),
+            "volume": e.get("volume"),
+            "volume24hr": e.get("volume24hr"),
+            "liquidity": e.get("liquidity"),
+            "startDate": e.get("startDate"),
+            "endDate": e.get("endDate"),
+            "marketsCount": len(markets),
+        })
+
+    return jsonify({
+        "count": len(simplified),
+        "params": params,
+        "events": simplified,
+    })
+
 
 @app.route("/events")
 def events():
