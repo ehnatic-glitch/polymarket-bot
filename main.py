@@ -32,22 +32,18 @@ def health():
 
 @app.route("/markets")
 def markets():
+    # Čítame query parametre z URL, napr. /markets?limit=20&order=volume24hr
+    limit = request.args.get("limit", "10")
+    order = request.args.get("order", "volume24hr")
+    active = request.args.get("active", "true")
+    closed = request.args.get("closed", "false")
+
     params = {
-        "limit": request.args.get("limit", 10),
-        "offset": request.args.get("offset", 0),
-        "order": request.args.get("order", "volume"),
-        "ascending": request.args.get("ascending", "false"),
-        "active": request.args.get("active", "true"),
-        "closed": request.args.get("closed", "false"),
+        "limit": limit,
+        "order": order,
+        "active": active,
+        "closed": closed,
     }
-
-    slug = request.args.get("slug")
-    if slug:
-        params["slug"] = slug
-
-    tag_id = request.args.get("tag_id")
-    if tag_id:
-        params["tag_id"] = tag_id
 
     url = f"{GAMMA_BASE}/markets"
     r = requests.get(url, params=params, timeout=20)
@@ -57,7 +53,6 @@ def markets():
     simplified = []
     for m in data:
         simplified.append({
-            "id": m.get("id"),
             "question": m.get("question"),
             "slug": m.get("slug"),
             "active": m.get("active"),
@@ -68,15 +63,13 @@ def markets():
             "endDate": m.get("endDate"),
             "outcomes": m.get("outcomes"),
             "outcomePrices": m.get("outcomePrices"),
-            "enableOrderBook": m.get("enableOrderBook")
         })
 
     return jsonify({
         "count": len(simplified),
         "params": params,
-        "markets": simplified
+        "markets": simplified,
     })
-
 
 @app.route("/markets/top")
 def markets_top():
