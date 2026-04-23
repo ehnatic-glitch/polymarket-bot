@@ -1,6 +1,7 @@
 from flask import Flask, jsonify, request
 import requests
 import json
+from datetime import datetime, timezone
 
 app = Flask(__name__)
 
@@ -15,7 +16,6 @@ def home():
             "/health",
             "/markets",
             "/markets/top",
-            "/events",
             "/dashboard",
             "/analyze-market",
         ]
@@ -49,9 +49,200 @@ def parse_json_list(value):
     return []
 
 
+def parse_date(date_str):
+    if not date_str:
+        return None
+    try:
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def get_yes_no_prices(market):
+    prices = parse_json_list(market.get("outcomePrices"))
+
+    yes_price = None
+    no_price = None
+
+    if len(prices) >= 2:
+        yes_price = to_float(prices[0], None)
+        no_price = to_float(prices[1], None)
+    elif len(prices) == 1:
+        yes_price = to_float(prices[0], None)
+        no_price = (1 - yes_price) if isinstance(yes_price, (int, float)) else None
+    else:
+        best_bid = to_float(market.get("bestBid"), None)
+        best_ask = to_float(market.get("bestAsk"), None)
+
+        if isinstance(best_bid, (int, float)):
+            yes_price = best_bid
+        if isinstance(best_ask, (int, float)):
+            no_price = 1 - best_ask
+
+    return yes_price, no_price
+
+
+def score_market(m):
+    score = 0
+    notes = []
+
+    liquidity = to_float(m.get("liquidity"))
+    volume24hr = to_float(m.get("volume24hr"))
+    yes_price, no_price = get_yes_no_prices(m)
+    question = (m.get("question") or "").lower()
+    end_date = parse_date(m.get("endDate"))
+
+    if liquidity > 250000:
+        score += 3
+        notes.append("high_liquidity")
+    elif liquidity > 100000:
+        score += 2
+        notes.append("good_liquidity")
+    elif liquidity > 50000:
+        score += 1
+        notes.append("ok_liquidity")
+    else:
+        score -= 3
+        notes.append("thin_liquidity")
+
+    if volume24hr > 500000:
+        score += 3
+        notes.append("high_volume")
+    elif volume24hr > 100000:
+        score += 2
+        notes.append("good_volume")
+    elif volume24hr > 25000:
+        score += 1
+        notes.append("ok_volume")
+    else:
+        score -= 2
+        notes.append("low_volume")
+
+    if isinstance(yes_price, (int, float)):
+        if 0.15 <= yes_price <= 0.85:
+            score += 2
+            notes.append("balanced_price")
+        elif yes_price < 0.10 or yes_price > 0.90:
+            score -= 3
+            notes.append("extreme_price")
+        elif yes_price < 0.15 or yes_price > 0.85:
+            score -= 1
+            notes.append("stretched_price")
+    else:
+        score -= 2
+        notes.append("missing_price")
+
+    if end_date:
+        now = datetime.now(timezone.utc)
+        days_to_end = (end_date - now).total_seconds() / 86400
+
+        if 3 <= days_to_end <= 180:
+            score += 1
+            notes.append("good_time_window")
+        elif days_to_end < 1:
+            score -= 3
+            notes.append("too_close_to_expiry")
+        elif days_to_end < 3:
+            score -= 2
+            notes.append("close_to_expiry")
+        elif days_to_end > 365:
+            score -= 2
+            notes.append("too_far_expiry")
+    else:
+        days_to_end = None
+        score -= 1
+        notes.append("missing_end_date")
+
+    noise_keywords = [
+        "up or down",
+        "5 minutes",
+        "hourly",
+        "today",
+        "this week",
+        "daily",
+        "minute",
+        "opens up or down",
+    ]
+    if any(k in question for k in noise_keywords):
+        score -= 3
+        notes.append("noise_market")
+
+    sports_keywords = [
+        "world cup",
+        "nba finals",
+        "mlb",
+        "nfl",
+        "champions league",
+        "stanley cup",
+    ]
+    if any(k in question for k in sports_keywords):
+        score -= 2
+        notes.append("sports_hype_risk")
+
+    ambiguity_keywords = [
+        "called by",
+        "out by",
+        "any country leave",
+        "military clash",
+    ]
+    if any(k in question for k in ambiguity_keywords):
+        score -= 2
+        notes.append("possible_ambiguity")
+
+    if score >= 5:
+        flag = "WATCH"
+    elif score >= 2:
+        flag = "MAYBE"
+    else:
+        flag = "PASS"
+
+    return {
+        "candidateScore": score,
+        "flag": flag,
+        "notes": notes,
+        "yesPrice": yes_price,
+        "noPrice": no_price,
+        "daysToEnd": days_to_end,
+    }
+
+
+def build_market_row(m):
+    scored = score_market(m)
+
+    return {
+        "question": m.get("question"),
+        "slug": m.get("slug"),
+        "active": m.get("active"),
+        "closed": m.get("closed"),
+        "volume": m.get("volume"),
+        "volume24hr": m.get("volume24hr"),
+        "liquidity": m.get("liquidity"),
+        "endDate": m.get("endDate"),
+        "outcomes": parse_json_list(m.get("outcomes")),
+        "outcomePrices": parse_json_list(m.get("outcomePrices")),
+        "bestBid": m.get("bestBid"),
+        "bestAsk": m.get("bestAsk"),
+        "lastTradePrice": m.get("lastTradePrice"),
+        "candidateScore": scored["candidateScore"],
+        "flag": scored["flag"],
+        "notes": scored["notes"],
+        "yesPrice": scored["yesPrice"],
+        "noPrice": scored["noPrice"],
+        "daysToEnd": scored["daysToEnd"],
+    }
+
+
+def flag_priority(flag):
+    if flag == "WATCH":
+        return 0
+    if flag == "MAYBE":
+        return 1
+    return 2
+
+
 @app.route("/markets")
 def markets():
-    limit = int(request.args.get("limit", "10"))
+    limit = int(request.args.get("limit", "20"))
     active = request.args.get("active", "true")
     closed = request.args.get("closed", "false")
 
@@ -66,45 +257,31 @@ def markets():
     r.raise_for_status()
     data = r.json()
 
-    filtered = []
+    rows = []
     for m in data:
-        volume24hr = to_float(m.get("volume24hr"))
-        liquidity = to_float(m.get("liquidity"))
-        outcome_prices = parse_json_list(m.get("outcomePrices"))
-        outcomes = parse_json_list(m.get("outcomes"))
-
         if m.get("active") is not True:
             continue
         if m.get("closed") is True:
             continue
-        if volume24hr <= 0:
-            continue
-        if liquidity <= 0:
-            continue
 
-        filtered.append({
-            "question": m.get("question"),
-            "slug": m.get("slug"),
-            "active": m.get("active"),
-            "closed": m.get("closed"),
-            "volume": m.get("volume"),
-            "volume24hr": m.get("volume24hr"),
-            "liquidity": m.get("liquidity"),
-            "endDate": m.get("endDate"),
-            "outcomes": outcomes,
-            "outcomePrices": outcome_prices,
-            "bestBid": m.get("bestBid"),
-            "bestAsk": m.get("bestAsk"),
-            "lastTradePrice": m.get("lastTradePrice"),
-        })
+        row = build_market_row(m)
+        rows.append(row)
 
-    filtered.sort(key=lambda x: to_float(x.get("volume24hr")), reverse=True)
-    filtered = filtered[:limit]
+    rows.sort(
+        key=lambda x: (
+            flag_priority(x.get("flag")),
+            -to_float(x.get("candidateScore")),
+            -to_float(x.get("liquidity")),
+            -to_float(x.get("volume24hr")),
+        )
+    )
+
+    rows = rows[:limit]
 
     return jsonify({
-        "count": len(filtered),
+        "count": len(rows),
         "params": params,
-        "markets": filtered,
+        "markets": rows,
     })
 
 
@@ -123,36 +300,26 @@ def markets_top():
     r.raise_for_status()
     data = r.json()
 
-    filtered = []
+    rows = []
     for m in data:
-        volume24hr = to_float(m.get("volume24hr"))
-        liquidity = to_float(m.get("liquidity"))
-        outcome_prices = parse_json_list(m.get("outcomePrices"))
-
         if m.get("active") is not True:
             continue
         if m.get("closed") is True:
             continue
-        if volume24hr <= 0:
-            continue
-        if liquidity <= 0:
-            continue
 
-        filtered.append({
-            "question": m.get("question"),
-            "slug": m.get("slug"),
-            "volume": m.get("volume"),
-            "volume24hr": m.get("volume24hr"),
-            "liquidity": m.get("liquidity"),
-            "endDate": m.get("endDate"),
-            "outcomePrices": outcome_prices,
-            "bestBid": m.get("bestBid"),
-            "bestAsk": m.get("bestAsk"),
-            "lastTradePrice": m.get("lastTradePrice"),
-        })
+        row = build_market_row(m)
+        rows.append(row)
 
-    filtered.sort(key=lambda x: to_float(x.get("volume24hr")), reverse=True)
-    return jsonify(filtered[:limit])
+    rows.sort(
+        key=lambda x: (
+            flag_priority(x.get("flag")),
+            -to_float(x.get("candidateScore")),
+            -to_float(x.get("liquidity")),
+            -to_float(x.get("volume24hr")),
+        )
+    )
+
+    return jsonify(rows[:limit])
 
 
 @app.route("/dashboard")
@@ -162,7 +329,7 @@ def dashboard():
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Polymarket Dashboard</title>
+  <title>Polymarket Candidate Dashboard</title>
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -195,21 +362,6 @@ def dashboard():
       background: #fafafa;
       font-weight: 600;
     }
-    .badge {
-      display: inline-block;
-      padding: 2px 6px;
-      border-radius: 4px;
-      font-size: 11px;
-      font-weight: 600;
-    }
-    .badge-active {
-      background: #e6f4ea;
-      color: #137333;
-    }
-    .badge-closed {
-      background: #fce8e6;
-      color: #c5221f;
-    }
     .small {
       font-size: 12px;
       color: #555;
@@ -219,6 +371,25 @@ def dashboard():
       margin-bottom: 8px;
       font-size: 13px;
     }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .watch {
+      background: #e6f4ea;
+      color: #137333;
+    }
+    .maybe {
+      background: #fff4e5;
+      color: #b06000;
+    }
+    .pass {
+      background: #fce8e6;
+      color: #c5221f;
+    }
     a {
       color: #1558d6;
       text-decoration: none;
@@ -226,43 +397,33 @@ def dashboard():
     a:hover {
       text-decoration: underline;
     }
+    .notes {
+      font-size: 12px;
+      color: #666;
+      max-width: 220px;
+      white-space: normal;
+    }
   </style>
 </head>
 <body>
-  <h1>Polymarket Read‑Only Dashboard</h1>
-  <p class="small">Zdroj: Render backend &gamma;-API (markets + events)</p>
+  <h1>Polymarket Candidate Dashboard</h1>
+  <p class="small">Filtrované podľa v5 discovery logiky: score, liquidity, volume, price shape, expiry, noise risk.</p>
 
   <div class="section">
-    <h2>Top markets (volume24hr)</h2>
+    <h2>Top candidates</h2>
     <div id="markets-error" class="error" style="display:none;"></div>
     <table id="markets-table">
       <thead>
         <tr>
+          <th>Flag</th>
+          <th>Score</th>
           <th>Question</th>
-          <th>Yes price</th>
-          <th>No price</th>
+          <th>Yes</th>
+          <th>No</th>
           <th>24h volume</th>
           <th>Liquidity</th>
           <th>End</th>
-          <th>Link</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-  </div>
-
-  <div class="section">
-    <h2>Events (volume24hr)</h2>
-    <div id="events-error" class="error" style="display:none;"></div>
-    <table id="events-table">
-      <thead>
-        <tr>
-          <th>Title</th>
-          <th>Status</th>
-          <th>24h volume</th>
-          <th>Liquidity</th>
-          <th>Markets</th>
-          <th>End</th>
+          <th>Notes</th>
           <th>Link</th>
         </tr>
       </thead>
@@ -283,46 +444,39 @@ def dashboard():
       return n.toFixed(3);
     }
 
+    function flagBadge(flag) {
+      if (flag === 'WATCH') return '<span class="badge watch">WATCH</span>';
+      if (flag === 'MAYBE') return '<span class="badge maybe">MAYBE</span>';
+      return '<span class="badge pass">PASS</span>';
+    }
+
     async function loadMarkets() {
       const errorEl = document.getElementById('markets-error');
       const tbody = document.querySelector('#markets-table tbody');
+
       try {
-        const res = await fetch('/markets?limit=10');
+        const res = await fetch('/markets?limit=25');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
+
         tbody.innerHTML = '';
 
         (data.markets || []).forEach(m => {
           const tr = document.createElement('tr');
-          const prices = Array.isArray(m.outcomePrices) ? m.outcomePrices : [];
-
-          let yes = null;
-          let no = null;
-
-          if (prices.length >= 2) {
-            yes = Number(prices[0]);
-            no = Number(prices[1]);
-          } else if (prices.length === 1) {
-            yes = Number(prices[0]);
-            no = Number.isFinite(yes) ? (1 - yes) : null;
-          } else {
-            const bid = Number(m.bestBid);
-            const ask = Number(m.bestAsk);
-            if (Number.isFinite(bid)) yes = bid;
-            if (Number.isFinite(ask)) no = 1 - ask;
-          }
-
           const link = m.slug
             ? 'https://polymarket.com/market/' + m.slug
             : null;
 
           tr.innerHTML = `
+            <td>${flagBadge(m.flag)}</td>
+            <td>${m.candidateScore ?? ''}</td>
             <td>${m.question || ''}</td>
-            <td>${fmtPrice(yes)}</td>
-            <td>${fmtPrice(no)}</td>
+            <td>${fmtPrice(m.yesPrice)}</td>
+            <td>${fmtPrice(m.noPrice)}</td>
             <td>${fmtInt(m.volume24hr)}</td>
             <td>${fmtInt(m.liquidity)}</td>
             <td>${m.endDate ? new Date(m.endDate).toLocaleString('sk-SK') : ''}</td>
+            <td class="notes">${(m.notes || []).join(', ')}</td>
             <td>${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Open</a>' : ''}</td>
           `;
           tbody.appendChild(tr);
@@ -335,100 +489,11 @@ def dashboard():
       }
     }
 
-    async function loadEvents() {
-      const errorEl = document.getElementById('events-error');
-      const tbody = document.querySelector('#events-table tbody');
-      try {
-        const res = await fetch('/events?limit=10&order=volume24hr');
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-        tbody.innerHTML = '';
-
-        (data.events || []).forEach(e => {
-          const link = e.slug
-            ? 'https://polymarket.com/event/' + e.slug
-            : null;
-          const status = e.closed ? 'closed' : (e.active ? 'active' : 'other');
-          let statusHtml = '';
-          if (status === 'active') {
-            statusHtml = '<span class="badge badge-active">ACTIVE</span>';
-          } else if (status === 'closed') {
-            statusHtml = '<span class="badge badge-closed">CLOSED</span>';
-          } else {
-            statusHtml = '<span class="badge">OTHER</span>';
-          }
-
-          const marketsCount = (
-            e.marketsCount !== undefined && e.marketsCount !== null
-              ? e.marketsCount
-              : (e.markets ? e.markets.length : '')
-          );
-
-          const tr = document.createElement('tr');
-          tr.innerHTML = `
-            <td>${e.title || ''}</td>
-            <td>${statusHtml}</td>
-            <td>${fmtInt(e.volume24hr)}</td>
-            <td>${fmtInt(e.liquidity)}</td>
-            <td>${marketsCount ?? ''}</td>
-            <td>${e.endDate ? new Date(e.endDate).toLocaleString('sk-SK') : ''}</td>
-            <td>${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Open</a>' : ''}</td>
-          `;
-          tbody.appendChild(tr);
-        });
-
-        errorEl.style.display = 'none';
-      } catch (err) {
-        errorEl.textContent = 'Chyba pri načítaní events: ' + err.message;
-        errorEl.style.display = 'block';
-      }
-    }
-
     loadMarkets();
-    loadEvents();
   </script>
 </body>
 </html>
     """
-
-
-@app.route("/events")
-def events():
-    params = {
-        "limit": request.args.get("limit", "10"),
-        "active": request.args.get("active", "true"),
-        "closed": request.args.get("closed", "false"),
-    }
-
-    url = f"{GAMMA_BASE}/events"
-
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        return jsonify({"error": str(e), "where": "gamma/events"}), 502
-
-    out = []
-    for ev in data:
-        out.append({
-            "title": ev.get("title"),
-            "slug": ev.get("slug"),
-            "active": ev.get("active"),
-            "closed": ev.get("closed"),
-            "endDate": ev.get("endDate"),
-            "liquidity": ev.get("liquidity"),
-            "volume": ev.get("volume"),
-            "volume24hr": ev.get("volume24hr"),
-            "marketsCount": ev.get("marketsCount"),
-            "markets": ev.get("markets", []),
-        })
-
-    return jsonify({
-        "count": len(out),
-        "events": out,
-        "params": params,
-    })
 
 
 @app.route("/analyze-market")
@@ -456,37 +521,6 @@ def analyze_market():
         return jsonify({"error": "No market found for given slug", "slug": slug}), 404
 
     m = data[0]
-    prices = parse_json_list(m.get("outcomePrices"))
-    outcomes = parse_json_list(m.get("outcomes"))
+    row = build_market_row(m)
 
-    yes_price = None
-    no_price = None
-
-    if len(prices) >= 2:
-        yes_price = to_float(prices[0], None)
-        no_price = to_float(prices[1], None)
-    elif len(prices) == 1:
-        yes_price = to_float(prices[0], None)
-        no_price = (1 - yes_price) if isinstance(yes_price, (int, float)) else None
-
-    result = {
-        "slug": m.get("slug"),
-        "question": m.get("question"),
-        "active": m.get("active"),
-        "closed": m.get("closed"),
-        "endDate": m.get("endDate"),
-        "volume": m.get("volume"),
-        "volume24hr": m.get("volume24hr"),
-        "liquidity": m.get("liquidity"),
-        "bestBid": m.get("bestBid"),
-        "bestAsk": m.get("bestAsk"),
-        "lastTradePrice": m.get("lastTradePrice"),
-        "prices": {
-            "yes": yes_price,
-            "no": no_price,
-        },
-        "raw_outcomes": outcomes,
-        "raw_outcomePrices": prices,
-    }
-
-    return jsonify(result)
+    return jsonify(row)
