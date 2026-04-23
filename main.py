@@ -331,13 +331,12 @@ def events():
         "params": params
     })     
 
- @app.route("/analyze-market")
+@app.route("/analyze-market")
 def analyze_market():
     slug = request.args.get("slug")
     if not slug:
         return jsonify({"error": "Missing slug parameter"}), 400
 
-    # 1) Fetch market by slug from Gamma API
     url = f"{GAMMA_BASE}/markets"
     params = {
         "slug": slug,
@@ -380,9 +379,3 @@ def analyze_market():
     }
 
     return jsonify(result)
-
-    return jsonify({
-        "count": len(simplified),
-        "params": params,
-        "events": simplified,
-    })
