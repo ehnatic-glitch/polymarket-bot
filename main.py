@@ -94,6 +94,7 @@ def markets_top():
         })
 
     return jsonify(simplified)
+
 @app.route("/dashboard")
 def dashboard():
     # Vrátime jednoduchú HTML stránku priamo ako string
@@ -293,42 +294,44 @@ def dashboard():
 </body>
 </html>
     """
-
 @app.route("/events")
 def events():
-    limit = request.args.get("limit", "10")
-    order = request.args.get("order", "volume24hr")
-    active = request.args.get("active", "true")
-    closed = request.args.get("closed", "false")
-
     params = {
-        "limit": limit,
-        "order": order,
-        "active": active,
-        "closed": closed,
+        "limit": request.args.get("limit", "10"),
+        "active": request.args.get("active", "true"),
+        "closed": request.args.get("closed", "false"),
     }
 
     url = f"{GAMMA_BASE}/events"
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
 
-    simplified = []
-    for e in data:
-        markets = e.get("markets") or []
-        simplified.append({
-            "title": e.get("title"),
-            "slug": e.get("slug"),
-            "active": e.get("active"),
-            "closed": e.get("closed"),
-            "volume": e.get("volume"),
-            "volume24hr": e.get("volume24hr"),
-            "liquidity": e.get("liquidity"),
-            "startDate": e.get("startDate"),
-            "endDate": e.get("endDate"),
-            "marketsCount": len(markets),
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return jsonify({"error": str(e), "where": "gamma/events"}), 502
+
+    out = []
+    for ev in data:
+        out.append({
+            "title": ev.get("title"),
+            "slug": ev.get("slug"),
+            "active": ev.get("active"),
+            "closed": ev.get("closed"),
+            "endDate": ev.get("endDate"),
+            "liquidity": ev.get("liquidity"),
+            "volume": ev.get("volume"),
+            "volume24hr": ev.get("volume24hr"),
+            "markets": ev.get("markets", []),
         })
-@app.route("/analyze-market")
+
+    return jsonify({
+        "count": len(out),
+        "events": out,
+        "params": params
+    })     
+
+ @app.route("/analyze-market")
 def analyze_market():
     slug = request.args.get("slug")
     if not slug:
