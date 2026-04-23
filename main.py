@@ -26,16 +26,23 @@ def health():
     return jsonify({"status": "ok"})
 
 
+def to_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
 @app.route("/markets")
 def markets():
-    limit = request.args.get("limit", "10")
-    order = request.args.get("order", "volume24hr")
+    limit = int(request.args.get("limit", "10"))
     active = request.args.get("active", "true")
     closed = request.args.get("closed", "false")
 
     params = {
-        "limit": limit,
-        "order": order,
+        "limit": 200,
         "active": active,
         "closed": closed,
     }
@@ -45,9 +52,21 @@ def markets():
     r.raise_for_status()
     data = r.json()
 
-    simplified = []
+    filtered = []
     for m in data:
-        simplified.append({
+        volume24hr = to_float(m.get("volume24hr"))
+        liquidity = to_float(m.get("liquidity"))
+
+        if m.get("active") is not True:
+            continue
+        if m.get("closed") is True:
+            continue
+        if volume24hr <= 0:
+            continue
+        if liquidity <= 0:
+            continue
+
+        filtered.append({
             "question": m.get("question"),
             "slug": m.get("slug"),
             "active": m.get("active"),
@@ -60,22 +79,24 @@ def markets():
             "outcomePrices": m.get("outcomePrices"),
         })
 
+    filtered.sort(key=lambda x: to_float(x.get("volume24hr")), reverse=True)
+    filtered = filtered[:limit]
+
     return jsonify({
-        "count": len(simplified),
+        "count": len(filtered),
         "params": params,
-        "markets": simplified,
+        "markets": filtered,
     })
 
 
 @app.route("/markets/top")
 def markets_top():
+    limit = int(request.args.get("limit", "20"))
+
     params = {
-        "limit": request.args.get("limit", "20"),
-        "offset": request.args.get("offset", "0"),
-        "order": request.args.get("order", "volume_24hr"),
-        "ascending": request.args.get("ascending", "false"),
-        "active": request.args.get("active", "true"),
-        "closed": request.args.get("closed", "false"),
+        "limit": 200,
+        "active": "true",
+        "closed": "false",
     }
 
     url = f"{GAMMA_BASE}/markets"
@@ -83,9 +104,21 @@ def markets_top():
     r.raise_for_status()
     data = r.json()
 
-    simplified = []
+    filtered = []
     for m in data:
-        simplified.append({
+        volume24hr = to_float(m.get("volume24hr"))
+        liquidity = to_float(m.get("liquidity"))
+
+        if m.get("active") is not True:
+            continue
+        if m.get("closed") is True:
+            continue
+        if volume24hr <= 0:
+            continue
+        if liquidity <= 0:
+            continue
+
+        filtered.append({
             "question": m.get("question"),
             "slug": m.get("slug"),
             "volume": m.get("volume"),
@@ -95,7 +128,8 @@ def markets_top():
             "outcomePrices": m.get("outcomePrices"),
         })
 
-    return jsonify(simplified)
+    filtered.sort(key=lambda x: to_float(x.get("volume24hr")), reverse=True)
+    return jsonify(filtered[:limit])
 
 
 @app.route("/dashboard")
@@ -217,7 +251,7 @@ def dashboard():
       const errorEl = document.getElementById('markets-error');
       const tbody = document.querySelector('#markets-table tbody');
       try {
-        const res = await fetch('/markets?limit=10&order=volume24hr');
+        const res = await fetch('/markets?limit=10');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         tbody.innerHTML = '';
@@ -233,8 +267,8 @@ def dashboard():
 
           tr.innerHTML = `
             <td>${m.question || ''}</td>
-            <td>${yes !== null ? yes.toFixed(3) : ''}</td>
-            <td>${no !== null ? no.toFixed(3) : ''}</td>
+            <td>${yes !== null ? Number(yes).toFixed(3) : ''}</td>
+            <td>${no !== null ? Number(no).toFixed(3) : ''}</td>
             <td>${m.volume24hr ?? ''}</td>
             <td>${m.liquidity ?? ''}</td>
             <td>${m.endDate ? new Date(m.endDate).toLocaleString() : ''}</td>
@@ -272,7 +306,7 @@ def dashboard():
           }
 
           const marketsCount = (
-            e.marketsCount !== undefined
+            e.marketsCount !== undefined && e.marketsCount !== null
               ? e.marketsCount
               : (e.markets ? e.markets.length : '')
           );
