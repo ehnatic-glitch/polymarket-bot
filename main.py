@@ -1,5 +1,6 @@
 from flask import Flask, jsonify, request
 import requests
+import json
 
 app = Flask(__name__)
 
@@ -35,6 +36,19 @@ def to_float(value, default=0.0):
         return default
 
 
+def parse_json_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            return []
+    return []
+
+
 @app.route("/markets")
 def markets():
     limit = int(request.args.get("limit", "10"))
@@ -56,6 +70,8 @@ def markets():
     for m in data:
         volume24hr = to_float(m.get("volume24hr"))
         liquidity = to_float(m.get("liquidity"))
+        outcome_prices = parse_json_list(m.get("outcomePrices"))
+        outcomes = parse_json_list(m.get("outcomes"))
 
         if m.get("active") is not True:
             continue
@@ -75,8 +91,11 @@ def markets():
             "volume24hr": m.get("volume24hr"),
             "liquidity": m.get("liquidity"),
             "endDate": m.get("endDate"),
-            "outcomes": m.get("outcomes"),
-            "outcomePrices": m.get("outcomePrices"),
+            "outcomes": outcomes,
+            "outcomePrices": outcome_prices,
+            "bestBid": m.get("bestBid"),
+            "bestAsk": m.get("bestAsk"),
+            "lastTradePrice": m.get("lastTradePrice"),
         })
 
     filtered.sort(key=lambda x: to_float(x.get("volume24hr")), reverse=True)
@@ -108,6 +127,7 @@ def markets_top():
     for m in data:
         volume24hr = to_float(m.get("volume24hr"))
         liquidity = to_float(m.get("liquidity"))
+        outcome_prices = parse_json_list(m.get("outcomePrices"))
 
         if m.get("active") is not True:
             continue
@@ -125,7 +145,10 @@ def markets_top():
             "volume24hr": m.get("volume24hr"),
             "liquidity": m.get("liquidity"),
             "endDate": m.get("endDate"),
-            "outcomePrices": m.get("outcomePrices"),
+            "outcomePrices": outcome_prices,
+            "bestBid": m.get("bestBid"),
+            "bestAsk": m.get("bestAsk"),
+            "lastTradePrice": m.get("lastTradePrice"),
         })
 
     filtered.sort(key=lambda x: to_float(x.get("volume24hr")), reverse=True)
@@ -166,6 +189,7 @@ def dashboard():
       padding: 6px 8px;
       border-bottom: 1px solid #eee;
       text-align: left;
+      vertical-align: top;
     }
     th {
       background: #fafafa;
@@ -247,6 +271,18 @@ def dashboard():
   </div>
 
   <script>
+    function fmtInt(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return '';
+      return Math.round(n).toLocaleString('sk-SK');
+    }
+
+    function fmtPrice(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return '';
+      return n.toFixed(3);
+    }
+
     async function loadMarkets() {
       const errorEl = document.getElementById('markets-error');
       const tbody = document.querySelector('#markets-table tbody');
@@ -255,11 +291,26 @@ def dashboard():
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         tbody.innerHTML = '';
+
         (data.markets || []).forEach(m => {
           const tr = document.createElement('tr');
-          const prices = m.outcomePrices || [];
-          const yes = prices[0] ?? null;
-          const no = (yes !== null) ? (1 - yes) : null;
+          const prices = Array.isArray(m.outcomePrices) ? m.outcomePrices : [];
+
+          let yes = null;
+          let no = null;
+
+          if (prices.length >= 2) {
+            yes = Number(prices[0]);
+            no = Number(prices[1]);
+          } else if (prices.length === 1) {
+            yes = Number(prices[0]);
+            no = Number.isFinite(yes) ? (1 - yes) : null;
+          } else {
+            const bid = Number(m.bestBid);
+            const ask = Number(m.bestAsk);
+            if (Number.isFinite(bid)) yes = bid;
+            if (Number.isFinite(ask)) no = 1 - ask;
+          }
 
           const link = m.slug
             ? 'https://polymarket.com/market/' + m.slug
@@ -267,15 +318,16 @@ def dashboard():
 
           tr.innerHTML = `
             <td>${m.question || ''}</td>
-            <td>${yes !== null ? Number(yes).toFixed(3) : ''}</td>
-            <td>${no !== null ? Number(no).toFixed(3) : ''}</td>
-            <td>${m.volume24hr ?? ''}</td>
-            <td>${m.liquidity ?? ''}</td>
-            <td>${m.endDate ? new Date(m.endDate).toLocaleString() : ''}</td>
+            <td>${fmtPrice(yes)}</td>
+            <td>${fmtPrice(no)}</td>
+            <td>${fmtInt(m.volume24hr)}</td>
+            <td>${fmtInt(m.liquidity)}</td>
+            <td>${m.endDate ? new Date(m.endDate).toLocaleString('sk-SK') : ''}</td>
             <td>${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Open</a>' : ''}</td>
           `;
           tbody.appendChild(tr);
         });
+
         errorEl.style.display = 'none';
       } catch (err) {
         errorEl.textContent = 'Chyba pri načítaní markets: ' + err.message;
@@ -291,6 +343,7 @@ def dashboard():
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         tbody.innerHTML = '';
+
         (data.events || []).forEach(e => {
           const link = e.slug
             ? 'https://polymarket.com/event/' + e.slug
@@ -315,14 +368,15 @@ def dashboard():
           tr.innerHTML = `
             <td>${e.title || ''}</td>
             <td>${statusHtml}</td>
-            <td>${e.volume24hr ?? ''}</td>
-            <td>${e.liquidity ?? ''}</td>
-            <td>${marketsCount}</td>
-            <td>${e.endDate ? new Date(e.endDate).toLocaleString() : ''}</td>
+            <td>${fmtInt(e.volume24hr)}</td>
+            <td>${fmtInt(e.liquidity)}</td>
+            <td>${marketsCount ?? ''}</td>
+            <td>${e.endDate ? new Date(e.endDate).toLocaleString('sk-SK') : ''}</td>
             <td>${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Open</a>' : ''}</td>
           `;
           tbody.appendChild(tr);
         });
+
         errorEl.style.display = 'none';
       } catch (err) {
         errorEl.textContent = 'Chyba pri načítaní events: ' + err.message;
@@ -402,10 +456,18 @@ def analyze_market():
         return jsonify({"error": "No market found for given slug", "slug": slug}), 404
 
     m = data[0]
+    prices = parse_json_list(m.get("outcomePrices"))
+    outcomes = parse_json_list(m.get("outcomes"))
 
-    prices = m.get("outcomePrices") or []
-    yes_price = prices[0] if len(prices) > 0 else None
-    no_price = (1 - yes_price) if isinstance(yes_price, (int, float)) else None
+    yes_price = None
+    no_price = None
+
+    if len(prices) >= 2:
+        yes_price = to_float(prices[0], None)
+        no_price = to_float(prices[1], None)
+    elif len(prices) == 1:
+        yes_price = to_float(prices[0], None)
+        no_price = (1 - yes_price) if isinstance(yes_price, (int, float)) else None
 
     result = {
         "slug": m.get("slug"),
@@ -416,11 +478,14 @@ def analyze_market():
         "volume": m.get("volume"),
         "volume24hr": m.get("volume24hr"),
         "liquidity": m.get("liquidity"),
+        "bestBid": m.get("bestBid"),
+        "bestAsk": m.get("bestAsk"),
+        "lastTradePrice": m.get("lastTradePrice"),
         "prices": {
             "yes": yes_price,
             "no": no_price,
         },
-        "raw_outcomes": m.get("outcomes"),
+        "raw_outcomes": outcomes,
         "raw_outcomePrices": prices,
     }
 
