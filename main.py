@@ -328,6 +328,55 @@ def events():
             "endDate": e.get("endDate"),
             "marketsCount": len(markets),
         })
+@app.route("/analyze-market")
+def analyze_market():
+    slug = request.args.get("slug")
+    if not slug:
+        return jsonify({"error": "Missing slug parameter"}), 400
+
+    # 1) Fetch market by slug from Gamma API
+    url = f"{GAMMA_BASE}/markets"
+    params = {
+        "slug": slug,
+        "limit": 1,
+        "active": "true",
+        "closed": "false",
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        return jsonify({"error": f"Gamma request failed: {e}"}), 502
+
+    data = r.json()
+    if not data:
+        return jsonify({"error": "No market found for given slug", "slug": slug}), 404
+
+    m = data[0]
+
+    prices = m.get("outcomePrices") or []
+    yes_price = prices[0] if len(prices) > 0 else None
+    no_price = (1 - yes_price) if isinstance(yes_price, (int, float)) else None
+
+    result = {
+        "slug": m.get("slug"),
+        "question": m.get("question"),
+        "active": m.get("active"),
+        "closed": m.get("closed"),
+        "endDate": m.get("endDate"),
+        "volume": m.get("volume"),
+        "volume24hr": m.get("volume24hr"),
+        "liquidity": m.get("liquidity"),
+        "prices": {
+            "yes": yes_price,
+            "no": no_price,
+        },
+        "raw_outcomes": m.get("outcomes"),
+        "raw_outcomePrices": prices,
+    }
+
+    return jsonify(result)
 
     return jsonify({
         "count": len(simplified),
