@@ -14,7 +14,9 @@ def home():
             "/health",
             "/markets",
             "/markets/top",
-            "/events"
+            "/events",
+            "/dashboard",
+            "/analyze-market",
         ]
     })
 
@@ -90,14 +92,14 @@ def markets_top():
             "volume24hr": m.get("volume24hr"),
             "liquidity": m.get("liquidity"),
             "endDate": m.get("endDate"),
-            "outcomePrices": m.get("outcomePrices")
+            "outcomePrices": m.get("outcomePrices"),
         })
 
     return jsonify(simplified)
 
+
 @app.route("/dashboard")
 def dashboard():
-    # Vrátime jednoduchú HTML stránku priamo ako string
     return """
 <!doctype html>
 <html lang="en">
@@ -226,7 +228,7 @@ def dashboard():
           const no = (yes !== null) ? (1 - yes) : null;
 
           const link = m.slug
-            ? 'https://polymarket.com/event/' + m.slug
+            ? 'https://polymarket.com/market/' + m.slug
             : null;
 
           tr.innerHTML = `
@@ -259,7 +261,7 @@ def dashboard():
           const link = e.slug
             ? 'https://polymarket.com/event/' + e.slug
             : null;
-          const status = e.active ? 'active' : (e.closed ? 'closed' : 'other');
+          const status = e.closed ? 'closed' : (e.active ? 'active' : 'other');
           let statusHtml = '';
           if (status === 'active') {
             statusHtml = '<span class="badge badge-active">ACTIVE</span>';
@@ -269,13 +271,19 @@ def dashboard():
             statusHtml = '<span class="badge">OTHER</span>';
           }
 
+          const marketsCount = (
+            e.marketsCount !== undefined
+              ? e.marketsCount
+              : (e.markets ? e.markets.length : '')
+          );
+
           const tr = document.createElement('tr');
           tr.innerHTML = `
             <td>${e.title || ''}</td>
             <td>${statusHtml}</td>
             <td>${e.volume24hr ?? ''}</td>
             <td>${e.liquidity ?? ''}</td>
-            <td>${e.marketsCount ?? ''}</td>
+            <td>${marketsCount}</td>
             <td>${e.endDate ? new Date(e.endDate).toLocaleString() : ''}</td>
             <td>${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Open</a>' : ''}</td>
           `;
@@ -294,6 +302,8 @@ def dashboard():
 </body>
 </html>
     """
+
+
 @app.route("/events")
 def events():
     params = {
@@ -322,14 +332,16 @@ def events():
             "liquidity": ev.get("liquidity"),
             "volume": ev.get("volume"),
             "volume24hr": ev.get("volume24hr"),
+            "marketsCount": ev.get("marketsCount"),
             "markets": ev.get("markets", []),
         })
 
     return jsonify({
         "count": len(out),
         "events": out,
-        "params": params
-    })     
+        "params": params,
+    })
+
 
 @app.route("/analyze-market")
 def analyze_market():
