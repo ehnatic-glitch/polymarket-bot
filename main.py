@@ -404,6 +404,36 @@ def decision_bias(flag, yes_price, oracle_risk, trade_type, gate_score, fr_score
     return "No trade", "PASS"
 
 
+def fail_point(checklist, oracle_risk, fr_score, ex_score, catalyst_confidence, notes):
+    if oracle_risk == "High":
+        return "Oracle Trap"
+    if checklist and not checklist["resolutability"]["ok"]:
+        return "Resolutability"
+    if checklist and not checklist["oracle"]["ok"]:
+        return "Oracle Trap"
+    if checklist and not checklist["friction"]["ok"]:
+        return "Frikcia"
+    if checklist and not checklist["exit"]["ok"]:
+        return "Exit"
+    if checklist and not checklist["catalyst"]["ok"]:
+        return "Catalyst"
+    if "noise_market" in (notes or []):
+        return "Noise market"
+    if "sports_hype_risk" in (notes or []):
+        return "Sports hype"
+    return "Žiadny kritický fail"
+
+
+def sizing_cap_from_v6(flag, trade_type, final_decision):
+    if final_decision == "PASS":
+        return "0 USDC"
+    if trade_type == "Centovka":
+        return "5–12 USDC"
+    if flag == "WATCH":
+        return "25–40 USDC"
+    return "10–20 USDC"
+
+
 def build_auto_draft(question, category, trade_type, yes_price, no_price, days_to_end,
                      oracle_risk, fr_label_sk, ex_label_sk, catalyst_type_sk,
                      catalyst_confidence_sk, flag, gate_score, notes, checklist,
@@ -435,11 +465,11 @@ def build_auto_draft(question, category, trade_type, yes_price, no_price, days_t
         mispricing = "Mispricing môže byť v načasovaní katalyzátora, správaní retailu alebo v tom, že trh ešte plne nezacenil relevantný scenár."
 
     if trade_type == "Momentum":
-        edge = "Pravdepodobný edge je timing/news edge; trh sa môže preceňovať až po potvrdení správy."
+        edge = "Pravdepodobný edge je timing alebo news edge; trh sa môže preceňovať až po potvrdení správy."
     elif trade_type == "Time Decay":
         edge = "Pravdepodobný edge je time-decay setup; čas pracuje proti jednej strane a trh to nemusí správne diskontovať."
     elif trade_type == "Resolution":
-        edge = "Ak edge existuje, je hlavne resolution/oracle charakteru; bez 100% jasných pravidiel však treba zostať extrémne konzervatívny."
+        edge = "Ak edge existuje, je hlavne resolution alebo oracle charakteru; bez 100% jasných pravidiel však treba zostať extrémne konzervatívny."
     elif trade_type == "Centovka":
         edge = "Ak edge existuje, je asymetrický; ide o centovku, kde malý sizing môže dávať zmysel len pri čistom technickom alebo scenárovom edge-i."
     else:
@@ -514,6 +544,7 @@ def score_market(m):
 
     gate_resolutability = oracle_risk == "Low"
     gate_base_rate = category in ["Politics", "Crypto", "Sports", "Other", "Geopolitics"]
+
     gate_friction = fr_score >= 3
     gate_exit = ex_score >= 2
     gate_catalyst = catalyst_confidence in ["High", "Medium"] and days_to_end is not None and days_to_end <= 180
@@ -624,35 +655,6 @@ def score_market(m):
     else:
         flag = "PASS"
 
-    summary_parts = []
-
-    if trade_type == "Momentum":
-        summary_parts.append("momentum/news")
-    elif trade_type == "Time Decay":
-        summary_parts.append("časový rozpad")
-    elif trade_type == "Resolution":
-        summary_parts.append("resolution risk")
-    elif trade_type == "Centovka":
-        summary_parts.append("centovka")
-
-    if oracle_risk == "Low":
-        summary_parts.append("nízke oracle riziko")
-    elif oracle_risk == "Medium":
-        summary_parts.append("stredné oracle riziko")
-    else:
-        summary_parts.append("vysoké oracle riziko")
-
-    summary_parts.append(sk_friction_label(fr_label).lower())
-    summary_parts.append(sk_exit_label(ex_label).lower())
-
-    if catalyst_type != "Unclear":
-        summary_parts.append(f"katalyzátor: {sk_catalyst_type(catalyst_type).lower()}")
-
-    if "sports_hype_risk" in notes:
-        summary_parts.append("šport potrebuje silnejší setup")
-
-    summary = ", ".join(summary_parts)
-
     checklist = {
         "resolutability": {
             "ok": gate_resolutability,
@@ -702,12 +704,14 @@ def score_market(m):
         ex_score=ex_score,
     )
 
+    fail = fail_point(checklist, oracle_risk, fr_score, ex_score, catalyst_confidence, notes)
+    sizing_cap = sizing_cap_from_v6(flag, trade_type, auto_draft["finalDecision"])
+
     return {
         "candidateScore": score,
         "flag": flag,
         "flagLabel": flag,
         "notes": notes,
-        "summary": summary,
         "yesPrice": yes_price,
         "noPrice": no_price,
         "daysToEnd": days_to_end,
@@ -738,6 +742,8 @@ def score_market(m):
             "oracle": gate_oracle,
         },
         "autoDraft": auto_draft,
+        "failPoint": fail,
+        "sizingCap": sizing_cap,
     }
 
 
@@ -762,7 +768,6 @@ def build_market_row(m):
         "flag": scored["flag"],
         "flagLabel": scored["flagLabel"],
         "notes": scored["notes"],
-        "summary": scored["summary"],
         "yesPrice": scored["yesPrice"],
         "noPrice": scored["noPrice"],
         "daysToEnd": scored["daysToEnd"],
@@ -786,6 +791,8 @@ def build_market_row(m):
         "catalystConfidenceLabel": scored["catalystConfidenceLabel"],
         "checklist": scored["checklist"],
         "autoDraft": scored["autoDraft"],
+        "failPoint": scored["failPoint"],
+        "sizingCap": scored["sizingCap"],
     }
 
 
@@ -793,6 +800,14 @@ def flag_priority(flag):
     if flag == "WATCH":
         return 0
     if flag == "REVIEW":
+        return 1
+    return 2
+
+
+def decision_priority(value):
+    if value == "BUY YES":
+        return 0
+    if value == "BUY NO":
         return 1
     return 2
 
@@ -818,6 +833,7 @@ def markets():
     max_oracle_risk = request.args.get("max_oracle_risk", "").strip()
     gate_only = request.args.get("gate_only", "false").lower() == "true"
     catalyst_conf_filter = request.args.get("catalyst_confidence", "").strip()
+    mode = request.args.get("mode", "strict").strip().lower()
 
     params = {
         "limit": 200,
@@ -843,7 +859,7 @@ def markets():
             continue
         if to_float(row.get("volume24hr")) < min_volume:
             continue
-        if hide_pass and row.get("flag") == "PASS":
+        if hide_pass and row.get("autoDraft", {}).get("finalDecision") == "PASS":
             continue
         if category_filter and row.get("category") != category_filter:
             continue
@@ -858,10 +874,20 @@ def markets():
         if gate_only and row.get("gateScore", 0) < 6:
             continue
 
+        if mode == "strict":
+            if row.get("gateScore", 0) < 6:
+                continue
+            if row.get("oracleRisk") != "Low":
+                continue
+        elif mode == "scout":
+            if row.get("gateScore", 0) < 4:
+                continue
+
         rows.append(row)
 
     rows.sort(
         key=lambda x: (
+            decision_priority(x.get("autoDraft", {}).get("finalDecision")),
             flag_priority(x.get("flag")),
             -to_float(x.get("gateScore")),
             oracle_priority(x.get("oracleRisk")),
@@ -885,6 +911,7 @@ def markets():
             "max_oracle_risk": max_oracle_risk,
             "gate_only": gate_only,
             "catalyst_confidence": catalyst_conf_filter,
+            "mode": mode,
         }
     })
 
@@ -901,11 +928,11 @@ def dashboard():
 <html lang="sk">
 <head>
   <meta charset="utf-8">
-  <title>Polymarket Kandidátny Dashboard v5.2</title>
+  <title>Polymarket Kandidátny Dashboard v5.3</title>
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      margin: 20px;
+      margin: 16px;
       background: #f5f5f5;
       color: #222;
     }
@@ -914,29 +941,29 @@ def dashboard():
     }
     .section {
       background: #ffffff;
-      padding: 16px;
+      padding: 14px;
       border-radius: 8px;
-      margin-bottom: 20px;
+      margin-bottom: 16px;
       box-shadow: 0 1px 3px rgba(0,0,0,0.08);
     }
     .layout {
       display: grid;
-      grid-template-columns: minmax(0, 2fr) minmax(360px, 1fr);
-      gap: 16px;
+      grid-template-columns: minmax(0, 2.2fr) minmax(380px, 1fr);
+      gap: 14px;
       align-items: start;
     }
     .controls {
       display: flex;
       flex-wrap: wrap;
-      gap: 12px;
-      margin-bottom: 14px;
+      gap: 10px;
+      margin-bottom: 12px;
       align-items: end;
     }
     .control {
       display: flex;
       flex-direction: column;
       gap: 4px;
-      min-width: 150px;
+      min-width: 135px;
     }
     label {
       font-size: 12px;
@@ -944,7 +971,7 @@ def dashboard():
       font-weight: 600;
     }
     input, select {
-      padding: 8px 10px;
+      padding: 7px 9px;
       border: 1px solid #ddd;
       border-radius: 6px;
       font: inherit;
@@ -953,25 +980,27 @@ def dashboard():
     .checkbox-wrap {
       display: flex;
       align-items: center;
-      gap: 8px;
-      padding-top: 22px;
+      gap: 7px;
+      padding-top: 20px;
     }
     table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 14px;
+      font-size: 12.5px;
+      table-layout: fixed;
     }
     th, td {
-      padding: 6px 8px;
+      padding: 5px 6px;
       border-bottom: 1px solid #eee;
       text-align: left;
       vertical-align: top;
     }
     th {
       background: #fafafa;
-      font-weight: 600;
+      font-weight: 700;
       position: sticky;
       top: 0;
+      z-index: 1;
     }
     tr.clickable {
       cursor: pointer;
@@ -994,6 +1023,7 @@ def dashboard():
       border-radius: 999px;
       font-size: 11px;
       font-weight: 700;
+      white-space: nowrap;
     }
     .watch {
       background: #e6f4ea;
@@ -1007,6 +1037,18 @@ def dashboard():
       background: #fce8e6;
       color: #c5221f;
     }
+    .decision-buy-yes {
+      background: #e8f5e9;
+      color: #137333;
+    }
+    .decision-buy-no {
+      background: #e8f0fe;
+      color: #1558d6;
+    }
+    .decision-pass {
+      background: #f3f4f6;
+      color: #555;
+    }
     .cat {
       display: inline-block;
       padding: 2px 8px;
@@ -1015,6 +1057,7 @@ def dashboard():
       background: #eef2ff;
       color: #3949ab;
       font-weight: 600;
+      white-space: nowrap;
     }
     .risk-low {
       color: #137333;
@@ -1030,13 +1073,13 @@ def dashboard():
     }
     .panel {
       position: sticky;
-      top: 20px;
+      top: 16px;
     }
     .panel-box {
       background: #fff;
       border-radius: 8px;
       box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-      padding: 16px;
+      padding: 14px;
     }
     .panel-muted {
       color: #444;
@@ -1049,7 +1092,7 @@ def dashboard():
     }
     .table-wrap {
       overflow: auto;
-      max-height: 78vh;
+      max-height: 80vh;
       border-radius: 8px;
     }
     .count {
@@ -1161,6 +1204,47 @@ def dashboard():
       color: #555;
       font-weight: 600;
     }
+    .legend-box {
+      margin-top: 16px;
+      padding-top: 12px;
+      border-top: 1px solid #eee;
+    }
+    .legend-item {
+      padding: 8px 0;
+      border-bottom: 1px solid #f2f2f2;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .legend-item:last-child {
+      border-bottom: none;
+    }
+    .question-cell {
+      max-width: 320px;
+    }
+    .question-truncate {
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      line-height: 1.35;
+      max-height: 2.7em;
+      word-break: break-word;
+    }
+    .w-flag { width: 72px; }
+    .w-decision { width: 92px; }
+    .w-gate { width: 52px; }
+    .w-score { width: 48px; }
+    .w-friction { width: 72px; }
+    .w-exit { width: 70px; }
+    .w-type { width: 72px; }
+    .w-cat { width: 70px; }
+    .w-oracle { width: 58px; }
+    .w-catc { width: 66px; }
+    .w-price { width: 50px; }
+    .w-vol { width: 74px; }
+    .w-liq { width: 82px; }
+    .w-days { width: 42px; }
+
     @media (max-width: 1200px) {
       .layout {
         grid-template-columns: 1fr;
@@ -1173,13 +1257,21 @@ def dashboard():
 </head>
 <body>
   <h1>Polymarket kandidátny dashboard</h1>
-  <p class="small">v5.2: odľahčený pravý panel, bez duplicity metrík, s checklistom a systémovým draftom podľa v6.</p>
+  <p class="small">v5.3: compact table, rozhodnutie v tabuľke, Strict/Scout režim, fail point a legenda v6.</p>
 
   <div class="layout">
     <div class="section">
       <h2>Top kandidáti</h2>
 
       <div class="controls">
+        <div class="control">
+          <label for="mode">Režim</label>
+          <select id="mode">
+            <option value="strict" selected>Strict v6</option>
+            <option value="scout">Scout</option>
+          </select>
+        </div>
+
         <div class="control">
           <label for="category">Kategória</label>
           <select id="category">
@@ -1253,11 +1345,6 @@ def dashboard():
         </div>
 
         <div class="checkbox-wrap">
-          <input type="checkbox" id="watchOnly" />
-          <label for="watchOnly">Len WATCH</label>
-        </div>
-
-        <div class="checkbox-wrap">
           <input type="checkbox" id="gateOnly" />
           <label for="gateOnly">Len 6/6 gate</label>
         </div>
@@ -1274,21 +1361,22 @@ def dashboard():
         <table id="markets-table">
           <thead>
             <tr>
-              <th>Flag</th>
-              <th>Gate</th>
-              <th>Skóre</th>
-              <th>Frikcia</th>
-              <th>Exit</th>
-              <th>Typ</th>
-              <th>Kategória</th>
-              <th>Oracle</th>
-              <th>Katalyzátor</th>
+              <th class="w-flag">Flag</th>
+              <th class="w-decision">Rozhod.</th>
+              <th class="w-gate">Gate</th>
+              <th class="w-score">Skóre</th>
+              <th class="w-friction">Frikcia</th>
+              <th class="w-exit">Exit</th>
+              <th class="w-type">Typ</th>
+              <th class="w-cat">Kat.</th>
+              <th class="w-oracle">Oracle</th>
+              <th class="w-catc">Kat.</th>
               <th>Otázka</th>
-              <th>Yes</th>
-              <th>No</th>
-              <th>24h objem</th>
-              <th>Likvidita</th>
-              <th>Dni</th>
+              <th class="w-price">Yes</th>
+              <th class="w-price">No</th>
+              <th class="w-vol">24h</th>
+              <th class="w-liq">Likv.</th>
+              <th class="w-days">Dni</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -1299,7 +1387,7 @@ def dashboard():
     <div class="panel">
       <div class="panel-box" id="detailPanel">
         <h3>Detail marketu</h3>
-        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa checklist a systémový draft podľa v6.</p>
+        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa checklist, systémový draft a legenda v6.</p>
       </div>
     </div>
   </div>
@@ -1330,6 +1418,12 @@ def dashboard():
       if (flag === 'WATCH') return '<span class="badge watch">WATCH</span>';
       if (flag === 'REVIEW') return '<span class="badge review">REVIEW</span>';
       return '<span class="badge pass">PASS</span>';
+    }
+
+    function decisionBadge(value) {
+      if (value === 'BUY YES') return '<span class="badge decision-buy-yes">BUY YES</span>';
+      if (value === 'BUY NO') return '<span class="badge decision-buy-no">BUY NO</span>';
+      return '<span class="badge decision-pass">PASS</span>';
     }
 
     function catBadge(cat) {
@@ -1427,9 +1521,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       const text = buildTradeLogText(selectedMarket);
       await navigator.clipboard.writeText(text);
       const msg = document.getElementById('savedNote');
-      if (msg) {
-        msg.textContent = 'Trade-log šablóna skopírovaná do schránky.';
-      }
+      if (msg) msg.textContent = 'Trade-log šablóna skopírovaná do schránky.';
     }
 
     function downloadTradeLog() {
@@ -1443,9 +1535,45 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       a.click();
       URL.revokeObjectURL(a.href);
       const msg = document.getElementById('savedNote');
-      if (msg) {
-        msg.textContent = 'Trade-log šablóna stiahnutá.';
-      }
+      if (msg) msg.textContent = 'Trade-log šablóna stiahnutá.';
+    }
+
+    function renderLegend() {
+      return `
+        <div class="legend-box">
+          <h3>Legenda v6</h3>
+
+          <div class="legend-item">
+            <strong>Gate 6/6</strong><br>
+            Súčet 6 povinných podmienok pred tradeom. Ak nie je 6/6, v strict režime trade spravidla neexistuje.
+          </div>
+
+          <div class="legend-item">
+            <strong>Mini checklist</strong><br>
+            Je detailný rozpis gate bodov: Resolutability, Base Rate, Frikcia, Exit, Catalyst, Oracle Trap.
+          </div>
+
+          <div class="legend-item">
+            <strong>Frikcia</strong><br>
+            Náklady a praktické prekážky tradu: spread, fees, sklz, likvidita a kvalita exitu. Ak zje edge, výsledok má byť PASS.
+          </div>
+
+          <div class="legend-item">
+            <strong>Typ trhu</strong><br>
+            Momentum = news repricing, Časový rozpad = edge z času, Resolution = pravidlá a oracle, Centovka = asymetria v pásme 0.01–0.05.
+          </div>
+
+          <div class="legend-item">
+            <strong>Oracle riziko</strong><br>
+            Riziko, že market resolve-ne inak, než vyzerá podľa reality, kvôli presnému textu pravidiel, source alebo ambiguity.
+          </div>
+
+          <div class="legend-item">
+            <strong>Rozhodnutie</strong><br>
+            PASS = neobchodovať. BUY YES / BUY NO = smer kandidáta podľa systému, nie garancia vstupu bez limitky a review.
+          </div>
+        </div>
+      `;
     }
 
     function showDetail(m) {
@@ -1459,6 +1587,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
             <h3>${m.question || 'Detail marketu'}</h3>
             <div>
               ${flagBadge(m.flag)}
+              ${decisionBadge(m.autoDraft?.finalDecision || 'PASS')}
               ${catBadge(m.categoryLabel)}
               ${pill('Typ: ' + (m.tradeTypeLabel || 'Ostatné'))}
               ${pill('Gate: ' + (m.gateScore ?? '') + '/6')}
@@ -1468,6 +1597,9 @@ ${m.autoDraft?.finalDecision || 'PASS'}
             ${link ? '<a class="trade-link" href="' + link + '" target="_blank" rel="noopener noreferrer">Otvoriť trade</a>' : ''}
           </div>
         </div>
+
+        <div class="draft-grid"><div>Fail point</div><div>${m.failPoint || ''}</div></div>
+        <div class="draft-grid"><div>Sizing cap</div><div>${m.sizingCap || ''}</div></div>
 
         <h3 style="margin-top:14px;">Mini 6/6 checklist</h3>
         ${renderChecklist(m.checklist || {})}
@@ -1505,6 +1637,8 @@ ${m.autoDraft?.finalDecision || 'PASS'}
 
           <div class="saved-note" id="savedNote"></div>
         </div>
+
+        ${renderLegend()}
       `;
     }
 
@@ -1513,6 +1647,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       const tbody = document.querySelector('#markets-table tbody');
       const countBox = document.getElementById('countBox');
 
+      const mode = document.getElementById('mode').value;
       const category = document.getElementById('category').value;
       const tradeType = document.getElementById('tradeType').value;
       const catalystConfidence = document.getElementById('catalystConfidence').value;
@@ -1520,12 +1655,12 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       const minLiquidity = document.getElementById('minLiquidity').value;
       const minVolume = document.getElementById('minVolume').value;
       const hidePass = document.getElementById('hidePass').checked;
-      const watchOnly = document.getElementById('watchOnly').checked;
       const gateOnly = document.getElementById('gateOnly').checked;
 
       try {
         const params = new URLSearchParams({
           limit: '100',
+          mode: mode,
           min_liquidity: minLiquidity,
           min_volume: minVolume,
           hide_pass: hidePass ? 'true' : 'false',
@@ -1540,11 +1675,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
         if (!res.ok) throw new Error('HTTP ' + res.status);
 
         const data = await res.json();
-        let markets = data.markets || [];
-
-        if (watchOnly) {
-          markets = markets.filter(m => m.flag === 'WATCH');
-        }
+        const markets = data.markets || [];
 
         cachedMarkets = markets;
         tbody.innerHTML = '';
@@ -1555,6 +1686,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
 
           tr.innerHTML = `
             <td>${flagBadge(m.flag)}</td>
+            <td>${decisionBadge(m.autoDraft?.finalDecision || 'PASS')}</td>
             <td>${m.gateScore ?? ''}/6</td>
             <td>${m.candidateScore ?? ''}</td>
             <td>${m.frictionLabelSk || ''}</td>
@@ -1563,7 +1695,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
             <td>${catBadge(m.categoryLabel)}</td>
             <td>${oracleBadge(m.oracleRiskLabel)}</td>
             <td>${m.catalystConfidenceLabel || ''}</td>
-            <td>${m.question || ''}</td>
+            <td class="question-cell"><div class="question-truncate">${m.question || ''}</div></td>
             <td>${fmtPrice(m.yesPrice)}</td>
             <td>${fmtPrice(m.noPrice)}</td>
             <td>${fmtInt(m.volume24hr)}</td>
@@ -1584,7 +1716,8 @@ ${m.autoDraft?.finalDecision || 'PASS'}
         if (markets.length > 0) {
           showDetail(markets[0]);
         } else {
-          document.getElementById('detailPanel').innerHTML = '<h3>Detail marketu</h3><p class="panel-muted">Žiadny market nevyhovuje aktuálnym filtrom.</p>';
+          document.getElementById('detailPanel').innerHTML =
+            '<h3>Detail marketu</h3><p class="panel-muted">Žiadny market nevyhovuje aktuálnym filtrom.</p>' + renderLegend();
         }
       } catch (err) {
         errorEl.textContent = 'Chyba pri načítaní marketov: ' + err.message;
@@ -1592,6 +1725,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       }
     }
 
+    document.getElementById('mode').addEventListener('change', loadMarkets);
     document.getElementById('category').addEventListener('change', loadMarkets);
     document.getElementById('tradeType').addEventListener('change', loadMarkets);
     document.getElementById('catalystConfidence').addEventListener('change', loadMarkets);
@@ -1599,7 +1733,6 @@ ${m.autoDraft?.finalDecision || 'PASS'}
     document.getElementById('minLiquidity').addEventListener('change', loadMarkets);
     document.getElementById('minVolume').addEventListener('change', loadMarkets);
     document.getElementById('hidePass').addEventListener('change', loadMarkets);
-    document.getElementById('watchOnly').addEventListener('change', loadMarkets);
     document.getElementById('gateOnly').addEventListener('change', loadMarkets);
 
     loadMarkets();
