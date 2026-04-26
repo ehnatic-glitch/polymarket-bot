@@ -82,6 +82,69 @@ def get_yes_no_prices(market):
     return yes_price, no_price
 
 
+def sk_category(value):
+    mapping = {
+        "Sports": "Šport",
+        "Politics": "Politika",
+        "Crypto": "Krypto",
+        "Geopolitics": "Geopolitika",
+        "Narrative": "Naratív",
+        "Other": "Ostatné",
+    }
+    return mapping.get(value, value or "Ostatné")
+
+
+def sk_trade_type(value):
+    mapping = {
+        "Momentum": "Momentum",
+        "Time Decay": "Časový rozpad",
+        "Resolution": "Resolution / spor",
+        "Centovka": "Centovka",
+        "Other": "Ostatné",
+    }
+    return mapping.get(value, value or "Ostatné")
+
+
+def sk_oracle_risk(value):
+    mapping = {
+        "Low": "Nízke",
+        "Medium": "Stredné",
+        "High": "Vysoké",
+    }
+    return mapping.get(value, value or "")
+
+
+def sk_friction_label(value):
+    mapping = {
+        "Low friction": "Nízka frikcia",
+        "Manageable": "Zvládnuteľná",
+        "Medium": "Stredná",
+        "High friction": "Vysoká frikcia",
+    }
+    return mapping.get(value, value or "")
+
+
+def sk_exit_label(value):
+    mapping = {
+        "Good exit": "Dobrý exit",
+        "Okay exit": "Priemerný exit",
+        "Weak exit": "Slabý exit",
+    }
+    return mapping.get(value, value or "")
+
+
+def sk_catalyst_type(value):
+    mapping = {
+        "Vote/Election": "Voľby / hlasovanie",
+        "Deadline": "Deadline",
+        "Report/Announcement": "Report / oznámenie",
+        "Scheduled event": "Naplánovaná udalosť",
+        "Near expiry": "Blízko expirácie",
+        "Unclear": "Nejasný",
+    }
+    return mapping.get(value, value or "")
+
+
 def categorize_market(question):
     q = (question or "").lower()
 
@@ -452,34 +515,34 @@ def score_market(m):
     if trade_type == "Momentum":
         summary_parts.append("momentum/news")
     elif trade_type == "Time Decay":
-        summary_parts.append("time decay")
+        summary_parts.append("časový rozpad")
     elif trade_type == "Resolution":
         summary_parts.append("resolution risk")
     elif trade_type == "Centovka":
         summary_parts.append("centovka")
 
     if oracle_risk == "Low":
-        summary_parts.append("nízky oracle risk")
+        summary_parts.append("nízke oracle riziko")
     elif oracle_risk == "Medium":
-        summary_parts.append("stredný oracle risk")
+        summary_parts.append("stredné oracle riziko")
     else:
-        summary_parts.append("vysoký oracle risk")
+        summary_parts.append("vysoké oracle riziko")
 
-    summary_parts.append(fr_label.lower())
-    summary_parts.append(ex_label.lower())
+    summary_parts.append(sk_friction_label(fr_label).lower())
+    summary_parts.append(sk_exit_label(ex_label).lower())
 
     if catalyst_type != "Unclear":
-        summary_parts.append(f"katalyzátor: {catalyst_type.lower()}")
+        summary_parts.append(f"katalyzátor: {sk_catalyst_type(catalyst_type).lower()}")
 
     if "sports_hype_risk" in notes:
-        summary_parts.append("šport needs stronger setup")
+        summary_parts.append("šport potrebuje silnejší setup")
 
     summary = ", ".join(summary_parts)
 
     checklist = {
         "resolutability": {
             "ok": gate_resolutability,
-            "note": "Pravidlá bez silnej ambiguity." if gate_resolutability else "Pravidlá/wording nesú ambiguity."
+            "note": "Pravidlá sú bez silnej ambiguity." if gate_resolutability else "Pravidlá alebo wording nesú ambiguities."
         },
         "baseRate": {
             "ok": gate_base_rate,
@@ -487,49 +550,57 @@ def score_market(m):
         },
         "friction": {
             "ok": gate_friction,
-            "note": f"{fr_label}, friction score {fr_score}."
+            "note": f"{sk_friction_label(fr_label)}, friction score {fr_score}."
         },
         "exit": {
             "ok": gate_exit,
-            "note": f"{ex_label}, exit score {ex_score}."
+            "note": f"{sk_exit_label(ex_label)}, exit score {ex_score}."
         },
         "catalyst": {
             "ok": gate_catalyst,
-            "note": f"{catalyst_type}, confidence {catalyst_confidence}."
+            "note": f"{sk_catalyst_type(catalyst_type)}, confidence {sk_oracle_risk(catalyst_confidence)}."
         },
         "oracle": {
             "ok": gate_oracle,
-            "note": f"Oracle risk {oracle_risk}."
+            "note": f"Oracle riziko: {sk_oracle_risk(oracle_risk)}."
         }
     }
 
     detail_commentary = [
-        f"Trade type: {trade_type}.",
-        f"Oracle risk: {oracle_risk}.",
-        f"Friction: {fr_label} ({fr_score}).",
-        f"Exit: {ex_label} ({ex_score}).",
-        f"Catalyst: {catalyst_type} / {catalyst_confidence}.",
+        f"Typ trhu: {sk_trade_type(trade_type)}.",
+        f"Oracle riziko: {sk_oracle_risk(oracle_risk)}.",
+        f"Frikcia: {sk_friction_label(fr_label)} ({fr_score}).",
+        f"Exit: {sk_exit_label(ex_label)} ({ex_score}).",
+        f"Katalyzátor: {sk_catalyst_type(catalyst_type)} / {sk_oracle_risk(catalyst_confidence)}.",
         f"Gate: {gate_score}/6."
     ]
 
     return {
         "candidateScore": score,
         "flag": flag,
+        "flagLabel": flag,
         "notes": notes,
         "summary": summary,
         "yesPrice": yes_price,
         "noPrice": no_price,
         "daysToEnd": days_to_end,
         "category": category,
+        "categoryLabel": sk_category(category),
         "tradeType": trade_type,
+        "tradeTypeLabel": sk_trade_type(trade_type),
         "oracleRisk": oracle_risk,
+        "oracleRiskLabel": sk_oracle_risk(oracle_risk),
         "gateScore": gate_score,
         "frictionScore": fr_score,
         "frictionLabel": fr_label,
+        "frictionLabelSk": sk_friction_label(fr_label),
         "exitScore": ex_score,
         "exitLabel": ex_label,
+        "exitLabelSk": sk_exit_label(ex_label),
         "catalystType": catalyst_type,
+        "catalystTypeLabel": sk_catalyst_type(catalyst_type),
         "catalystConfidence": catalyst_confidence,
+        "catalystConfidenceLabel": sk_oracle_risk(catalyst_confidence),
         "checklist": checklist,
         "detailCommentary": detail_commentary,
         "gate": {
@@ -562,22 +633,30 @@ def build_market_row(m):
         "lastTradePrice": m.get("lastTradePrice"),
         "candidateScore": scored["candidateScore"],
         "flag": scored["flag"],
+        "flagLabel": scored["flagLabel"],
         "notes": scored["notes"],
         "summary": scored["summary"],
         "yesPrice": scored["yesPrice"],
         "noPrice": scored["noPrice"],
         "daysToEnd": scored["daysToEnd"],
         "category": scored["category"],
+        "categoryLabel": scored["categoryLabel"],
         "tradeType": scored["tradeType"],
+        "tradeTypeLabel": scored["tradeTypeLabel"],
         "oracleRisk": scored["oracleRisk"],
+        "oracleRiskLabel": scored["oracleRiskLabel"],
         "gateScore": scored["gateScore"],
         "gate": scored["gate"],
         "frictionScore": scored["frictionScore"],
         "frictionLabel": scored["frictionLabel"],
+        "frictionLabelSk": scored["frictionLabelSk"],
         "exitScore": scored["exitScore"],
         "exitLabel": scored["exitLabel"],
+        "exitLabelSk": scored["exitLabelSk"],
         "catalystType": scored["catalystType"],
+        "catalystTypeLabel": scored["catalystTypeLabel"],
         "catalystConfidence": scored["catalystConfidence"],
+        "catalystConfidenceLabel": scored["catalystConfidenceLabel"],
         "checklist": scored["checklist"],
         "detailCommentary": scored["detailCommentary"],
     }
@@ -688,10 +767,10 @@ def markets_top():
 def dashboard():
     return """
 <!doctype html>
-<html lang="en">
+<html lang="sk">
 <head>
   <meta charset="utf-8">
-  <title>Polymarket Candidate Dashboard v4</title>
+  <title>Polymarket Kandidátny Dashboard</title>
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -843,12 +922,6 @@ def dashboard():
       color: #666;
       font-weight: 600;
     }
-    .summary {
-      font-size: 12px;
-      color: #666;
-      max-width: 280px;
-      white-space: normal;
-    }
     .table-wrap {
       overflow: auto;
       max-height: 78vh;
@@ -926,51 +999,51 @@ def dashboard():
   </style>
 </head>
 <body>
-  <h1>Polymarket Candidate Dashboard</h1>
-  <p class="small">v4 podľa v6: detail panel, mini 6/6 checklist, friction score, exit score.</p>
+  <h1>Polymarket kandidátny dashboard</h1>
+  <p class="small">v4 podľa v6: detail panel, mini 6/6 checklist, frikcia, exit score.</p>
 
   <div class="layout">
     <div class="section">
-      <h2>Top candidates</h2>
+      <h2>Top kandidáti</h2>
 
       <div class="controls">
         <div class="control">
-          <label for="category">Category</label>
+          <label for="category">Kategória</label>
           <select id="category">
-            <option value="">All</option>
-            <option value="Sports">Sports</option>
-            <option value="Politics">Politics</option>
-            <option value="Crypto">Crypto</option>
-            <option value="Geopolitics">Geopolitics</option>
-            <option value="Narrative">Narrative</option>
-            <option value="Other">Other</option>
+            <option value="">Všetko</option>
+            <option value="Sports">Šport</option>
+            <option value="Politics">Politika</option>
+            <option value="Crypto">Krypto</option>
+            <option value="Geopolitics">Geopolitika</option>
+            <option value="Narrative">Naratív</option>
+            <option value="Other">Ostatné</option>
           </select>
         </div>
 
         <div class="control">
-          <label for="tradeType">Trade type</label>
+          <label for="tradeType">Typ trhu</label>
           <select id="tradeType">
-            <option value="">All</option>
+            <option value="">Všetko</option>
             <option value="Momentum">Momentum</option>
-            <option value="Time Decay">Time Decay</option>
-            <option value="Resolution">Resolution</option>
+            <option value="Time Decay">Časový rozpad</option>
+            <option value="Resolution">Resolution / spor</option>
             <option value="Centovka">Centovka</option>
-            <option value="Other">Other</option>
+            <option value="Other">Ostatné</option>
           </select>
         </div>
 
         <div class="control">
-          <label for="maxOracleRisk">Max oracle risk</label>
+          <label for="maxOracleRisk">Max oracle riziko</label>
           <select id="maxOracleRisk">
-            <option value="">All</option>
-            <option value="Low" selected>Low</option>
-            <option value="Medium">Medium</option>
-            <option value="High">High</option>
+            <option value="">Všetko</option>
+            <option value="Low" selected>Nízke</option>
+            <option value="Medium">Stredné</option>
+            <option value="High">Vysoké</option>
           </select>
         </div>
 
         <div class="control">
-          <label for="minLiquidity">Min liquidity</label>
+          <label for="minLiquidity">Min likvidita</label>
           <select id="minLiquidity">
             <option value="0">0</option>
             <option value="50000">50 000</option>
@@ -981,7 +1054,7 @@ def dashboard():
         </div>
 
         <div class="control">
-          <label for="minVolume">Min 24h volume</label>
+          <label for="minVolume">Min 24h objem</label>
           <select id="minVolume">
             <option value="0">0</option>
             <option value="25000" selected>25 000</option>
@@ -993,21 +1066,21 @@ def dashboard():
 
         <div class="checkbox-wrap">
           <input type="checkbox" id="hidePass" checked />
-          <label for="hidePass">Hide PASS</label>
+          <label for="hidePass">Skryť PASS</label>
         </div>
 
         <div class="checkbox-wrap">
           <input type="checkbox" id="watchOnly" />
-          <label for="watchOnly">WATCH only</label>
+          <label for="watchOnly">Len WATCH</label>
         </div>
 
         <div class="checkbox-wrap">
           <input type="checkbox" id="gateOnly" />
-          <label for="gateOnly">6/6 gate only</label>
+          <label for="gateOnly">Len 6/6 gate</label>
         </div>
 
         <div class="control">
-          <button onclick="loadMarkets()">Refresh</button>
+          <button onclick="loadMarkets()">Obnoviť</button>
         </div>
       </div>
 
@@ -1020,18 +1093,18 @@ def dashboard():
             <tr>
               <th>Flag</th>
               <th>Gate</th>
-              <th>Score</th>
-              <th>Friction</th>
+              <th>Skóre</th>
+              <th>Frikcia</th>
               <th>Exit</th>
-              <th>Type</th>
-              <th>Category</th>
+              <th>Typ</th>
+              <th>Kategória</th>
               <th>Oracle</th>
-              <th>Question</th>
+              <th>Otázka</th>
               <th>Yes</th>
               <th>No</th>
-              <th>24h volume</th>
-              <th>Liquidity</th>
-              <th>Days</th>
+              <th>24h objem</th>
+              <th>Likvidita</th>
+              <th>Dni</th>
               <th>Link</th>
             </tr>
           </thead>
@@ -1042,7 +1115,7 @@ def dashboard():
 
     <div class="panel">
       <div class="panel-box" id="detailPanel">
-        <h3>Market detail</h3>
+        <h3>Detail marketu</h3>
         <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa mini pre-trade panel podľa v6.</p>
       </div>
     </div>
@@ -1076,13 +1149,13 @@ def dashboard():
     }
 
     function catBadge(cat) {
-      return '<span class="cat">' + (cat || 'Other') + '</span>';
+      return '<span class="cat">' + (cat || 'Ostatné') + '</span>';
     }
 
     function oracleBadge(level) {
-      if (level === 'Low') return '<span class="risk-low">Low</span>';
-      if (level === 'Medium') return '<span class="risk-medium">Medium</span>';
-      return '<span class="risk-high">High</span>';
+      if (level === 'Nízke') return '<span class="risk-low">Nízke</span>';
+      if (level === 'Stredné') return '<span class="risk-medium">Stredné</span>';
+      return '<span class="risk-high">Vysoké</span>';
     }
 
     function pill(text) {
@@ -1103,7 +1176,7 @@ def dashboard():
         const item = checklist[key];
         return `
           <div class="check">
-            <div class="${item.ok ? 'ok' : 'no'}">${item.ok ? 'YES' : 'NO'}</div>
+            <div class="${item.ok ? 'ok' : 'no'}">${item.ok ? 'ÁNO' : 'NIE'}</div>
             <div><strong>${label}</strong><br>${item.note || ''}</div>
           </div>
         `;
@@ -1119,33 +1192,33 @@ def dashboard():
         .join('');
 
       panel.innerHTML = `
-        <h3>${m.question || 'Market detail'}</h3>
+        <h3>${m.question || 'Detail marketu'}</h3>
         <div style="margin-bottom:10px;">
           ${flagBadge(m.flag)}
-          ${catBadge(m.category)}
-          ${pill('Type: ' + (m.tradeType || 'Other'))}
+          ${catBadge(m.categoryLabel)}
+          ${pill('Typ: ' + (m.tradeTypeLabel || 'Ostatné'))}
           ${pill('Gate: ' + (m.gateScore ?? '') + '/6')}
         </div>
 
-        <div class="kv"><div>Oracle</div><div>${oracleBadge(m.oracleRisk)}</div></div>
+        <div class="kv"><div>Oracle</div><div>${oracleBadge(m.oracleRiskLabel)}</div></div>
         <div class="kv"><div>Yes / No</div><div>${fmtPrice(m.yesPrice)} / ${fmtPrice(m.noPrice)}</div></div>
-        <div class="kv"><div>Liquidity</div><div>${fmtInt(m.liquidity)}</div></div>
-        <div class="kv"><div>24h volume</div><div>${fmtInt(m.volume24hr)}</div></div>
-        <div class="kv"><div>Days</div><div>${fmtDays(m.daysToEnd)}</div></div>
-        <div class="kv"><div>Friction</div><div>${m.frictionLabel || ''} (${m.frictionScore ?? ''})</div></div>
-        <div class="kv"><div>Exit</div><div>${m.exitLabel || ''} (${m.exitScore ?? ''})</div></div>
-        <div class="kv"><div>Catalyst</div><div>${m.catalystType || ''} / ${m.catalystConfidence || ''}</div></div>
-        <div class="kv"><div>Summary</div><div>${m.summary || ''}</div></div>
+        <div class="kv"><div>Likvidita</div><div>${fmtInt(m.liquidity)}</div></div>
+        <div class="kv"><div>24h objem</div><div>${fmtInt(m.volume24hr)}</div></div>
+        <div class="kv"><div>Dni</div><div>${fmtDays(m.daysToEnd)}</div></div>
+        <div class="kv"><div>Frikcia</div><div>${m.frictionLabelSk || ''} (${m.frictionScore ?? ''})</div></div>
+        <div class="kv"><div>Exit</div><div>${m.exitLabelSk || ''} (${m.exitScore ?? ''})</div></div>
+        <div class="kv"><div>Katalyzátor</div><div>${m.catalystTypeLabel || ''} / ${m.catalystConfidenceLabel || ''}</div></div>
+        <div class="kv"><div>Zhrnutie</div><div>${m.summary || ''}</div></div>
 
         <h3 style="margin-top:14px;">Mini 6/6 checklist</h3>
         ${renderChecklist(m.checklist || {})}
 
-        <h3 style="margin-top:14px;">Quick notes</h3>
+        <h3 style="margin-top:14px;">Rýchle poznámky</h3>
         <ul class="detail-list">${commentary}</ul>
 
         <div class="link-row">
-          ${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Open on Polymarket</a>' : ''}
-          ${m.slug ? '<a href="/analyze-market?slug=' + encodeURIComponent(m.slug) + '" target="_blank" rel="noopener noreferrer">Analyze JSON</a>' : ''}
+          ${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Otvoriť na Polymarkete</a>' : ''}
+          ${m.slug ? '<a href="/analyze-market?slug=' + encodeURIComponent(m.slug) + '" target="_blank" rel="noopener noreferrer">Zobraziť JSON analýzu</a>' : ''}
         </div>
       `;
     }
@@ -1200,18 +1273,18 @@ def dashboard():
             <td>${flagBadge(m.flag)}</td>
             <td>${m.gateScore ?? ''}/6</td>
             <td>${m.candidateScore ?? ''}</td>
-            <td>${m.frictionLabel || ''}</td>
-            <td>${m.exitLabel || ''}</td>
-            <td>${m.tradeType || ''}</td>
-            <td>${catBadge(m.category)}</td>
-            <td>${oracleBadge(m.oracleRisk)}</td>
+            <td>${m.frictionLabelSk || ''}</td>
+            <td>${m.exitLabelSk || ''}</td>
+            <td>${m.tradeTypeLabel || ''}</td>
+            <td>${catBadge(m.categoryLabel)}</td>
+            <td>${oracleBadge(m.oracleRiskLabel)}</td>
             <td>${m.question || ''}</td>
             <td>${fmtPrice(m.yesPrice)}</td>
             <td>${fmtPrice(m.noPrice)}</td>
             <td>${fmtInt(m.volume24hr)}</td>
             <td>${fmtInt(m.liquidity)}</td>
             <td>${fmtDays(m.daysToEnd)}</td>
-            <td>${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Open</a>' : ''}</td>
+            <td>${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Otvoriť</a>' : ''}</td>
           `;
 
           tr.addEventListener('click', (e) => {
@@ -1229,7 +1302,7 @@ def dashboard():
           showDetail(markets[0]);
         }
       } catch (err) {
-        errorEl.textContent = 'Chyba pri načítaní markets: ' + err.message;
+        errorEl.textContent = 'Chyba pri načítaní marketov: ' + err.message;
         errorEl.style.display = 'block';
       }
     }
