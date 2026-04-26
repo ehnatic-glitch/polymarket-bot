@@ -1,6 +1,8 @@
 from flask import Flask, jsonify, request
 import requests
 import json
+import re
+from collections import defaultdict
 from datetime import datetime, timezone
 
 app = Flask(__name__)
@@ -150,20 +152,22 @@ def categorize_market(question):
 
     sports_keywords = [
         "world cup", "nba finals", "nfl", "mlb", "stanley cup",
-        "champions league", "premier league", "ufc", "fifa"
+        "champions league", "premier league", "ufc", "fifa",
+        "win the 2026", "win the finals", "win the world cup"
     ]
     politics_keywords = [
         "presidential", "election", "senate", "house", "democratic",
         "republican", "nomination", "trump", "vance", "rubio", "newsom",
-        "macron", "prime minister", "parliament"
+        "macron", "prime minister", "parliament", "cabinet", "governor"
     ]
     crypto_keywords = [
         "bitcoin", "btc", "ethereum", "eth", "solana", "xrp", "crypto",
-        "kraken", "coinbase", "ipo", "microstrategy"
+        "kraken", "coinbase", "ipo", "microstrategy", "doge", "token"
     ]
     geopolitics_keywords = [
         "ukraine", "nato", "china", "india", "military",
-        "war", "troops", "ceasefire", "taiwan", "iran", "israel", "hezbollah"
+        "war", "troops", "ceasefire", "taiwan", "iran", "israel", "hezbollah",
+        "gaza", "russia"
     ]
     meme_keywords = [
         "gta", "jesus christ", "$1m", "meme"
@@ -199,7 +203,7 @@ def detect_trade_type(question, yes_price, days_to_end):
         return "Time Decay"
 
     momentum_keywords = [
-        "ipo", "ceasefire", "announcement", "report", "vote", "deadline"
+        "ipo", "ceasefire", "announcement", "report", "vote", "deadline", "earnings"
     ]
     if any(k in q for k in momentum_keywords):
         return "Momentum"
@@ -404,7 +408,7 @@ def decision_bias(flag, yes_price, oracle_risk, trade_type, gate_score, fr_score
     return "No trade", "PASS"
 
 
-def fail_point(checklist, oracle_risk, fr_score, ex_score, catalyst_confidence, notes):
+def fail_point(checklist, oracle_risk, notes):
     if oracle_risk == "High":
         return "Oracle Trap"
     if checklist and not checklist["resolutability"]["ok"]:
@@ -432,6 +436,56 @@ def sizing_cap_from_v6(flag, trade_type, final_decision):
     if flag == "WATCH":
         return "25–40 USDC"
     return "10–20 USDC"
+
+
+def normalize_words(text):
+    q = (text or "").lower()
+    q = re.sub(r"[^a-z0-9\s]", " ", q)
+    words = [w for w in q.split() if len(w) > 2]
+    stop = {
+        "will", "the", "2026", "2025", "2024", "with", "from", "that",
+        "have", "this", "what", "when", "before", "after", "into", "over",
+        "under", "their", "they", "wins", "win", "lose", "losee"
+    }
+    return [w for w in words if w not in stop]
+
+
+def detect_cluster(question, category):
+    q = (question or "").lower()
+
+    if "world cup" in q or "fifa" in q:
+        return "FIFA World Cup 2026"
+    if "nba finals" in q:
+        return "NBA Finals 2026"
+    if "stanley cup" in q:
+        return "Stanley Cup"
+    if "champions league" in q:
+        return "Champions League"
+    if "presidential election" in q or "president" in q:
+        return "US Presidential"
+    if "senate" in q:
+        return "US Senate"
+    if "house" in q:
+        return "US House"
+    if "bitcoin" in q or "btc" in q:
+        return "Bitcoin"
+    if "ethereum" in q or "eth" in q:
+        return "Ethereum"
+    if "coinbase" in q:
+        return "Coinbase"
+    if "kraken" in q:
+        return "Kraken"
+    if "ukraine" in q:
+        return "Ukraine"
+    if "israel" in q or "gaza" in q or "hezbollah" in q:
+        return "Middle East"
+
+    words = normalize_words(question)
+    if category == "Sports" and len(words) >= 3:
+        return "Sports: " + " ".join(words[:3])
+    if len(words) >= 2:
+        return f"{category}: " + " ".join(words[:2])
+    return f"{category}: misc"
 
 
 def build_auto_draft(question, category, trade_type, yes_price, no_price, days_to_end,
@@ -544,7 +598,6 @@ def score_market(m):
 
     gate_resolutability = oracle_risk == "Low"
     gate_base_rate = category in ["Politics", "Crypto", "Sports", "Other", "Geopolitics"]
-
     gate_friction = fr_score >= 3
     gate_exit = ex_score >= 2
     gate_catalyst = catalyst_confidence in ["High", "Medium"] and days_to_end is not None and days_to_end <= 180
@@ -704,8 +757,9 @@ def score_market(m):
         ex_score=ex_score,
     )
 
-    fail = fail_point(checklist, oracle_risk, fr_score, ex_score, catalyst_confidence, notes)
+    fail = fail_point(checklist, oracle_risk, notes)
     sizing_cap = sizing_cap_from_v6(flag, trade_type, auto_draft["finalDecision"])
+    cluster = detect_cluster(raw_question, category)
 
     return {
         "candidateScore": score,
@@ -744,6 +798,7 @@ def score_market(m):
         "autoDraft": auto_draft,
         "failPoint": fail,
         "sizingCap": sizing_cap,
+        "cluster": cluster,
     }
 
 
@@ -793,6 +848,7 @@ def build_market_row(m):
         "autoDraft": scored["autoDraft"],
         "failPoint": scored["failPoint"],
         "sizingCap": scored["sizingCap"],
+        "cluster": scored["cluster"],
     }
 
 
@@ -820,6 +876,40 @@ def oracle_priority(level):
     return 2
 
 
+def apply_diversity(rows, mode="strict", diversify=True, max_per_category=None, max_per_cluster=None):
+    if not diversify:
+        return rows
+
+    if max_per_category is None:
+        max_per_category = 3 if mode == "strict" else 4
+    if max_per_cluster is None:
+        max_per_cluster = 2
+
+    category_counts = defaultdict(int)
+    cluster_counts = defaultdict(int)
+    selected = []
+
+    for row in rows:
+        cat = row.get("category", "Other")
+        cluster = row.get("cluster", "misc")
+
+        if category_counts[cat] >= max_per_category:
+            continue
+        if cluster_counts[cluster] >= max_per_cluster:
+            continue
+
+        selected.append(row)
+        category_counts[cat] += 1
+        cluster_counts[cluster] += 1
+
+    return selected
+
+
+def top_non_sports(rows, limit=3):
+    non_sports = [r for r in rows if r.get("category") != "Sports"]
+    return non_sports[:limit]
+
+
 @app.route("/markets")
 def markets():
     limit = int(request.args.get("limit", "80"))
@@ -834,9 +924,15 @@ def markets():
     gate_only = request.args.get("gate_only", "false").lower() == "true"
     catalyst_conf_filter = request.args.get("catalyst_confidence", "").strip()
     mode = request.args.get("mode", "strict").strip().lower()
+    diversify = request.args.get("diversify", "true").lower() == "true"
+    max_per_category = request.args.get("max_per_category")
+    max_per_cluster = request.args.get("max_per_cluster")
+
+    max_per_category = int(max_per_category) if max_per_category not in [None, ""] else None
+    max_per_cluster = int(max_per_cluster) if max_per_cluster not in [None, ""] else None
 
     params = {
-        "limit": 200,
+        "limit": 250,
         "active": active,
         "closed": closed,
     }
@@ -887,6 +983,7 @@ def markets():
 
     rows.sort(
         key=lambda x: (
+            0 if x.get("category") != "Sports" and mode == "scout" else 1,
             decision_priority(x.get("autoDraft", {}).get("finalDecision")),
             flag_priority(x.get("flag")),
             -to_float(x.get("gateScore")),
@@ -897,11 +994,21 @@ def markets():
         )
     )
 
-    rows = rows[:limit]
+    diversified_rows = apply_diversity(
+        rows,
+        mode=mode,
+        diversify=diversify,
+        max_per_category=max_per_category,
+        max_per_cluster=max_per_cluster,
+    )
+
+    diversified_rows = diversified_rows[:limit]
+    alt_non_sports = top_non_sports(rows, limit=3)
 
     return jsonify({
-        "count": len(rows),
-        "markets": rows,
+        "count": len(diversified_rows),
+        "markets": diversified_rows,
+        "topNonSports": alt_non_sports,
         "filters": {
             "min_liquidity": min_liquidity,
             "min_volume": min_volume,
@@ -912,6 +1019,9 @@ def markets():
             "gate_only": gate_only,
             "catalyst_confidence": catalyst_conf_filter,
             "mode": mode,
+            "diversify": diversify,
+            "max_per_category": max_per_category,
+            "max_per_cluster": max_per_cluster,
         }
     })
 
@@ -928,7 +1038,7 @@ def dashboard():
 <html lang="sk">
 <head>
   <meta charset="utf-8">
-  <title>Polymarket Kandidátny Dashboard v5.3</title>
+  <title>Polymarket Kandidátny Dashboard v5.4</title>
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -948,7 +1058,7 @@ def dashboard():
     }
     .layout {
       display: grid;
-      grid-template-columns: minmax(0, 2.2fr) minmax(380px, 1fr);
+      grid-template-columns: minmax(0, 2.2fr) minmax(390px, 1fr);
       gap: 14px;
       align-items: start;
     }
@@ -956,7 +1066,7 @@ def dashboard():
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
       align-items: end;
     }
     .control {
@@ -964,6 +1074,15 @@ def dashboard():
       flex-direction: column;
       gap: 4px;
       min-width: 135px;
+    }
+    .help-inline {
+      margin: 6px 0 10px 0;
+      font-size: 12px;
+      color: #555;
+      background: #fafafa;
+      border: 1px solid #eee;
+      padding: 8px 10px;
+      border-radius: 6px;
     }
     label {
       font-size: 12px;
@@ -1092,7 +1211,7 @@ def dashboard():
     }
     .table-wrap {
       overflow: auto;
-      max-height: 80vh;
+      max-height: 62vh;
       border-radius: 8px;
     }
     .count {
@@ -1176,7 +1295,7 @@ def dashboard():
     .trade-link:hover {
       text-decoration: underline;
     }
-    .journal-box {
+    .journal-box, .legend-box, .non-sports-box {
       margin-top: 16px;
       padding-top: 12px;
       border-top: 1px solid #eee;
@@ -1204,11 +1323,6 @@ def dashboard():
       color: #555;
       font-weight: 600;
     }
-    .legend-box {
-      margin-top: 16px;
-      padding-top: 12px;
-      border-top: 1px solid #eee;
-    }
     .legend-item {
       padding: 8px 0;
       border-bottom: 1px solid #f2f2f2;
@@ -1230,16 +1344,34 @@ def dashboard():
       max-height: 2.7em;
       word-break: break-word;
     }
-    .w-flag { width: 72px; }
+    .mini-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .mini-card {
+      border: 1px solid #eee;
+      border-radius: 6px;
+      padding: 8px;
+      background: #fafafa;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .mini-card strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    .w-flag { width: 70px; }
     .w-decision { width: 92px; }
-    .w-gate { width: 52px; }
-    .w-score { width: 48px; }
+    .w-gate { width: 50px; }
+    .w-score { width: 46px; }
     .w-friction { width: 72px; }
     .w-exit { width: 70px; }
     .w-type { width: 72px; }
-    .w-cat { width: 70px; }
-    .w-oracle { width: 58px; }
-    .w-catc { width: 66px; }
+    .w-cat { width: 58px; }
+    .w-oracle { width: 56px; }
+    .w-catc { width: 60px; }
     .w-price { width: 50px; }
     .w-vol { width: 74px; }
     .w-liq { width: 82px; }
@@ -1257,7 +1389,7 @@ def dashboard():
 </head>
 <body>
   <h1>Polymarket kandidátny dashboard</h1>
-  <p class="small">v5.3: compact table, rozhodnutie v tabuľke, Strict/Scout režim, fail point a legenda v6.</p>
+  <p class="small">v5.4: diversity filter, cluster dedupe, top mimo športu, Strict/Scout helper a menej športového spamu.</p>
 
   <div class="layout">
     <div class="section">
@@ -1339,6 +1471,27 @@ def dashboard():
           </select>
         </div>
 
+        <div class="control">
+          <label for="maxPerCategory">Max / kategória</label>
+          <select id="maxPerCategory">
+            <option value="">Auto</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+            <option value="5">5</option>
+          </select>
+        </div>
+
+        <div class="control">
+          <label for="maxPerCluster">Max / cluster</label>
+          <select id="maxPerCluster">
+            <option value="">Auto</option>
+            <option value="1">1</option>
+            <option value="2" selected>2</option>
+            <option value="3">3</option>
+          </select>
+        </div>
+
         <div class="checkbox-wrap">
           <input type="checkbox" id="hidePass" checked />
           <label for="hidePass">Skryť PASS</label>
@@ -1349,9 +1502,18 @@ def dashboard():
           <label for="gateOnly">Len 6/6 gate</label>
         </div>
 
+        <div class="checkbox-wrap">
+          <input type="checkbox" id="diversify" checked />
+          <label for="diversify">Diverzifikovať feed</label>
+        </div>
+
         <div class="control">
           <button onclick="loadMarkets()">Obnoviť</button>
         </div>
+      </div>
+
+      <div class="help-inline" id="modeHelp">
+        Strict v6 = užší shortlist na reálny trade. Scout = širší research feed na hľadanie kandidátov pred finálnym preosiatím.
       </div>
 
       <div class="count" id="countBox"></div>
@@ -1387,7 +1549,7 @@ def dashboard():
     <div class="panel">
       <div class="panel-box" id="detailPanel">
         <h3>Detail marketu</h3>
-        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa checklist, systémový draft a legenda v6.</p>
+        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa checklist, systémový draft, cluster a legenda v6.</p>
       </div>
     </div>
   </div>
@@ -1395,6 +1557,7 @@ def dashboard():
   <script>
     let cachedMarkets = [];
     let selectedMarket = null;
+    let cachedNonSports = [];
 
     function fmtInt(value) {
       const n = Number(value);
@@ -1544,13 +1707,23 @@ ${m.autoDraft?.finalDecision || 'PASS'}
           <h3>Legenda v6</h3>
 
           <div class="legend-item">
+            <strong>Strict v6</strong><br>
+            Užší shortlist na reálny trade. Cieľ je vidieť len najčistejšie kandidáty blízko execution-ready stavu.
+          </div>
+
+          <div class="legend-item">
+            <strong>Scout</strong><br>
+            Širší research feed. Slúži na objavovanie kandidátov, nie na automatický vstup bez ďalšieho review.
+          </div>
+
+          <div class="legend-item">
             <strong>Gate 6/6</strong><br>
             Súčet 6 povinných podmienok pred tradeom. Ak nie je 6/6, v strict režime trade spravidla neexistuje.
           </div>
 
           <div class="legend-item">
             <strong>Mini checklist</strong><br>
-            Je detailný rozpis gate bodov: Resolutability, Base Rate, Frikcia, Exit, Catalyst, Oracle Trap.
+            Detailný rozpis gate bodov: Resolutability, Base Rate, Frikcia, Exit, Catalyst, Oracle Trap.
           </div>
 
           <div class="legend-item">
@@ -1569,9 +1742,37 @@ ${m.autoDraft?.finalDecision || 'PASS'}
           </div>
 
           <div class="legend-item">
-            <strong>Rozhodnutie</strong><br>
-            PASS = neobchodovať. BUY YES / BUY NO = smer kandidáta podľa systému, nie garancia vstupu bez limitky a review.
+            <strong>Cluster</strong><br>
+            Skupina marketov patriacich k rovnakému eventu alebo naratívu. Slúži na zníženie duplicitného feedu a lepšiu diverzifikáciu.
           </div>
+        </div>
+      `;
+    }
+
+    function renderNonSports() {
+      if (!cachedNonSports || cachedNonSports.length === 0) {
+        return `
+          <div class="non-sports-box">
+            <h3>Top mimo športu</h3>
+            <div class="panel-muted">Aktuálne nebol nájdený žiadny zaujímavý non-sports kandidát podľa tvojich filtrov.</div>
+          </div>
+        `;
+      }
+
+      const cards = cachedNonSports.map(m => `
+        <div class="mini-card">
+          <strong>${m.question || ''}</strong>
+          ${decisionBadge(m.autoDraft?.finalDecision || 'PASS')}
+          ${catBadge(m.categoryLabel || 'Ostatné')}
+          ${pill('Gate: ' + (m.gateScore ?? '') + '/6')}
+          <div style="margin-top:6px;">Cluster: ${m.cluster || ''}</div>
+        </div>
+      `).join('');
+
+      return `
+        <div class="non-sports-box">
+          <h3>Top mimo športu</h3>
+          <div class="mini-list">${cards}</div>
         </div>
       `;
     }
@@ -1598,6 +1799,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
           </div>
         </div>
 
+        <div class="draft-grid"><div>Cluster</div><div>${m.cluster || ''}</div></div>
         <div class="draft-grid"><div>Fail point</div><div>${m.failPoint || ''}</div></div>
         <div class="draft-grid"><div>Sizing cap</div><div>${m.sizingCap || ''}</div></div>
 
@@ -1638,8 +1840,19 @@ ${m.autoDraft?.finalDecision || 'PASS'}
           <div class="saved-note" id="savedNote"></div>
         </div>
 
+        ${renderNonSports()}
         ${renderLegend()}
       `;
+    }
+
+    function updateModeHelp() {
+      const mode = document.getElementById('mode').value;
+      const help = document.getElementById('modeHelp');
+      if (mode === 'strict') {
+        help.textContent = 'Strict v6 = užší shortlist na reálny trade. Prirodzene pustí menej marketov, ale bližšie k execution-ready kvalite.';
+      } else {
+        help.textContent = 'Scout = širší research feed. Umožní objaviť viac kandidátov, ale neznamená to automatický BUY bez ďalšieho v6 review.';
+      }
     }
 
     async function loadMarkets() {
@@ -1656,6 +1869,11 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       const minVolume = document.getElementById('minVolume').value;
       const hidePass = document.getElementById('hidePass').checked;
       const gateOnly = document.getElementById('gateOnly').checked;
+      const diversify = document.getElementById('diversify').checked;
+      const maxPerCategory = document.getElementById('maxPerCategory').value;
+      const maxPerCluster = document.getElementById('maxPerCluster').value;
+
+      updateModeHelp();
 
       try {
         const params = new URLSearchParams({
@@ -1668,7 +1886,10 @@ ${m.autoDraft?.finalDecision || 'PASS'}
           trade_type: tradeType,
           max_oracle_risk: maxOracleRisk,
           gate_only: gateOnly ? 'true' : 'false',
-          catalyst_confidence: catalystConfidence
+          catalyst_confidence: catalystConfidence,
+          diversify: diversify ? 'true' : 'false',
+          max_per_category: maxPerCategory,
+          max_per_cluster: maxPerCluster
         });
 
         const res = await fetch('/markets?' + params.toString());
@@ -1676,6 +1897,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
 
         const data = await res.json();
         const markets = data.markets || [];
+        cachedNonSports = data.topNonSports || [];
 
         cachedMarkets = markets;
         tbody.innerHTML = '';
@@ -1717,7 +1939,8 @@ ${m.autoDraft?.finalDecision || 'PASS'}
           showDetail(markets[0]);
         } else {
           document.getElementById('detailPanel').innerHTML =
-            '<h3>Detail marketu</h3><p class="panel-muted">Žiadny market nevyhovuje aktuálnym filtrom.</p>' + renderLegend();
+            '<h3>Detail marketu</h3><p class="panel-muted">Žiadny market nevyhovuje aktuálnym filtrom.</p>' +
+            renderNonSports() + renderLegend();
         }
       } catch (err) {
         errorEl.textContent = 'Chyba pri načítaní marketov: ' + err.message;
@@ -1734,6 +1957,9 @@ ${m.autoDraft?.finalDecision || 'PASS'}
     document.getElementById('minVolume').addEventListener('change', loadMarkets);
     document.getElementById('hidePass').addEventListener('change', loadMarkets);
     document.getElementById('gateOnly').addEventListener('change', loadMarkets);
+    document.getElementById('diversify').addEventListener('change', loadMarkets);
+    document.getElementById('maxPerCategory').addEventListener('change', loadMarkets);
+    document.getElementById('maxPerCluster').addEventListener('change', loadMarkets);
 
     loadMarkets();
   </script>
