@@ -12,6 +12,11 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 APP_CONFIG = {
     "dashboard_title": "Polymarket kandidátny dashboard",
     "default_min_liquidity": 100000.0,
+    "bankroll_total": 500.0,
+    "cash_reserve": 150.0,
+    "max_total_exposure": 200.0,
+    "max_narrative_exposure": 75.0,
+    "max_active_positions": 3,
 }
 
 
@@ -719,7 +724,53 @@ def build_auto_draft(question, category, trade_type, yes_price, no_price, days_t
     }
 
 
-def score_market(m):
+def entry_zone_status(final_decision, limit_price, yes_price, no_price):
+    if final_decision not in ["BUY YES", "BUY NO"] or not isinstance(limit_price, (int, float)):
+        return {
+            "code": "none",
+            "label": "Mimo plánu",
+            "distance": None,
+        }
+
+    market_price = yes_price if final_decision == "BUY YES" else no_price
+    if not isinstance(market_price, (int, float)):
+        return {
+            "code": "unknown",
+            "label": "Bez ceny",
+            "distance": None,
+        }
+
+    dist = round(market_price - limit_price, 3)
+
+    if market_price <= limit_price:
+        return {
+            "code": "entry",
+            "label": "V entry zóne",
+            "distance": dist,
+        }
+
+    if dist <= 0.01:
+        return {
+            "code": "near",
+            "label": "Blízko zóny",
+            "distance": dist,
+        }
+
+    if dist <= 0.03:
+        return {
+            "code": "far",
+            "label": "Mimo zóny",
+            "distance": dist,
+        }
+
+    return {
+        "code": "chase",
+        "label": "Nechase",
+        "distance": dist,
+    }
+
+
+def score_market(m, strict_mode=False):
     score = 0
     notes = []
 
@@ -816,6 +867,20 @@ def score_market(m):
         score += 1
         notes.append("asymmetric_centovka")
 
+    if strict_mode:
+        if category == "Sports":
+            score -= 5
+            notes.append("strict_sports_penalty")
+        if category == "Narrative":
+            score -= 4
+            notes.append("strict_narrative_penalty")
+        if oracle_risk == "Medium":
+            score -= 2
+            notes.append("strict_medium_oracle_penalty")
+        if isinstance(yes_price, (int, float)) and (yes_price < 0.05 or yes_price > 0.95):
+            score -= 3
+            notes.append("strict_extreme_price_penalty")
+
     hard_reject = (
         oracle_risk == "High" or
         "noise_market" in notes or
@@ -830,7 +895,8 @@ def score_market(m):
             isinstance(yes_price, (int, float)) and
             0.18 <= yes_price <= 0.82 and
             days_to_end is not None and
-            7 <= days_to_end <= 120
+            7 <= days_to_end <= 120 and
+            not strict_mode
         )
     )
 
@@ -854,6 +920,12 @@ def score_market(m):
         flag = "REVIEW"
     else:
         flag = "PASS"
+
+    if strict_mode:
+        if category in ["Sports", "Narrative"]:
+            flag = "PASS"
+        if oracle_risk in ["Medium", "High"] and flag == "WATCH":
+            flag = "REVIEW"
 
     display_flag = {
         "WATCH": "WATCH",
@@ -924,6 +996,35 @@ def score_market(m):
     fail = fail_point(checklist, oracle_risk, notes)
     sizing_cap = sizing_cap_from_v6(flag, trade_type, auto_draft["finalDecision"])
     cluster = detect_cluster(raw_question, category)
+    entry_zone = entry_zone_status(
+        auto_draft["finalDecision"],
+        execution_plan["limitPrice"],
+        yes_price,
+        no_price
+    )
+
+    why_now = []
+    if catalyst_confidence in ["High", "Medium"]:
+        why_now.append(f"katalyzátor {sk_catalyst_type(catalyst_type).lower()}")
+    if days_to_end is not None and days_to_end <= 7:
+        why_now.append("blízka expirácia")
+    if entry_zone["code"] in ["entry", "near"]:
+        why_now.append(entry_zone["label"].lower())
+    if isinstance(yes_price, (int, float)) and yes_price < 0.15:
+        why_now.append("longshot filter")
+    if oracle_risk == "Low":
+        why_now.append("nízke oracle riziko")
+
+    if why_now:
+        why_now_text = "Why now: " + ", ".join(why_now[:3]) + "."
+    else:
+        why_now_text = "Why now: bez silného aktuálneho triggera."
+
+    is_watchlist = (
+        auto_draft["finalDecision"] in ["BUY YES", "BUY NO"] or
+        flag == "WATCH" or
+        entry_zone["code"] in ["entry", "near"]
+    )
 
     return {
         "candidateScore": score,
@@ -964,11 +1065,15 @@ def score_market(m):
         "failPoint": fail,
         "sizingCap": sizing_cap,
         "cluster": cluster,
+        "entryZone": entry_zone,
+        "whyNow": why_now_text,
+        "isWatchlist": is_watchlist,
+        "strictModeApplied": strict_mode,
     }
 
 
-def build_market_row(m):
-    scored = score_market(m)
+def build_market_row(m, strict_mode=False):
+    scored = score_market(m, strict_mode=strict_mode)
 
     return {
         "question": m.get("question"),
@@ -1015,6 +1120,10 @@ def build_market_row(m):
         "failPoint": scored["failPoint"],
         "sizingCap": scored["sizingCap"],
         "cluster": scored["cluster"],
+        "entryZone": scored["entryZone"],
+        "whyNow": scored["whyNow"],
+        "isWatchlist": scored["isWatchlist"],
+        "strictModeApplied": scored["strictModeApplied"],
     }
 
 
@@ -1040,6 +1149,16 @@ def oracle_priority(level):
     if level == "Medium":
         return 1
     return 2
+
+
+def watchlist_priority(row):
+    if row.get("autoDraft", {}).get("finalDecision") in ["BUY YES", "BUY NO"]:
+        return 0
+    if row.get("flag") == "WATCH":
+        return 1
+    if row.get("entryZone", {}).get("code") in ["entry", "near"]:
+        return 2
+    return 3
 
 
 def apply_diversity(rows, diversify=True, max_per_category=3, max_per_cluster=2):
@@ -1071,6 +1190,87 @@ def top_non_sports(rows, limit=3):
     return non_sports[:limit]
 
 
+def build_watchlist(rows, limit=12):
+    watch = [r for r in rows if r.get("isWatchlist")]
+    watch.sort(
+        key=lambda x: (
+            watchlist_priority(x),
+            decision_priority(x.get("autoDraft", {}).get("finalDecision")),
+            flag_priority(x.get("flagLabel")),
+            -to_float(x.get("gateScore")),
+            -to_float(x.get("candidateScore")),
+        )
+    )
+    return watch[:limit]
+
+
+def build_portfolio_summary(rows):
+    selected = []
+    narrative_buckets = defaultdict(float)
+
+    for row in rows:
+        decision = row.get("autoDraft", {}).get("finalDecision")
+        if decision not in ["BUY YES", "BUY NO"]:
+            continue
+        selected.append(row)
+
+    selected.sort(
+        key=lambda x: (
+            decision_priority(x.get("autoDraft", {}).get("finalDecision")),
+            -to_float(x.get("gateScore")),
+            -to_float(x.get("candidateScore")),
+        )
+    )
+
+    selected = selected[:APP_CONFIG["max_active_positions"]]
+
+    total_exposure = 0.0
+    positions = []
+
+    for row in selected:
+        stake = to_float(row.get("executionPlan", {}).get("stakeUSDC"), 0.0)
+        cluster = row.get("cluster") or "misc"
+        narrative_buckets[cluster] += stake
+        total_exposure += stake
+        positions.append({
+            "question": row.get("question"),
+            "cluster": cluster,
+            "decision": row.get("autoDraft", {}).get("finalDecision"),
+            "stakeUSDC": stake,
+            "limitPrice": row.get("executionPlan", {}).get("limitPrice"),
+            "entryZone": row.get("entryZone", {}).get("label"),
+        })
+
+    reserve = APP_CONFIG["cash_reserve"]
+    bankroll_total = APP_CONFIG["bankroll_total"]
+    max_total = APP_CONFIG["max_total_exposure"]
+    free_risk = max(0.0, max_total - total_exposure)
+
+    warnings = []
+    if total_exposure > max_total:
+        warnings.append("Prekročený max celkový risk 200 USDC.")
+    if len(positions) > APP_CONFIG["max_active_positions"]:
+        warnings.append("Prekročený max počet aktívnych pozícií.")
+    for cluster, amount in narrative_buckets.items():
+        if amount > APP_CONFIG["max_narrative_exposure"]:
+            warnings.append(f"Prekročený max narrative cap 75 USDC pre {cluster}.")
+
+    return {
+        "bankrollTotal": bankroll_total,
+        "cashReserve": reserve,
+        "maxTotalExposure": max_total,
+        "activeExposure": round(total_exposure, 2),
+        "freeRiskBudget": round(free_risk, 2),
+        "activePositions": len(positions),
+        "positions": positions,
+        "narrativeExposure": [
+            {"cluster": k, "exposure": round(v, 2)}
+            for k, v in sorted(narrative_buckets.items(), key=lambda x: -x[1])
+        ],
+        "warnings": warnings,
+    }
+
+
 @app.route("/markets")
 def markets():
     limit = int(request.args.get("limit", "80"))
@@ -1082,6 +1282,8 @@ def markets():
     hide_pass = request.args.get("hide_pass", "true").lower() == "true"
     category_filter = request.args.get("category", "").strip()
     diversify = request.args.get("diversify", "true").lower() == "true"
+    watchlist_only = request.args.get("watchlist_only", "false").lower() == "true"
+    strict_mode = request.args.get("strict_mode", "false").lower() == "true"
 
     params = {
         "limit": 250,
@@ -1101,13 +1303,15 @@ def markets():
         if m.get("closed") is True:
             continue
 
-        row = build_market_row(m)
+        row = build_market_row(m, strict_mode=strict_mode)
 
         if to_float(row.get("liquidity")) < min_liquidity:
             continue
         if hide_pass and row.get("autoDraft", {}).get("finalDecision") == "PASS":
             continue
         if category_filter and row.get("category") != category_filter:
+            continue
+        if watchlist_only and not row.get("isWatchlist"):
             continue
 
         rows.append(row)
@@ -1134,16 +1338,22 @@ def markets():
 
     diversified_rows = diversified_rows[:limit]
     alt_non_sports = top_non_sports(rows, limit=3)
+    watchlist = build_watchlist(rows, limit=12)
+    portfolio = build_portfolio_summary(watchlist)
 
     return jsonify({
         "count": len(diversified_rows),
         "markets": diversified_rows,
         "topNonSports": alt_non_sports,
+        "watchlist": watchlist,
+        "portfolio": portfolio,
         "filters": {
             "min_liquidity": min_liquidity,
             "hide_pass": hide_pass,
             "category": category_filter,
             "diversify": diversify,
+            "watchlist_only": watchlist_only,
+            "strict_mode": strict_mode,
         }
     })
 
@@ -1157,7 +1367,8 @@ def markets_top():
 def analyze_market():
     payload = request.get_json(force=True, silent=True) or {}
     market = payload.get("market") or {}
-    return jsonify(build_market_row(market))
+    strict_mode = bool(payload.get("strict_mode", False))
+    return jsonify(build_market_row(market, strict_mode=strict_mode))
 
 
 @app.route("/dashboard")
@@ -1170,7 +1381,7 @@ def dashboard():
 <html lang="sk">
 <head>
   <meta charset="utf-8">
-  <title>{title} v5.8</title>
+  <title>{title} v6.0.1</title>
   <style>
     body {{
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -1313,6 +1524,26 @@ def dashboard():
       color: #c5221f;
       font-weight: 700;
     }}
+    .zone-entry {{
+      color: #137333;
+      font-weight: 700;
+    }}
+    .zone-near {{
+      color: #b06000;
+      font-weight: 700;
+    }}
+    .zone-far {{
+      color: #666;
+      font-weight: 700;
+    }}
+    .zone-chase {{
+      color: #c5221f;
+      font-weight: 700;
+    }}
+    .zone-none {{
+      color: #888;
+      font-weight: 700;
+    }}
     .panel {{
       position: sticky;
       top: 16px;
@@ -1396,6 +1627,18 @@ def dashboard():
       background: #f3f4f6;
       color: #333;
     }}
+    .delta-up {{
+      color: #137333;
+      font-weight: 700;
+    }}
+    .delta-down {{
+      color: #c5221f;
+      font-weight: 700;
+    }}
+    .delta-flat {{
+      color: #666;
+      font-weight: 700;
+    }}
     .action-row {{
       display: flex;
       gap: 10px;
@@ -1428,7 +1671,7 @@ def dashboard():
     .trade-link:hover {{
       text-decoration: underline;
     }}
-    .journal-box, .non-sports-box {{
+    .journal-box, .non-sports-box, .watchlist-box, .portfolio-box, .alerts-box {{
       margin-top: 16px;
       padding-top: 12px;
       border-top: 1px solid #eee;
@@ -1485,9 +1728,22 @@ def dashboard():
       display: block;
       margin-bottom: 4px;
     }}
+    .top-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }}
+    .warning {{
+      color: #c5221f;
+      font-weight: 700;
+      font-size: 12px;
+      margin-top: 6px;
+    }}
 
     .w-flag {{ width: 92px; }}
     .w-decision {{ width: 92px; }}
+    .w-zone {{ width: 92px; }}
     .w-gate {{ width: 50px; }}
     .w-score {{ width: 46px; }}
     .w-friction {{ width: 82px; }}
@@ -1507,12 +1763,30 @@ def dashboard():
       .panel {{
         position: static;
       }}
+      .top-grid {{
+        grid-template-columns: 1fr;
+      }}
     }}
   </style>
 </head>
 <body>
   <h1>{title}</h1>
-  <p class="small">v5.8: auto-draft bez písania, TP1/TP2 s percentami výstupu, runner a status refresh panel. [cite:544][cite:548]</p>
+  <p class="small">v6.0.1: delta tracking, watchlist, entry zóna, portfolio guardrails, rare alerts, strict v6 mode. [file:454][cite:544]</p>
+
+  <div class="top-grid">
+    <div class="section">
+      <h2>Watchlist</h2>
+      <div id="watchlistBox" class="panel-muted">Načítavam watchlist...</div>
+    </div>
+    <div class="section">
+      <h2>Portfolio panel</h2>
+      <div id="portfolioBox" class="panel-muted">Načítavam portfolio panel...</div>
+    </div>
+    <div class="section">
+      <h2>Rare alerts</h2>
+      <div id="alertsBox" class="panel-muted">Zatiaľ bez alertov.</div>
+    </div>
+  </div>
 
   <div class="layout">
     <div class="section">
@@ -1537,8 +1811,8 @@ def dashboard():
           <select id="minLiquidity">
             <option value="50000">50 000</option>
             <option value="100000" {"selected" if default_min_liquidity == 100000 else ""}>100 000</option>
-            <option value="150000" {"selected" if default_min_liquidity == 150000 else ""}>150 000</option>
-            <option value="250000" {"selected" if default_min_liquidity == 250000 else ""}>250 000</option>
+            <option value="150000">150 000</option>
+            <option value="250000">250 000</option>
           </select>
         </div>
 
@@ -1550,6 +1824,16 @@ def dashboard():
         <div class="checkbox-wrap">
           <input type="checkbox" id="diversify" checked />
           <label for="diversify">Diverzifikovať feed</label>
+        </div>
+
+        <div class="checkbox-wrap">
+          <input type="checkbox" id="watchlistOnly" />
+          <label for="watchlistOnly">Len watchlist</label>
+        </div>
+
+        <div class="checkbox-wrap">
+          <input type="checkbox" id="strictMode" />
+          <label for="strictMode">Strict v6 mode</label>
         </div>
 
         <div class="control">
@@ -1567,6 +1851,7 @@ def dashboard():
             <tr>
               <th class="w-flag">Kandidát</th>
               <th class="w-decision">Rozhod.</th>
+              <th class="w-zone">Entry zóna</th>
               <th class="w-gate">Gate</th>
               <th class="w-score">Skóre</th>
               <th class="w-friction">Frikcia</th>
@@ -1590,7 +1875,7 @@ def dashboard():
     <div class="panel">
       <div class="panel-box" id="detailPanel">
         <h3>Detail marketu</h3>
-        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa checklist, systémový draft a presný entry/exit plán. [cite:548]</p>
+        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa checklist, delta tracking, systémový draft a entry/exit plán. [file:454]</p>
       </div>
     </div>
   </div>
@@ -1599,6 +1884,11 @@ def dashboard():
     let cachedMarkets = [];
     let selectedMarket = null;
     let cachedNonSports = [];
+    let cachedWatchlist = [];
+    let cachedPortfolio = null;
+    let previousSnapshot = new Map();
+    let currentDeltaMap = new Map();
+    let rareAlerts = [];
     let autoRefreshTimer = null;
     let lastRefreshAt = null;
 
@@ -1675,11 +1965,13 @@ def dashboard():
       const windowText = info.inWindow
         ? 'Sme v aktívnom okne 07:00–21:00.'
         : 'Sme mimo aktívneho okna 07:00–21:00.';
+      const strictOn = document.getElementById('strictMode')?.checked ? 'ON' : 'OFF';
 
       el.innerHTML =
         'Dashboard aktuálny k: <strong>' + lastText + '</strong><br>' +
         'Aktuálny dátum a čas: <strong>' + fmtDateTime(now) + '</strong><br>' +
         'Plán refreshu: <strong>07:00, 09:00, 11:00, 13:00, 15:00, 17:00, 19:00, 21:00</strong><br>' +
+        'Strict v6 mode: <strong>' + strictOn + '</strong><br>' +
         windowText + ' Ďalší plánovaný refresh: <strong>' + nextText + '</strong>';
     }}
 
@@ -1715,6 +2007,16 @@ def dashboard():
       return '<span class="risk-high">Vysoké</span>';
     }}
 
+    function zoneBadge(zone) {{
+      const code = zone?.code || 'none';
+      const label = zone?.label || 'Mimo plánu';
+      if (code === 'entry') return '<span class="zone-entry">' + label + '</span>';
+      if (code === 'near') return '<span class="zone-near">' + label + '</span>';
+      if (code === 'far') return '<span class="zone-far">' + label + '</span>';
+      if (code === 'chase') return '<span class="zone-chase">' + label + '</span>';
+      return '<span class="zone-none">' + label + '</span>';
+    }}
+
     function pill(text) {{
       return '<span class="metric-pill">' + text + '</span>';
     }}
@@ -1740,6 +2042,178 @@ def dashboard():
       }}).join('');
     }}
 
+    function deltaClass(value) {{
+      if (value > 0) return 'delta-up';
+      if (value < 0) return 'delta-down';
+      return 'delta-flat';
+    }}
+
+    function fmtDelta(value) {{
+      const n = Number(value);
+      if (!Number.isFinite(n)) return '0.000';
+      const sign = n > 0 ? '+' : '';
+      return sign + n.toFixed(3);
+    }}
+
+    function computeDeltaMap(markets) {{
+      const nextMap = new Map();
+      const deltaMap = new Map();
+      const alerts = [];
+
+      markets.forEach(m => {{
+        const key = m.slug || m.question;
+        const prev = previousSnapshot.get(key);
+
+        const snap = {{
+          yesPrice: m.yesPrice,
+          noPrice: m.noPrice,
+          flag: m.flag,
+          flagLabel: m.flagLabel,
+          decision: m.autoDraft?.finalDecision || 'PASS',
+          gateScore: m.gateScore,
+          liquidity: m.liquidity,
+          entryZone: m.entryZone?.code || 'none',
+          oracleRisk: m.oracleRiskLabel,
+        }};
+        nextMap.set(key, snap);
+
+        const delta = {{
+          yesDelta: null,
+          noDelta: null,
+          gateDelta: null,
+          flagChanged: false,
+          decisionChanged: false,
+          liquidityDeltaPct: null,
+          summary: [],
+        }};
+
+        if (prev) {{
+          if (Number.isFinite(Number(snap.yesPrice)) && Number.isFinite(Number(prev.yesPrice))) {{
+            delta.yesDelta = Number((snap.yesPrice - prev.yesPrice).toFixed(3));
+            if (Math.abs(delta.yesDelta) >= 0.02) {{
+              delta.summary.push('YES ' + fmtDelta(delta.yesDelta));
+            }}
+          }}
+
+          if (Number.isFinite(Number(snap.noPrice)) && Number.isFinite(Number(prev.noPrice))) {{
+            delta.noDelta = Number((snap.noPrice - prev.noPrice).toFixed(3));
+          }}
+
+          if (Number.isFinite(Number(snap.gateScore)) && Number.isFinite(Number(prev.gateScore))) {{
+            delta.gateDelta = Number(snap.gateScore) - Number(prev.gateScore);
+            if (delta.gateDelta !== 0) {{
+              delta.summary.push('Gate ' + (delta.gateDelta > 0 ? '+' : '') + delta.gateDelta);
+            }}
+          }}
+
+          if (snap.flag !== prev.flag) {{
+            delta.flagChanged = true;
+            delta.summary.push('Flag: ' + prev.flagLabel + ' -> ' + snap.flagLabel);
+          }}
+
+          if (snap.decision !== prev.decision) {{
+            delta.decisionChanged = true;
+            delta.summary.push('Decision: ' + prev.decision + ' -> ' + snap.decision);
+          }}
+
+          if (Number.isFinite(Number(snap.liquidity)) && Number.isFinite(Number(prev.liquidity)) && Number(prev.liquidity) > 0) {{
+            const pct = ((Number(snap.liquidity) - Number(prev.liquidity)) / Number(prev.liquidity)) * 100;
+            delta.liquidityDeltaPct = Number(pct.toFixed(1));
+          }}
+
+          if (snap.flag === 'WATCH' && prev.flag !== 'WATCH') {{
+            alerts.push('Nový WATCH: ' + (m.question || ''));
+          }}
+          if (prev.decision === 'PASS' && (snap.decision === 'BUY YES' || snap.decision === 'BUY NO')) {{
+            alerts.push('PASS -> ' + snap.decision + ': ' + (m.question || ''));
+          }}
+          if (prev.entryZone !== 'entry' && snap.entryZone === 'entry') {{
+            alerts.push('Market vošiel do entry zóny: ' + (m.question || ''));
+          }}
+          if (snap.oracleRisk === 'Vysoké' && prev.oracleRisk !== 'Vysoké') {{
+            alerts.push('Oracle risk vyskočil na vysoké: ' + (m.question || ''));
+          }}
+          if (Number.isFinite(delta.liquidityDeltaPct) && delta.liquidityDeltaPct <= -30) {{
+            alerts.push('Likvidita prudko padla: ' + (m.question || ''));
+          }}
+          if (m.daysToEnd !== null && Number(m.daysToEnd) <= 3 && (snap.decision === 'BUY YES' || snap.decision === 'BUY NO')) {{
+            alerts.push('Blíži sa time-stop / expiry risk: ' + (m.question || ''));
+          }}
+        }}
+
+        deltaMap.set(key, delta);
+      }});
+
+      previousSnapshot = nextMap;
+      currentDeltaMap = deltaMap;
+      rareAlerts = alerts.slice(0, 10);
+    }}
+
+    function renderWatchlist() {{
+      const box = document.getElementById('watchlistBox');
+      if (!box) return;
+
+      if (!cachedWatchlist || cachedWatchlist.length === 0) {{
+        box.innerHTML = 'Žiadne watchlist kandidáty podľa aktuálnych filtrov.';
+        return;
+      }}
+
+      box.innerHTML = cachedWatchlist.map(m => `
+        <div class="mini-card">
+          <strong>${{m.question || ''}}</strong>
+          ${{decisionBadge(m.autoDraft?.finalDecision || 'PASS')}}
+          ${{zoneBadge(m.entryZone)}}
+          ${{pill('Gate: ' + (m.gateScore ?? '') + '/6')}}
+          <div style="margin-top:6px;">${{m.whyNow || ''}}</div>
+        </div>
+      `).join('');
+    }}
+
+    function renderPortfolio() {{
+      const box = document.getElementById('portfolioBox');
+      if (!box) return;
+
+      const p = cachedPortfolio;
+      if (!p) {{
+        box.innerHTML = 'Portfolio panel nie je dostupný.';
+        return;
+      }}
+
+      let html = `
+        <div>${{pill('Bankroll: ' + fmtInt(p.bankrollTotal) + ' USDC')}}</div>
+        <div>${{pill('Rezerva: ' + fmtInt(p.cashReserve) + ' USDC')}}</div>
+        <div>${{pill('Active risk: ' + fmtInt(p.activeExposure) + ' USDC')}}</div>
+        <div>${{pill('Free risk: ' + fmtInt(p.freeRiskBudget) + ' USDC')}}</div>
+        <div>${{pill('Pozície: ' + (p.activePositions || 0) + '/3')}}</div>
+      `;
+
+      if (p.narrativeExposure && p.narrativeExposure.length) {{
+        html += '<div style="margin-top:8px;">' + p.narrativeExposure.map(x =>
+          pill(x.cluster + ': ' + fmtInt(x.exposure) + ' USDC')
+        ).join(' ') + '</div>';
+      }}
+
+      if (p.warnings && p.warnings.length) {{
+        html += p.warnings.map(w => '<div class="warning">' + w + '</div>').join('');
+      }}
+
+      box.innerHTML = html;
+    }}
+
+    function renderAlerts() {{
+      const box = document.getElementById('alertsBox');
+      if (!box) return;
+
+      if (!rareAlerts || rareAlerts.length === 0) {{
+        box.innerHTML = 'Zatiaľ bez rare alertov.';
+        return;
+      }}
+
+      box.innerHTML = rareAlerts.map(a => `
+        <div class="mini-card">${{a}}</div>
+      `).join('');
+    }}
+
     function buildTradeLogText(m) {{
       return `KATEGORIZÁCIA TRHU: ${{m.tradeTypeLabel || ''}}
 
@@ -1763,12 +2237,16 @@ ${{m.autoDraft?.edge || ''}}
 RESOLUTION ANALÝZA:
 ${{m.autoDraft?.resolution || ''}}
 
+WHY NOW:
+${{m.whyNow || ''}}
+
 PARAMETRE VSTUPU:
 Market: ${{m.question || ''}}
 Entry side: ${{m.executionPlan?.entrySide || ''}}
 Limit price: ${{m.executionPlan?.limitPrice ?? ''}}
 Stake: ${{m.executionPlan?.stakeUSDC || 0}} USDC
 Tranches: ${{m.executionPlan?.tranche1USDC || 0}} / ${{m.executionPlan?.tranche2USDC || 0}} / ${{m.executionPlan?.tranche3USDC || 0}} USDC
+Entry zone: ${{m.entryZone?.label || ''}}
 YES cena: ${{fmtPrice(m.yesPrice)}}
 NO cena: ${{fmtPrice(m.noPrice)}}
 Likvidita: ${{fmtInt(m.liquidity)}}
@@ -1851,6 +2329,40 @@ ${{m.autoDraft?.finalDecision || 'PASS'}}
       `;
     }}
 
+    function renderDeltaSection(m) {{
+      const key = m.slug || m.question;
+      const d = currentDeltaMap.get(key);
+
+      if (!d) {{
+        return '<div class="panel-muted">Delta tracking zatiaľ nie je k dispozícii.</div>';
+      }}
+
+      const yesLine = d.yesDelta === null
+        ? 'YES delta: bez predošlého snapshotu.'
+        : 'YES delta: <span class="' + deltaClass(d.yesDelta) + '">' + fmtDelta(d.yesDelta) + '</span>';
+
+      const gateLine = d.gateDelta === null
+        ? 'Gate delta: bez predošlého snapshotu.'
+        : 'Gate delta: <span class="' + deltaClass(d.gateDelta) + '">' + (d.gateDelta > 0 ? '+' : '') + d.gateDelta + '</span>';
+
+      const liqLine = d.liquidityDeltaPct === null
+        ? 'Likvidita delta: bez predošlého snapshotu.'
+        : 'Likvidita delta: <span class="' + deltaClass(d.liquidityDeltaPct) + '">' + (d.liquidityDeltaPct > 0 ? '+' : '') + d.liquidityDeltaPct.toFixed(1) + '%</span>';
+
+      const summary = d.summary && d.summary.length
+        ? d.summary.join(' | ')
+        : 'Bez významnej zmeny od posledného refreshu.';
+
+      return `
+        <div class="panel-muted">
+          ${yesLine}<br>
+          ${gateLine}<br>
+          ${liqLine}<br>
+          Zhrnutie: ${summary}
+        </div>
+      `;
+    }}
+
     function showDetail(m) {{
       selectedMarket = m;
       const panel = document.getElementById('detailPanel');
@@ -1866,6 +2378,7 @@ ${{m.autoDraft?.finalDecision || 'PASS'}}
               ${{catBadge(m.categoryLabel)}}
               ${{pill('Typ: ' + (m.tradeTypeLabel || 'Ostatné'))}}
               ${{pill('Gate: ' + (m.gateScore ?? '') + '/6')}}
+              ${{pill('Entry zóna: ' + (m.entryZone?.label || ''))}}
             </div>
           </div>
           <div>
@@ -1876,6 +2389,10 @@ ${{m.autoDraft?.finalDecision || 'PASS'}}
         <div class="draft-grid"><div>Cluster</div><div>${{m.cluster || ''}}</div></div>
         <div class="draft-grid"><div>Fail point</div><div>${{m.failPoint || ''}}</div></div>
         <div class="draft-grid"><div>Sizing cap</div><div>${{m.sizingCap || ''}}</div></div>
+        <div class="draft-grid"><div>Why now</div><div>${{m.whyNow || ''}}</div></div>
+
+        <h3 style="margin-top:14px;">Delta tracking</h3>
+        ${{renderDeltaSection(m)}}
 
         <h3 style="margin-top:14px;">Mini 6/6 checklist</h3>
         ${{renderChecklist(m.checklist || {{}})}}
@@ -1909,6 +2426,7 @@ ${{m.autoDraft?.finalDecision || 'PASS'}}
 
           <div class="draft-grid"><div>Side</div><div>${{m.executionPlan?.entrySide || ''}}</div></div>
           <div class="draft-grid"><div>Limit price</div><div>${{m.executionPlan?.limitPrice ?? ''}}</div></div>
+          <div class="draft-grid"><div>Entry zóna</div><div>${{m.entryZone?.label || ''}}</div></div>
           <div class="draft-grid"><div>Stake</div><div>${{m.executionPlan?.stakeUSDC || 0}} USDC (${{m.executionPlan?.stakePct || '0%'}})</div></div>
           <div class="draft-grid"><div>Tranches</div><div>${{m.executionPlan?.tranche1USDC || 0}} / ${{m.executionPlan?.tranche2USDC || 0}} / ${{m.executionPlan?.tranche3USDC || 0}} USDC</div></div>
 
@@ -1952,14 +2470,18 @@ ${{m.autoDraft?.finalDecision || 'PASS'}}
       const minLiquidity = document.getElementById('minLiquidity').value;
       const hidePass = document.getElementById('hidePass').checked;
       const diversify = document.getElementById('diversify').checked;
+      const watchlistOnly = document.getElementById('watchlistOnly').checked;
+      const strictMode = document.getElementById('strictMode').checked;
 
       try {{
         const params = new URLSearchParams({{
-          limit: '100',
+          limit: '120',
           min_liquidity: minLiquidity,
           hide_pass: hidePass ? 'true' : 'false',
           category: category,
-          diversify: diversify ? 'true' : 'false'
+          diversify: diversify ? 'true' : 'false',
+          watchlist_only: watchlistOnly ? 'true' : 'false',
+          strict_mode: strictMode ? 'true' : 'false'
         }});
 
         const res = await fetch('/markets?' + params.toString());
@@ -1968,6 +2490,10 @@ ${{m.autoDraft?.finalDecision || 'PASS'}}
         const data = await res.json();
         const markets = data.markets || [];
         cachedNonSports = data.topNonSports || [];
+        cachedWatchlist = data.watchlist || [];
+        cachedPortfolio = data.portfolio || null;
+
+        computeDeltaMap(markets);
 
         let selectedSlug = selectedMarket?.slug || null;
         cachedMarkets = markets;
@@ -1980,6 +2506,7 @@ ${{m.autoDraft?.finalDecision || 'PASS'}}
           tr.innerHTML = `
             <td>${{flagBadge(m.flagLabel)}}</td>
             <td>${{decisionBadge(m.autoDraft?.finalDecision || 'PASS')}}</td>
+            <td>${{zoneBadge(m.entryZone)}}</td>
             <td>${{m.gateScore ?? ''}}/6</td>
             <td>${{m.candidateScore ?? ''}}</td>
             <td>${{m.frictionLabelSk || ''}}</td>
@@ -2006,6 +2533,9 @@ ${{m.autoDraft?.finalDecision || 'PASS'}}
         errorEl.style.display = 'none';
         lastRefreshAt = new Date();
         updateStatusLine();
+        renderWatchlist();
+        renderPortfolio();
+        renderAlerts();
 
         if (markets.length > 0) {{
           const matched = selectedSlug ? markets.find(x => x.slug === selectedSlug) : null;
@@ -2025,6 +2555,11 @@ ${{m.autoDraft?.finalDecision || 'PASS'}}
     document.getElementById('minLiquidity').addEventListener('change', loadMarkets);
     document.getElementById('hidePass').addEventListener('change', loadMarkets);
     document.getElementById('diversify').addEventListener('change', loadMarkets);
+    document.getElementById('watchlistOnly').addEventListener('change', loadMarkets);
+    document.getElementById('strictMode').addEventListener('change', () => {{
+      updateStatusLine();
+      loadMarkets();
+    }});
 
     loadMarkets();
     updateStatusLine();
