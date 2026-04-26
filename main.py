@@ -488,6 +488,96 @@ def detect_cluster(question, category):
     return f"{category}: misc"
 
 
+def clamp_price(x):
+    if x is None:
+        return None
+    return max(0.01, min(0.99, round(x, 3)))
+
+
+def round_usdc(x):
+    return int(round(x))
+
+
+def build_execution_plan(flag, trade_type, final_decision, yes_price, no_price, liquidity, volume24hr, days_to_end):
+    if final_decision == "PASS":
+        return {
+            "entrySide": "NONE",
+            "limitPrice": None,
+            "stakeUSDC": 0,
+            "stakePct": "0%",
+            "tranche1USDC": 0,
+            "tranche2USDC": 0,
+            "tranche3USDC": 0,
+            "takeProfit1": "",
+            "takeProfit2": "",
+            "runnerRule": "No trade.",
+            "timeStop": "No trade.",
+            "fullExitTrigger": "No trade.",
+        }
+
+    if trade_type == "Centovka":
+        stake = 8
+    elif flag == "WATCH":
+        stake = 30
+    else:
+        stake = 15
+
+    if liquidity >= 500000 and volume24hr >= 100000:
+        improve = 0.01
+    elif liquidity >= 150000 and volume24hr >= 25000:
+        improve = 0.02
+    else:
+        improve = 0.03
+
+    if final_decision == "BUY YES":
+        base_price = yes_price if isinstance(yes_price, (int, float)) else None
+        limit_price = clamp_price(base_price - improve) if base_price is not None else None
+        tp1 = clamp_price(limit_price + 0.05) if limit_price is not None else None
+        tp2 = clamp_price(limit_price + 0.10) if limit_price is not None else None
+        entry_side = "YES"
+    else:
+        base_price = no_price if isinstance(no_price, (int, float)) else None
+        limit_price = clamp_price(base_price - improve) if base_price is not None else None
+        tp1 = clamp_price(limit_price + 0.05) if limit_price is not None else None
+        tp2 = clamp_price(limit_price + 0.10) if limit_price is not None else None
+        entry_side = "NO"
+
+    t1 = round_usdc(stake * 0.40)
+    t2 = round_usdc(stake * 0.35)
+    t3 = stake - t1 - t2
+
+    if trade_type == "Momentum":
+        runner_rule = "Po prvom silnom move alebo potvrdení news odpredaj približne 50%, zvyšok manažuj ako runner."
+    elif trade_type == "Time Decay":
+        runner_rule = "Postupne znižuj pred deadlinom; nenechávaj plný sizing tesne pred expirácie."
+    elif trade_type == "Resolution":
+        runner_rule = "Drž väčšinu dlhšie len ak sa nezhoršuje oracle riziko; pri novom spore redukuj."
+    else:
+        runner_rule = "Po TP1 odriskuj časť pozície, runner nechaj len ak edge ostáva čistý."
+
+    if days_to_end is not None and days_to_end <= 3:
+        time_stop = "Ak nepríde očakávaný pohyb rýchlo, zníž alebo zavri pozíciu ešte pred expirácou."
+    else:
+        time_stop = "Ak sa trh nepohne v smere tézy do 24–72 hodín po očakávanom katalyzátore, zníž alebo zavri pozíciu."
+
+    full_exit = "Okamžitý full exit pri zrušení asymetrie, novom oracle alebo dispute riziku, faktickej chybe v téze alebo prudkom zhoršení likvidity."
+
+    return {
+        "entrySide": entry_side,
+        "limitPrice": limit_price,
+        "stakeUSDC": stake,
+        "stakePct": f"{round(stake / 500 * 100, 1)}%",
+        "tranche1USDC": t1,
+        "tranche2USDC": t2,
+        "tranche3USDC": t3,
+        "takeProfit1": f"{tp1:.3f}" if tp1 is not None else "",
+        "takeProfit2": f"{tp2:.3f}" if tp2 is not None else "",
+        "runnerRule": runner_rule,
+        "timeStop": time_stop,
+        "fullExitTrigger": full_exit,
+    }
+
+
 def build_auto_draft(question, category, trade_type, yes_price, no_price, days_to_end,
                      oracle_risk, fr_label_sk, ex_label_sk, catalyst_type_sk,
                      catalyst_confidence_sk, flag, gate_score, notes, checklist,
@@ -708,6 +798,12 @@ def score_market(m):
     else:
         flag = "PASS"
 
+    display_flag = {
+        "WATCH": "WATCH",
+        "REVIEW": "POTENCIÁL",
+        "PASS": "PASS",
+    }.get(flag, flag)
+
     checklist = {
         "resolutability": {
             "ok": gate_resolutability,
@@ -757,6 +853,17 @@ def score_market(m):
         ex_score=ex_score,
     )
 
+    execution_plan = build_execution_plan(
+        flag=flag,
+        trade_type=trade_type,
+        final_decision=auto_draft["finalDecision"],
+        yes_price=yes_price,
+        no_price=no_price,
+        liquidity=liquidity,
+        volume24hr=volume24hr,
+        days_to_end=days_to_end,
+    )
+
     fail = fail_point(checklist, oracle_risk, notes)
     sizing_cap = sizing_cap_from_v6(flag, trade_type, auto_draft["finalDecision"])
     cluster = detect_cluster(raw_question, category)
@@ -764,7 +871,7 @@ def score_market(m):
     return {
         "candidateScore": score,
         "flag": flag,
-        "flagLabel": flag,
+        "flagLabel": display_flag,
         "notes": notes,
         "yesPrice": yes_price,
         "noPrice": no_price,
@@ -796,6 +903,7 @@ def score_market(m):
             "oracle": gate_oracle,
         },
         "autoDraft": auto_draft,
+        "executionPlan": execution_plan,
         "failPoint": fail,
         "sizingCap": sizing_cap,
         "cluster": cluster,
@@ -846,16 +954,17 @@ def build_market_row(m):
         "catalystConfidenceLabel": scored["catalystConfidenceLabel"],
         "checklist": scored["checklist"],
         "autoDraft": scored["autoDraft"],
+        "executionPlan": scored["executionPlan"],
         "failPoint": scored["failPoint"],
         "sizingCap": scored["sizingCap"],
         "cluster": scored["cluster"],
     }
 
 
-def flag_priority(flag):
-    if flag == "WATCH":
+def flag_priority(label):
+    if label == "WATCH":
         return 0
-    if flag == "REVIEW":
+    if label == "POTENCIÁL":
         return 1
     return 2
 
@@ -876,14 +985,9 @@ def oracle_priority(level):
     return 2
 
 
-def apply_diversity(rows, mode="strict", diversify=True, max_per_category=None, max_per_cluster=None):
+def apply_diversity(rows, diversify=True, max_per_category=3, max_per_cluster=2):
     if not diversify:
         return rows
-
-    if max_per_category is None:
-        max_per_category = 3 if mode == "strict" else 4
-    if max_per_cluster is None:
-        max_per_cluster = 2
 
     category_counts = defaultdict(int)
     cluster_counts = defaultdict(int)
@@ -915,21 +1019,10 @@ def markets():
     limit = int(request.args.get("limit", "80"))
     active = request.args.get("active", "true")
     closed = request.args.get("closed", "false")
-    min_liquidity = to_float(request.args.get("min_liquidity", "0"))
-    min_volume = to_float(request.args.get("min_volume", "0"))
+    min_liquidity = to_float(request.args.get("min_liquidity", "100000"))
     hide_pass = request.args.get("hide_pass", "true").lower() == "true"
     category_filter = request.args.get("category", "").strip()
-    trade_type_filter = request.args.get("trade_type", "").strip()
-    max_oracle_risk = request.args.get("max_oracle_risk", "").strip()
-    gate_only = request.args.get("gate_only", "false").lower() == "true"
-    catalyst_conf_filter = request.args.get("catalyst_confidence", "").strip()
-    mode = request.args.get("mode", "strict").strip().lower()
     diversify = request.args.get("diversify", "true").lower() == "true"
-    max_per_category = request.args.get("max_per_category")
-    max_per_cluster = request.args.get("max_per_cluster")
-
-    max_per_category = int(max_per_category) if max_per_category not in [None, ""] else None
-    max_per_cluster = int(max_per_cluster) if max_per_cluster not in [None, ""] else None
 
     params = {
         "limit": 250,
@@ -953,39 +1046,18 @@ def markets():
 
         if to_float(row.get("liquidity")) < min_liquidity:
             continue
-        if to_float(row.get("volume24hr")) < min_volume:
-            continue
         if hide_pass and row.get("autoDraft", {}).get("finalDecision") == "PASS":
             continue
         if category_filter and row.get("category") != category_filter:
             continue
-        if trade_type_filter and row.get("tradeType") != trade_type_filter:
-            continue
-        if catalyst_conf_filter and row.get("catalystConfidence") != catalyst_conf_filter:
-            continue
-        if max_oracle_risk:
-            allowed = {"Low": 0, "Medium": 1, "High": 2}
-            if allowed.get(row.get("oracleRisk"), 2) > allowed.get(max_oracle_risk, 2):
-                continue
-        if gate_only and row.get("gateScore", 0) < 6:
-            continue
-
-        if mode == "strict":
-            if row.get("gateScore", 0) < 6:
-                continue
-            if row.get("oracleRisk") != "Low":
-                continue
-        elif mode == "scout":
-            if row.get("gateScore", 0) < 4:
-                continue
 
         rows.append(row)
 
     rows.sort(
         key=lambda x: (
-            0 if x.get("category") != "Sports" and mode == "scout" else 1,
             decision_priority(x.get("autoDraft", {}).get("finalDecision")),
-            flag_priority(x.get("flag")),
+            flag_priority(x.get("flagLabel")),
+            0 if x.get("category") != "Sports" else 1,
             -to_float(x.get("gateScore")),
             oracle_priority(x.get("oracleRisk")),
             -to_float(x.get("candidateScore")),
@@ -996,10 +1068,9 @@ def markets():
 
     diversified_rows = apply_diversity(
         rows,
-        mode=mode,
         diversify=diversify,
-        max_per_category=max_per_category,
-        max_per_cluster=max_per_cluster,
+        max_per_category=3,
+        max_per_cluster=2,
     )
 
     diversified_rows = diversified_rows[:limit]
@@ -1011,17 +1082,9 @@ def markets():
         "topNonSports": alt_non_sports,
         "filters": {
             "min_liquidity": min_liquidity,
-            "min_volume": min_volume,
             "hide_pass": hide_pass,
             "category": category_filter,
-            "trade_type": trade_type_filter,
-            "max_oracle_risk": max_oracle_risk,
-            "gate_only": gate_only,
-            "catalyst_confidence": catalyst_conf_filter,
-            "mode": mode,
             "diversify": diversify,
-            "max_per_category": max_per_category,
-            "max_per_cluster": max_per_cluster,
         }
     })
 
@@ -1038,7 +1101,7 @@ def dashboard():
 <html lang="sk">
 <head>
   <meta charset="utf-8">
-  <title>Polymarket Kandidátny Dashboard v5.4</title>
+  <title>Polymarket Kandidátny Dashboard v5.5</title>
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -1073,16 +1136,7 @@ def dashboard():
       display: flex;
       flex-direction: column;
       gap: 4px;
-      min-width: 135px;
-    }
-    .help-inline {
-      margin: 6px 0 10px 0;
-      font-size: 12px;
-      color: #555;
-      background: #fafafa;
-      border: 1px solid #eee;
-      padding: 8px 10px;
-      border-radius: 6px;
+      min-width: 150px;
     }
     label {
       font-size: 12px;
@@ -1295,7 +1349,7 @@ def dashboard():
     .trade-link:hover {
       text-decoration: underline;
     }
-    .journal-box, .legend-box, .non-sports-box {
+    .journal-box, .non-sports-box {
       margin-top: 16px;
       padding-top: 12px;
       border-top: 1px solid #eee;
@@ -1322,15 +1376,6 @@ def dashboard():
       font-size: 12px;
       color: #555;
       font-weight: 600;
-    }
-    .legend-item {
-      padding: 8px 0;
-      border-bottom: 1px solid #f2f2f2;
-      font-size: 13px;
-      line-height: 1.5;
-    }
-    .legend-item:last-child {
-      border-bottom: none;
     }
     .question-cell {
       max-width: 320px;
@@ -1362,16 +1407,15 @@ def dashboard():
       margin-bottom: 4px;
     }
 
-    .w-flag { width: 70px; }
+    .w-flag { width: 92px; }
     .w-decision { width: 92px; }
     .w-gate { width: 50px; }
     .w-score { width: 46px; }
-    .w-friction { width: 72px; }
-    .w-exit { width: 70px; }
+    .w-friction { width: 82px; }
+    .w-exit { width: 76px; }
     .w-type { width: 72px; }
     .w-cat { width: 58px; }
     .w-oracle { width: 56px; }
-    .w-catc { width: 60px; }
     .w-price { width: 50px; }
     .w-vol { width: 74px; }
     .w-liq { width: 82px; }
@@ -1389,21 +1433,13 @@ def dashboard():
 </head>
 <body>
   <h1>Polymarket kandidátny dashboard</h1>
-  <p class="small">v5.4: diversity filter, cluster dedupe, top mimo športu, Strict/Scout helper a menej športového spamu.</p>
+  <p class="small">v5.5 minimalist: WATCH / POTENCIÁL, menej filtrov, cluster dedupe a entry/exit plán.</p>
 
   <div class="layout">
     <div class="section">
       <h2>Top kandidáti</h2>
 
       <div class="controls">
-        <div class="control">
-          <label for="mode">Režim</label>
-          <select id="mode">
-            <option value="strict" selected>Strict v6</option>
-            <option value="scout">Scout</option>
-          </select>
-        </div>
-
         <div class="control">
           <label for="category">Kategória</label>
           <select id="category">
@@ -1418,41 +1454,8 @@ def dashboard():
         </div>
 
         <div class="control">
-          <label for="tradeType">Typ trhu</label>
-          <select id="tradeType">
-            <option value="">Všetko</option>
-            <option value="Momentum">Momentum</option>
-            <option value="Time Decay">Časový rozpad</option>
-            <option value="Resolution">Resolution / spor</option>
-            <option value="Centovka">Centovka</option>
-            <option value="Other">Ostatné</option>
-          </select>
-        </div>
-
-        <div class="control">
-          <label for="catalystConfidence">Sila katalyzátora</label>
-          <select id="catalystConfidence">
-            <option value="">Všetko</option>
-            <option value="High">Silný</option>
-            <option value="Medium">Stredný</option>
-            <option value="Low">Slabý</option>
-          </select>
-        </div>
-
-        <div class="control">
-          <label for="maxOracleRisk">Max oracle riziko</label>
-          <select id="maxOracleRisk">
-            <option value="">Všetko</option>
-            <option value="Low" selected>Nízke</option>
-            <option value="Medium">Stredné</option>
-            <option value="High">Vysoké</option>
-          </select>
-        </div>
-
-        <div class="control">
           <label for="minLiquidity">Min likvidita</label>
           <select id="minLiquidity">
-            <option value="0">0</option>
             <option value="50000">50 000</option>
             <option value="100000" selected>100 000</option>
             <option value="150000">150 000</option>
@@ -1460,46 +1463,9 @@ def dashboard():
           </select>
         </div>
 
-        <div class="control">
-          <label for="minVolume">Min 24h objem</label>
-          <select id="minVolume">
-            <option value="0">0</option>
-            <option value="25000" selected>25 000</option>
-            <option value="50000">50 000</option>
-            <option value="100000">100 000</option>
-            <option value="250000">250 000</option>
-          </select>
-        </div>
-
-        <div class="control">
-          <label for="maxPerCategory">Max / kategória</label>
-          <select id="maxPerCategory">
-            <option value="">Auto</option>
-            <option value="2">2</option>
-            <option value="3">3</option>
-            <option value="4">4</option>
-            <option value="5">5</option>
-          </select>
-        </div>
-
-        <div class="control">
-          <label for="maxPerCluster">Max / cluster</label>
-          <select id="maxPerCluster">
-            <option value="">Auto</option>
-            <option value="1">1</option>
-            <option value="2" selected>2</option>
-            <option value="3">3</option>
-          </select>
-        </div>
-
         <div class="checkbox-wrap">
           <input type="checkbox" id="hidePass" checked />
           <label for="hidePass">Skryť PASS</label>
-        </div>
-
-        <div class="checkbox-wrap">
-          <input type="checkbox" id="gateOnly" />
-          <label for="gateOnly">Len 6/6 gate</label>
         </div>
 
         <div class="checkbox-wrap">
@@ -1512,10 +1478,6 @@ def dashboard():
         </div>
       </div>
 
-      <div class="help-inline" id="modeHelp">
-        Strict v6 = užší shortlist na reálny trade. Scout = širší research feed na hľadanie kandidátov pred finálnym preosiatím.
-      </div>
-
       <div class="count" id="countBox"></div>
       <div id="markets-error" class="error" style="display:none;"></div>
 
@@ -1523,7 +1485,7 @@ def dashboard():
         <table id="markets-table">
           <thead>
             <tr>
-              <th class="w-flag">Flag</th>
+              <th class="w-flag">Kandidát</th>
               <th class="w-decision">Rozhod.</th>
               <th class="w-gate">Gate</th>
               <th class="w-score">Skóre</th>
@@ -1532,7 +1494,6 @@ def dashboard():
               <th class="w-type">Typ</th>
               <th class="w-cat">Kat.</th>
               <th class="w-oracle">Oracle</th>
-              <th class="w-catc">Kat.</th>
               <th>Otázka</th>
               <th class="w-price">Yes</th>
               <th class="w-price">No</th>
@@ -1549,7 +1510,7 @@ def dashboard():
     <div class="panel">
       <div class="panel-box" id="detailPanel">
         <h3>Detail marketu</h3>
-        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa checklist, systémový draft, cluster a legenda v6.</p>
+        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa checklist, systémový draft a entry/exit plán.</p>
       </div>
     </div>
   </div>
@@ -1577,9 +1538,9 @@ def dashboard():
       return Math.round(n).toString();
     }
 
-    function flagBadge(flag) {
-      if (flag === 'WATCH') return '<span class="badge watch">WATCH</span>';
-      if (flag === 'REVIEW') return '<span class="badge review">REVIEW</span>';
+    function flagBadge(label) {
+      if (label === 'WATCH') return '<span class="badge watch">WATCH</span>';
+      if (label === 'POTENCIÁL') return '<span class="badge review">POTENCIÁL</span>';
       return '<span class="badge pass">PASS</span>';
     }
 
@@ -1649,21 +1610,24 @@ ${m.autoDraft?.resolution || ''}
 
 PARAMETRE VSTUPU:
 Market: ${m.question || ''}
+Entry side: ${m.executionPlan?.entrySide || ''}
+Limit price: ${m.executionPlan?.limitPrice ?? ''}
+Stake: ${m.executionPlan?.stakeUSDC || 0} USDC
+Tranches: ${m.executionPlan?.tranche1USDC || 0} / ${m.executionPlan?.tranche2USDC || 0} / ${m.executionPlan?.tranche3USDC || 0} USDC
 YES cena: ${fmtPrice(m.yesPrice)}
 NO cena: ${fmtPrice(m.noPrice)}
 Likvidita: ${fmtInt(m.liquidity)}
 24h objem: ${fmtInt(m.volume24hr)}
 Dni do expirácie: ${fmtDays(m.daysToEnd)}
-Sizing hint: ${m.autoDraft?.sizingHint || ''}
 
 PLÁN VÝSTUPU:
-Fáza 1: podľa typu setupu a liquidity conditions
-Fáza 2: partial de-risk pri repricingu
-Runner: len ak edge ostáva platný
-Time-stop limit: 24–72h po očakávanom katalyzátore bez pohybu
+TP1: ${m.executionPlan?.takeProfit1 || ''}
+TP2: ${m.executionPlan?.takeProfit2 || ''}
+Runner: ${m.executionPlan?.runnerRule || ''}
+Time-stop: ${m.executionPlan?.timeStop || ''}
 
 INVALIDÁCIA (FULL EXIT TRIGGER):
-${m.autoDraft?.invalidation || ''}
+${m.executionPlan?.fullExitTrigger || ''}
 
 KATALYZÁTOR:
 ${m.autoDraft?.catalyst || ''}
@@ -1699,54 +1663,6 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       URL.revokeObjectURL(a.href);
       const msg = document.getElementById('savedNote');
       if (msg) msg.textContent = 'Trade-log šablóna stiahnutá.';
-    }
-
-    function renderLegend() {
-      return `
-        <div class="legend-box">
-          <h3>Legenda v6</h3>
-
-          <div class="legend-item">
-            <strong>Strict v6</strong><br>
-            Užší shortlist na reálny trade. Cieľ je vidieť len najčistejšie kandidáty blízko execution-ready stavu.
-          </div>
-
-          <div class="legend-item">
-            <strong>Scout</strong><br>
-            Širší research feed. Slúži na objavovanie kandidátov, nie na automatický vstup bez ďalšieho review.
-          </div>
-
-          <div class="legend-item">
-            <strong>Gate 6/6</strong><br>
-            Súčet 6 povinných podmienok pred tradeom. Ak nie je 6/6, v strict režime trade spravidla neexistuje.
-          </div>
-
-          <div class="legend-item">
-            <strong>Mini checklist</strong><br>
-            Detailný rozpis gate bodov: Resolutability, Base Rate, Frikcia, Exit, Catalyst, Oracle Trap.
-          </div>
-
-          <div class="legend-item">
-            <strong>Frikcia</strong><br>
-            Náklady a praktické prekážky tradu: spread, fees, sklz, likvidita a kvalita exitu. Ak zje edge, výsledok má byť PASS.
-          </div>
-
-          <div class="legend-item">
-            <strong>Typ trhu</strong><br>
-            Momentum = news repricing, Časový rozpad = edge z času, Resolution = pravidlá a oracle, Centovka = asymetria v pásme 0.01–0.05.
-          </div>
-
-          <div class="legend-item">
-            <strong>Oracle riziko</strong><br>
-            Riziko, že market resolve-ne inak, než vyzerá podľa reality, kvôli presnému textu pravidiel, source alebo ambiguity.
-          </div>
-
-          <div class="legend-item">
-            <strong>Cluster</strong><br>
-            Skupina marketov patriacich k rovnakému eventu alebo naratívu. Slúži na zníženie duplicitného feedu a lepšiu diverzifikáciu.
-          </div>
-        </div>
-      `;
     }
 
     function renderNonSports() {
@@ -1787,7 +1703,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
           <div class="title-main">
             <h3>${m.question || 'Detail marketu'}</h3>
             <div>
-              ${flagBadge(m.flag)}
+              ${flagBadge(m.flagLabel)}
               ${decisionBadge(m.autoDraft?.finalDecision || 'PASS')}
               ${catBadge(m.categoryLabel)}
               ${pill('Typ: ' + (m.tradeTypeLabel || 'Ostatné'))}
@@ -1831,6 +1747,26 @@ ${m.autoDraft?.finalDecision || 'PASS'}
 
           <label class="block-label">Invalidácia</label>
           <div class="panel-muted">${m.autoDraft?.invalidation || ''}</div>
+        </div>
+
+        <div class="journal-box">
+          <h3>Entry / Exit plán</h3>
+
+          <div class="draft-grid"><div>Side</div><div>${m.executionPlan?.entrySide || ''}</div></div>
+          <div class="draft-grid"><div>Limit price</div><div>${m.executionPlan?.limitPrice ?? ''}</div></div>
+          <div class="draft-grid"><div>Stake</div><div>${m.executionPlan?.stakeUSDC || 0} USDC (${m.executionPlan?.stakePct || '0%'})</div></div>
+          <div class="draft-grid"><div>Tranches</div><div>${m.executionPlan?.tranche1USDC || 0} / ${m.executionPlan?.tranche2USDC || 0} / ${m.executionPlan?.tranche3USDC || 0} USDC</div></div>
+          <div class="draft-grid"><div>TP1</div><div>${m.executionPlan?.takeProfit1 || ''}</div></div>
+          <div class="draft-grid"><div>TP2</div><div>${m.executionPlan?.takeProfit2 || ''}</div></div>
+
+          <label class="block-label">Runner rule</label>
+          <div class="panel-muted">${m.executionPlan?.runnerRule || ''}</div>
+
+          <label class="block-label">Time stop</label>
+          <div class="panel-muted">${m.executionPlan?.timeStop || ''}</div>
+
+          <label class="block-label">Full exit trigger</label>
+          <div class="panel-muted">${m.executionPlan?.fullExitTrigger || ''}</div>
 
           <div class="action-row">
             <button class="btn-primary" onclick="copyTradeLog()">Kopírovať trade-log šablónu</button>
@@ -1841,18 +1777,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
         </div>
 
         ${renderNonSports()}
-        ${renderLegend()}
       `;
-    }
-
-    function updateModeHelp() {
-      const mode = document.getElementById('mode').value;
-      const help = document.getElementById('modeHelp');
-      if (mode === 'strict') {
-        help.textContent = 'Strict v6 = užší shortlist na reálny trade. Prirodzene pustí menej marketov, ale bližšie k execution-ready kvalite.';
-      } else {
-        help.textContent = 'Scout = širší research feed. Umožní objaviť viac kandidátov, ale neznamená to automatický BUY bez ďalšieho v6 review.';
-      }
     }
 
     async function loadMarkets() {
@@ -1860,36 +1785,18 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       const tbody = document.querySelector('#markets-table tbody');
       const countBox = document.getElementById('countBox');
 
-      const mode = document.getElementById('mode').value;
       const category = document.getElementById('category').value;
-      const tradeType = document.getElementById('tradeType').value;
-      const catalystConfidence = document.getElementById('catalystConfidence').value;
-      const maxOracleRisk = document.getElementById('maxOracleRisk').value;
       const minLiquidity = document.getElementById('minLiquidity').value;
-      const minVolume = document.getElementById('minVolume').value;
       const hidePass = document.getElementById('hidePass').checked;
-      const gateOnly = document.getElementById('gateOnly').checked;
       const diversify = document.getElementById('diversify').checked;
-      const maxPerCategory = document.getElementById('maxPerCategory').value;
-      const maxPerCluster = document.getElementById('maxPerCluster').value;
-
-      updateModeHelp();
 
       try {
         const params = new URLSearchParams({
           limit: '100',
-          mode: mode,
           min_liquidity: minLiquidity,
-          min_volume: minVolume,
           hide_pass: hidePass ? 'true' : 'false',
           category: category,
-          trade_type: tradeType,
-          max_oracle_risk: maxOracleRisk,
-          gate_only: gateOnly ? 'true' : 'false',
-          catalyst_confidence: catalystConfidence,
-          diversify: diversify ? 'true' : 'false',
-          max_per_category: maxPerCategory,
-          max_per_cluster: maxPerCluster
+          diversify: diversify ? 'true' : 'false'
         });
 
         const res = await fetch('/markets?' + params.toString());
@@ -1907,7 +1814,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
           tr.className = 'clickable';
 
           tr.innerHTML = `
-            <td>${flagBadge(m.flag)}</td>
+            <td>${flagBadge(m.flagLabel)}</td>
             <td>${decisionBadge(m.autoDraft?.finalDecision || 'PASS')}</td>
             <td>${m.gateScore ?? ''}/6</td>
             <td>${m.candidateScore ?? ''}</td>
@@ -1916,7 +1823,6 @@ ${m.autoDraft?.finalDecision || 'PASS'}
             <td>${m.tradeTypeLabel || ''}</td>
             <td>${catBadge(m.categoryLabel)}</td>
             <td>${oracleBadge(m.oracleRiskLabel)}</td>
-            <td>${m.catalystConfidenceLabel || ''}</td>
             <td class="question-cell"><div class="question-truncate">${m.question || ''}</div></td>
             <td>${fmtPrice(m.yesPrice)}</td>
             <td>${fmtPrice(m.noPrice)}</td>
@@ -1940,7 +1846,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
         } else {
           document.getElementById('detailPanel').innerHTML =
             '<h3>Detail marketu</h3><p class="panel-muted">Žiadny market nevyhovuje aktuálnym filtrom.</p>' +
-            renderNonSports() + renderLegend();
+            renderNonSports();
         }
       } catch (err) {
         errorEl.textContent = 'Chyba pri načítaní marketov: ' + err.message;
@@ -1948,18 +1854,10 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       }
     }
 
-    document.getElementById('mode').addEventListener('change', loadMarkets);
     document.getElementById('category').addEventListener('change', loadMarkets);
-    document.getElementById('tradeType').addEventListener('change', loadMarkets);
-    document.getElementById('catalystConfidence').addEventListener('change', loadMarkets);
-    document.getElementById('maxOracleRisk').addEventListener('change', loadMarkets);
     document.getElementById('minLiquidity').addEventListener('change', loadMarkets);
-    document.getElementById('minVolume').addEventListener('change', loadMarkets);
     document.getElementById('hidePass').addEventListener('change', loadMarkets);
-    document.getElementById('gateOnly').addEventListener('change', loadMarkets);
     document.getElementById('diversify').addEventListener('change', loadMarkets);
-    document.getElementById('maxPerCategory').addEventListener('change', loadMarkets);
-    document.getElementById('maxPerCluster').addEventListener('change', loadMarkets);
 
     loadMarkets();
   </script>
