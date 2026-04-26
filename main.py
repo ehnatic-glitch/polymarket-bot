@@ -2,12 +2,17 @@ from flask import Flask, jsonify, request
 import requests
 import json
 import re
+import os
 from collections import defaultdict
 from datetime import datetime, timezone
 
 app = Flask(__name__)
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
+APP_CONFIG = {
+    "dashboard_title": "Polymarket kandidátny dashboard",
+    "default_min_liquidity": 100000.0,
+}
 
 
 @app.route("/")
@@ -20,7 +25,8 @@ def home():
             "/markets/top",
             "/dashboard",
             "/analyze-market",
-        ]
+        ],
+        "config": APP_CONFIG,
     })
 
 
@@ -498,6 +504,67 @@ def round_usdc(x):
     return int(round(x))
 
 
+def compute_exit_targets(entry_side, entry_price, trade_type):
+    if not isinstance(entry_price, (int, float)):
+        return None, None
+
+    if trade_type == "Centovka":
+        if entry_price <= 0.01:
+            return clamp_price(0.06), clamp_price(0.11)
+        if entry_price <= 0.02:
+            return clamp_price(0.06), clamp_price(0.11)
+        if entry_price <= 0.03:
+            return clamp_price(0.07), clamp_price(0.12)
+        return clamp_price(entry_price + 0.04), clamp_price(entry_price + 0.08)
+
+    if trade_type == "Momentum":
+        return clamp_price(entry_price + 0.08), clamp_price(entry_price + 0.15)
+
+    if trade_type == "Time Decay":
+        return clamp_price(entry_price + 0.05), clamp_price(entry_price + 0.10)
+
+    if trade_type == "Resolution":
+        return clamp_price(entry_price + 0.10), clamp_price(entry_price + 0.18)
+
+    return clamp_price(entry_price + 0.06), clamp_price(entry_price + 0.12)
+
+
+def exit_split_for_trade(trade_type):
+    if trade_type == "Centovka":
+        return {
+            "tp1Pct": 50,
+            "tp2Pct": 30,
+            "runnerPct": 20,
+        }
+
+    if trade_type == "Momentum":
+        return {
+            "tp1Pct": 50,
+            "tp2Pct": 30,
+            "runnerPct": 20,
+        }
+
+    if trade_type == "Time Decay":
+        return {
+            "tp1Pct": 40,
+            "tp2Pct": 40,
+            "runnerPct": 20,
+        }
+
+    if trade_type == "Resolution":
+        return {
+            "tp1Pct": 40,
+            "tp2Pct": 35,
+            "runnerPct": 25,
+        }
+
+    return {
+        "tp1Pct": 50,
+        "tp2Pct": 30,
+        "runnerPct": 20,
+    }
+
+
 def build_execution_plan(flag, trade_type, final_decision, yes_price, no_price, liquidity, volume24hr, days_to_end):
     if final_decision == "PASS":
         return {
@@ -510,6 +577,11 @@ def build_execution_plan(flag, trade_type, final_decision, yes_price, no_price, 
             "tranche3USDC": 0,
             "takeProfit1": "",
             "takeProfit2": "",
+            "tp1Pct": 0,
+            "tp2Pct": 0,
+            "runnerPct": 0,
+            "tp1Action": "No trade.",
+            "tp2Action": "No trade.",
             "runnerRule": "No trade.",
             "timeStop": "No trade.",
             "fullExitTrigger": "No trade.",
@@ -532,28 +604,32 @@ def build_execution_plan(flag, trade_type, final_decision, yes_price, no_price, 
     if final_decision == "BUY YES":
         base_price = yes_price if isinstance(yes_price, (int, float)) else None
         limit_price = clamp_price(base_price - improve) if base_price is not None else None
-        tp1 = clamp_price(limit_price + 0.05) if limit_price is not None else None
-        tp2 = clamp_price(limit_price + 0.10) if limit_price is not None else None
         entry_side = "YES"
+        target_anchor = limit_price if limit_price is not None else base_price
     else:
         base_price = no_price if isinstance(no_price, (int, float)) else None
         limit_price = clamp_price(base_price - improve) if base_price is not None else None
-        tp1 = clamp_price(limit_price + 0.05) if limit_price is not None else None
-        tp2 = clamp_price(limit_price + 0.10) if limit_price is not None else None
         entry_side = "NO"
+        target_anchor = limit_price if limit_price is not None else base_price
+
+    tp1, tp2 = compute_exit_targets(entry_side, target_anchor, trade_type)
+    split = exit_split_for_trade(trade_type)
 
     t1 = round_usdc(stake * 0.40)
     t2 = round_usdc(stake * 0.35)
     t3 = stake - t1 - t2
 
+    tp1_action = f"Pri cene {tp1:.3f} predať {split['tp1Pct']}% pozície a locknúť profit." if tp1 is not None else ""
+    tp2_action = f"Pri cene {tp2:.3f} predať ďalších {split['tp2Pct']}% pozície." if tp2 is not None else ""
+
     if trade_type == "Momentum":
-        runner_rule = "Po prvom silnom move alebo potvrdení news odpredaj približne 50%, zvyšok manažuj ako runner."
+        runner_rule = f"Po TP2 nechaj {split['runnerPct']}% runner len ak flow ostáva silný a edge sa nepotvrdzuje proti tebe."
     elif trade_type == "Time Decay":
-        runner_rule = "Postupne znižuj pred deadlinom; nenechávaj plný sizing tesne pred expirácie."
+        runner_rule = f"Po TP2 nechaj max {split['runnerPct']}% runner; pred deadlinom znižuj agresívnejšie, ak katalyzátor neprichádza."
     elif trade_type == "Resolution":
-        runner_rule = "Drž väčšinu dlhšie len ak sa nezhoršuje oracle riziko; pri novom spore redukuj."
+        runner_rule = f"Po TP2 nechaj {split['runnerPct']}% runner len ak sa nezhoršuje oracle alebo dispute riziko."
     else:
-        runner_rule = "Po TP1 odriskuj časť pozície, runner nechaj len ak edge ostáva čistý."
+        runner_rule = f"Po TP2 nechaj {split['runnerPct']}% runner len ak edge ostáva čistý a order book sa nekazí."
 
     if days_to_end is not None and days_to_end <= 3:
         time_stop = "Ak nepríde očakávaný pohyb rýchlo, zníž alebo zavri pozíciu ešte pred expirácou."
@@ -572,6 +648,11 @@ def build_execution_plan(flag, trade_type, final_decision, yes_price, no_price, 
         "tranche3USDC": t3,
         "takeProfit1": f"{tp1:.3f}" if tp1 is not None else "",
         "takeProfit2": f"{tp2:.3f}" if tp2 is not None else "",
+        "tp1Pct": split["tp1Pct"],
+        "tp2Pct": split["tp2Pct"],
+        "runnerPct": split["runnerPct"],
+        "tp1Action": tp1_action,
+        "tp2Action": tp2_action,
         "runnerRule": runner_rule,
         "timeStop": time_stop,
         "fullExitTrigger": full_exit,
@@ -1019,7 +1100,9 @@ def markets():
     limit = int(request.args.get("limit", "80"))
     active = request.args.get("active", "true")
     closed = request.args.get("closed", "false")
-    min_liquidity = to_float(request.args.get("min_liquidity", "100000"))
+    min_liquidity = to_float(
+        request.args.get("min_liquidity", str(APP_CONFIG["default_min_liquidity"]))
+    )
     hide_pass = request.args.get("hide_pass", "true").lower() == "true"
     category_filter = request.args.get("category", "").strip()
     diversify = request.args.get("diversify", "true").lower() == "true"
@@ -1094,135 +1177,145 @@ def markets_top():
     return markets()
 
 
+@app.route("/analyze-market", methods=["POST"])
+def analyze_market():
+    payload = request.get_json(force=True, silent=True) or {}
+    market = payload.get("market") or {}
+    return jsonify(build_market_row(market))
+
+
 @app.route("/dashboard")
 def dashboard():
-    return """
+    title = APP_CONFIG["dashboard_title"]
+    default_min_liquidity = int(APP_CONFIG["default_min_liquidity"])
+
+    return f"""
 <!doctype html>
 <html lang="sk">
 <head>
   <meta charset="utf-8">
-  <title>Polymarket Kandidátny Dashboard v5.5</title>
+  <title>{title} v5.7</title>
   <style>
-    body {
+    body {{
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       margin: 16px;
       background: #f5f5f5;
       color: #222;
-    }
-    h1, h2, h3 {
+    }}
+    h1, h2, h3 {{
       margin-bottom: 0.3rem;
-    }
-    .section {
+    }}
+    .section {{
       background: #ffffff;
       padding: 14px;
       border-radius: 8px;
       margin-bottom: 16px;
       box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-    }
-    .layout {
+    }}
+    .layout {{
       display: grid;
-      grid-template-columns: minmax(0, 2.2fr) minmax(390px, 1fr);
+      grid-template-columns: minmax(0, 2.2fr) minmax(420px, 1fr);
       gap: 14px;
       align-items: start;
-    }
-    .controls {
+    }}
+    .controls {{
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
       margin-bottom: 10px;
       align-items: end;
-    }
-    .control {
+    }}
+    .control {{
       display: flex;
       flex-direction: column;
       gap: 4px;
       min-width: 150px;
-    }
-    label {
+    }}
+    label {{
       font-size: 12px;
       color: #555;
       font-weight: 600;
-    }
-    input, select {
+    }}
+    input, select {{
       padding: 7px 9px;
       border: 1px solid #ddd;
       border-radius: 6px;
       font: inherit;
       background: #fff;
-    }
-    .checkbox-wrap {
+    }}
+    .checkbox-wrap {{
       display: flex;
       align-items: center;
       gap: 7px;
       padding-top: 20px;
-    }
-    table {
+    }}
+    table {{
       width: 100%;
       border-collapse: collapse;
       font-size: 12.5px;
       table-layout: fixed;
-    }
-    th, td {
+    }}
+    th, td {{
       padding: 5px 6px;
       border-bottom: 1px solid #eee;
       text-align: left;
       vertical-align: top;
-    }
-    th {
+    }}
+    th {{
       background: #fafafa;
       font-weight: 700;
       position: sticky;
       top: 0;
       z-index: 1;
-    }
-    tr.clickable {
+    }}
+    tr.clickable {{
       cursor: pointer;
-    }
-    tr.clickable:hover {
+    }}
+    tr.clickable:hover {{
       background: #fafcff;
-    }
-    .small {
+    }}
+    .small {{
       font-size: 12px;
       color: #555;
-    }
-    .error {
+    }}
+    .error {{
       color: #c5221f;
       margin-bottom: 8px;
       font-size: 13px;
-    }
-    .badge {
+    }}
+    .badge {{
       display: inline-block;
       padding: 2px 8px;
       border-radius: 999px;
       font-size: 11px;
       font-weight: 700;
       white-space: nowrap;
-    }
-    .watch {
+    }}
+    .watch {{
       background: #e6f4ea;
       color: #137333;
-    }
-    .review {
+    }}
+    .review {{
       background: #fff4e5;
       color: #b06000;
-    }
-    .pass {
+    }}
+    .pass {{
       background: #fce8e6;
       color: #c5221f;
-    }
-    .decision-buy-yes {
+    }}
+    .decision-buy-yes {{
       background: #e8f5e9;
       color: #137333;
-    }
-    .decision-buy-no {
+    }}
+    .decision-buy-no {{
       background: #e8f0fe;
       color: #1558d6;
-    }
-    .decision-pass {
+    }}
+    .decision-pass {{
       background: #f3f4f6;
       color: #555;
-    }
-    .cat {
+    }}
+    .cat {{
       display: inline-block;
       padding: 2px 8px;
       border-radius: 999px;
@@ -1231,30 +1324,30 @@ def dashboard():
       color: #3949ab;
       font-weight: 600;
       white-space: nowrap;
-    }
-    .risk-low {
+    }}
+    .risk-low {{
       color: #137333;
       font-weight: 700;
-    }
-    .risk-medium {
+    }}
+    .risk-medium {{
       color: #b06000;
       font-weight: 700;
-    }
-    .risk-high {
+    }}
+    .risk-high {{
       color: #c5221f;
       font-weight: 700;
-    }
-    .panel {
+    }}
+    .panel {{
       position: sticky;
       top: 16px;
-    }
-    .panel-box {
+    }}
+    .panel-box {{
       background: #fff;
       border-radius: 8px;
       box-shadow: 0 1px 3px rgba(0,0,0,0.08);
       padding: 14px;
-    }
-    .panel-muted {
+    }}
+    .panel-muted {{
       color: #444;
       font-size: 13px;
       line-height: 1.5;
@@ -1262,18 +1355,18 @@ def dashboard():
       border: 1px solid #eee;
       border-radius: 6px;
       padding: 10px;
-    }
-    .table-wrap {
+    }}
+    .table-wrap {{
       overflow: auto;
       max-height: 62vh;
       border-radius: 8px;
-    }
-    .count {
+    }}
+    .count {{
       margin-bottom: 10px;
       font-size: 13px;
       color: #444;
-    }
-    .status-line {
+    }}
+    .status-line {{
       margin-bottom: 10px;
       font-size: 12px;
       color: #666;
@@ -1282,41 +1375,41 @@ def dashboard():
       border-radius: 6px;
       padding: 8px 10px;
       line-height: 1.5;
-    }
-    button {
+    }}
+    button {{
       padding: 8px 12px;
       border: 1px solid #ddd;
       border-radius: 6px;
       background: #fff;
       cursor: pointer;
-    }
-    .btn-primary {
+    }}
+    .btn-primary {{
       background: #1558d6;
       border-color: #1558d6;
       color: white;
-    }
-    .check {
+    }}
+    .check {{
       display: flex;
       align-items: flex-start;
       gap: 8px;
       padding: 8px 0;
       border-bottom: 1px solid #f0f0f0;
       font-size: 13px;
-    }
-    .check:last-child {
+    }}
+    .check:last-child {{
       border-bottom: none;
-    }
-    .ok {
+    }}
+    .ok {{
       color: #137333;
       font-weight: 700;
       min-width: 28px;
-    }
-    .no {
+    }}
+    .no {{
       color: #c5221f;
       font-weight: 700;
       min-width: 28px;
-    }
-    .metric-pill {
+    }}
+    .metric-pill {{
       display: inline-block;
       padding: 3px 8px;
       border-radius: 999px;
@@ -1326,71 +1419,71 @@ def dashboard():
       margin-bottom: 6px;
       background: #f3f4f6;
       color: #333;
-    }
-    .action-row {
+    }}
+    .action-row {{
       display: flex;
       gap: 10px;
       flex-wrap: wrap;
       margin-top: 12px;
-    }
-    .title-row {
+    }}
+    .title-row {{
       display: flex;
       justify-content: space-between;
       align-items: flex-start;
       gap: 12px;
       margin-bottom: 8px;
-    }
-    .title-main {
+    }}
+    .title-main {{
       min-width: 0;
       flex: 1;
-    }
-    .title-main h3 {
+    }}
+    .title-main h3 {{
       margin: 0 0 8px 0;
       line-height: 1.25;
-    }
-    .trade-link {
+    }}
+    .trade-link {{
       white-space: nowrap;
       font-size: 13px;
       text-decoration: none;
       color: #1558d6;
       font-weight: 600;
       margin-top: 2px;
-    }
-    .trade-link:hover {
+    }}
+    .trade-link:hover {{
       text-decoration: underline;
-    }
-    .journal-box, .non-sports-box {
+    }}
+    .journal-box, .non-sports-box {{
       margin-top: 16px;
       padding-top: 12px;
       border-top: 1px solid #eee;
-    }
-    .saved-note {
+    }}
+    .saved-note {{
       margin-top: 8px;
       font-size: 12px;
       color: #137333;
-    }
-    .draft-grid {
+    }}
+    .draft-grid {{
       display: grid;
-      grid-template-columns: 110px 1fr;
+      grid-template-columns: 120px 1fr;
       gap: 8px;
       font-size: 13px;
       margin-bottom: 10px;
-    }
-    .draft-grid div:first-child {
+    }}
+    .draft-grid div:first-child {{
       color: #666;
       font-weight: 600;
-    }
-    .block-label {
+    }}
+    .block-label {{
       margin-top: 10px;
       display: block;
       font-size: 12px;
       color: #555;
       font-weight: 600;
-    }
-    .question-cell {
+    }}
+    .question-cell {{
       max-width: 320px;
-    }
-    .question-truncate {
+    }}
+    .question-truncate {{
       display: -webkit-box;
       -webkit-line-clamp: 2;
       -webkit-box-orient: vertical;
@@ -1398,52 +1491,52 @@ def dashboard():
       line-height: 1.35;
       max-height: 2.7em;
       word-break: break-word;
-    }
-    .mini-list {
+    }}
+    .mini-list {{
       display: grid;
       gap: 8px;
       margin-top: 10px;
-    }
-    .mini-card {
+    }}
+    .mini-card {{
       border: 1px solid #eee;
       border-radius: 6px;
       padding: 8px;
       background: #fafafa;
       font-size: 12px;
       line-height: 1.4;
-    }
-    .mini-card strong {
+    }}
+    .mini-card strong {{
       display: block;
       margin-bottom: 4px;
-    }
+    }}
 
-    .w-flag { width: 92px; }
-    .w-decision { width: 92px; }
-    .w-gate { width: 50px; }
-    .w-score { width: 46px; }
-    .w-friction { width: 82px; }
-    .w-exit { width: 76px; }
-    .w-type { width: 72px; }
-    .w-cat { width: 58px; }
-    .w-oracle { width: 56px; }
-    .w-price { width: 50px; }
-    .w-vol { width: 74px; }
-    .w-liq { width: 82px; }
-    .w-days { width: 42px; }
+    .w-flag {{ width: 92px; }}
+    .w-decision {{ width: 92px; }}
+    .w-gate {{ width: 50px; }}
+    .w-score {{ width: 46px; }}
+    .w-friction {{ width: 82px; }}
+    .w-exit {{ width: 76px; }}
+    .w-type {{ width: 72px; }}
+    .w-cat {{ width: 58px; }}
+    .w-oracle {{ width: 56px; }}
+    .w-price {{ width: 50px; }}
+    .w-vol {{ width: 74px; }}
+    .w-liq {{ width: 82px; }}
+    .w-days {{ width: 42px; }}
 
-    @media (max-width: 1200px) {
-      .layout {
+    @media (max-width: 1200px) {{
+      .layout {{
         grid-template-columns: 1fr;
-      }
-      .panel {
+      }}
+      .panel {{
         position: static;
-      }
-    }
+      }}
+    }}
   </style>
 </head>
 <body>
-  <h1>Polymarket kandidátny dashboard</h1>
-  <p class="small">v5.5 minimalist: WATCH / POTENCIÁL, menej filtrov, cluster dedupe a entry/exit plán.</p>
+  <h1>{title}</h1>
+  <p class="small">v5.7: auto-draft bez písania, TP1/TP2 s percentami výstupu, runner a v6-style execution plán. [file:454]</p>
 
   <div class="layout">
     <div class="section">
@@ -1467,9 +1560,9 @@ def dashboard():
           <label for="minLiquidity">Min likvidita</label>
           <select id="minLiquidity">
             <option value="50000">50 000</option>
-            <option value="100000" selected>100 000</option>
-            <option value="150000">150 000</option>
-            <option value="250000">250 000</option>
+            <option value="100000" {"selected" if default_min_liquidity == 100000 else ""}>100 000</option>
+            <option value="150000" {"selected" if default_min_liquidity == 150000 else ""}>150 000</option>
+            <option value="250000" {"selected" if default_min_liquidity == 250000 else ""}>250 000</option>
           </select>
         </div>
 
@@ -1488,7 +1581,6 @@ def dashboard():
         </div>
       </div>
 
-      <div class="status-line" id="statusLine">Dashboard sa inicializuje...</div>
       <div class="count" id="countBox"></div>
       <div id="markets-error" class="error" style="display:none;"></div>
 
@@ -1521,7 +1613,7 @@ def dashboard():
     <div class="panel">
       <div class="panel-box" id="detailPanel">
         <h3>Detail marketu</h3>
-        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa checklist, systémový draft a entry/exit plán.</p>
+        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa checklist, systémový draft a presný entry/exit plán.</p>
       </div>
     </div>
   </div>
@@ -1530,129 +1622,52 @@ def dashboard():
     let cachedMarkets = [];
     let selectedMarket = null;
     let cachedNonSports = [];
-    let autoRefreshTimer = null;
-    let lastRefreshAt = null;
 
-    const REFRESH_HOURS = [7, 9, 11, 13, 15, 17, 19, 21];
-
-    function fmtInt(value) {
+    function fmtInt(value) {{
       const n = Number(value);
       if (!Number.isFinite(n)) return '';
       return Math.round(n).toLocaleString('sk-SK');
-    }
+    }}
 
-    function fmtPrice(value) {
+    function fmtPrice(value) {{
       const n = Number(value);
       if (!Number.isFinite(n)) return '';
       return n.toFixed(3);
-    }
+    }}
 
-    function fmtDays(value) {
+    function fmtDays(value) {{
       const n = Number(value);
       if (!Number.isFinite(n)) return '';
       return Math.round(n).toString();
-    }
+    }}
 
-    function fmtDateTime(dateObj) {
-      if (!(dateObj instanceof Date)) return '';
-      return dateObj.toLocaleString('sk-SK', {
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit'
-      });
-    }
-
-    function flagBadge(label) {
+    function flagBadge(label) {{
       if (label === 'WATCH') return '<span class="badge watch">WATCH</span>';
       if (label === 'POTENCIÁL') return '<span class="badge review">POTENCIÁL</span>';
       return '<span class="badge pass">PASS</span>';
-    }
+    }}
 
-    function decisionBadge(value) {
+    function decisionBadge(value) {{
       if (value === 'BUY YES') return '<span class="badge decision-buy-yes">BUY YES</span>';
       if (value === 'BUY NO') return '<span class="badge decision-buy-no">BUY NO</span>';
       return '<span class="badge decision-pass">PASS</span>';
-    }
+    }}
 
-    function catBadge(cat) {
+    function catBadge(cat) {{
       return '<span class="cat">' + (cat || 'Ostatné') + '</span>';
-    }
+    }}
 
-    function oracleBadge(level) {
+    function oracleBadge(level) {{
       if (level === 'Nízke') return '<span class="risk-low">Nízke</span>';
       if (level === 'Stredné') return '<span class="risk-medium">Stredné</span>';
       return '<span class="risk-high">Vysoké</span>';
-    }
+    }}
 
-    function pill(text) {
+    function pill(text) {{
       return '<span class="metric-pill">' + text + '</span>';
-    }
+    }}
 
-    function getScheduleInfo(now = new Date()) {
-      const currentHour = now.getHours();
-      const currentMinute = now.getMinutes();
-
-      const today = new Date(now);
-      const next = new Date(now);
-
-      for (const hour of REFRESH_HOURS) {
-        if (currentHour < hour || (currentHour === hour && currentMinute === 0 && now.getSeconds() === 0)) {
-          next.setHours(hour, 0, 0, 0);
-          return {
-            inWindow: currentHour >= 7 && currentHour <= 21,
-            nextRefresh: next
-          };
-        }
-        if (currentHour < hour || (currentHour === hour && currentMinute < 0)) {
-          next.setHours(hour, 0, 0, 0);
-          return {
-            inWindow: currentHour >= 7 && currentHour <= 21,
-            nextRefresh: next
-          };
-        }
-      }
-
-      const tomorrow = new Date(today);
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      tomorrow.setHours(7, 0, 0, 0);
-
-      return {
-        inWindow: false,
-        nextRefresh: tomorrow
-      };
-    }
-
-    function msUntilNextRefresh(now = new Date()) {
-      const info = getScheduleInfo(now);
-      return Math.max(1000, info.nextRefresh.getTime() - now.getTime());
-    }
-
-    function updateStatusLine() {
-      const el = document.getElementById('statusLine');
-      if (!el) return;
-
-      const now = new Date();
-      const info = getScheduleInfo(now);
-      const lastText = lastRefreshAt
-        ? fmtDateTime(lastRefreshAt)
-        : 'ešte neprebehla';
-
-      const nextText = fmtDateTime(info.nextRefresh);
-      const windowText = info.inWindow
-        ? 'Sme v aktívnom okne 07:00–21:00.'
-        : 'Sme mimo aktívneho okna 07:00–21:00.';
-
-      el.innerHTML =
-        'Dashboard aktuálny k: <strong>' + lastText + '</strong><br>' +
-        'Aktuálny dátum a čas: <strong>' + fmtDateTime(now) + '</strong><br>' +
-        'Plán refreshu: <strong>07:00, 09:00, 11:00, 13:00, 15:00, 17:00, 19:00, 21:00</strong><br>' +
-        windowText + ' Ďalší plánovaný refresh: <strong>' + nextText + '</strong>';
-    }
-
-    function renderChecklist(checklist) {
+    function renderChecklist(checklist) {{
       const order = [
         ['resolutability', 'Resolutability'],
         ['baseRate', 'Base Rate'],
@@ -1662,87 +1677,90 @@ def dashboard():
         ['oracle', 'Oracle Trap']
       ];
 
-      return order.map(([key, label]) => {
+      return order.map(([key, label]) => {{
         const item = checklist[key];
         return `
           <div class="check">
-            <div class="${item.ok ? 'ok' : 'no'}">${item.ok ? 'ÁNO' : 'NIE'}</div>
-            <div><strong>${label}</strong><br>${item.note || ''}</div>
+            <div class="${{item.ok ? 'ok' : 'no'}}">${{item.ok ? 'ÁNO' : 'NIE'}}</div>
+            <div><strong>${{label}}</strong><br>${{item.note || ''}}</div>
           </div>
         `;
-      }).join('');
-    }
+      }}).join('');
+    }}
 
-    function buildTradeLogText(m) {
-      return `KATEGORIZÁCIA TRHU: ${m.tradeTypeLabel || ''}
+    function buildTradeLogText(m) {{
+      return `KATEGORIZÁCIA TRHU: ${{m.tradeTypeLabel || ''}}
 
 PRE-TRADE CHECKLIST:
-1. Resolutability: ${(m.checklist?.resolutability?.ok ? 'ÁNO' : 'NIE')} - ${m.checklist?.resolutability?.note || ''}
-2. Base Rate: ${(m.checklist?.baseRate?.ok ? 'ÁNO' : 'NIE')} - ${m.checklist?.baseRate?.note || ''}
-3. Frikcia: ${(m.checklist?.friction?.ok ? 'ÁNO' : 'NIE')} - ${m.checklist?.friction?.note || ''}
-4. Exit: ${(m.checklist?.exit?.ok ? 'ÁNO' : 'NIE')} - ${m.checklist?.exit?.note || ''}
-5. Catalyst: ${(m.checklist?.catalyst?.ok ? 'ÁNO' : 'NIE')} - ${m.checklist?.catalyst?.note || ''}
-6. Oracle Trap: ${(m.checklist?.oracle?.ok ? 'ÁNO' : 'NIE')} - ${m.checklist?.oracle?.note || ''}
+1. Resolutability: ${{(m.checklist?.resolutability?.ok ? 'ÁNO' : 'NIE')}} - ${{m.checklist?.resolutability?.note || ''}}
+2. Base Rate: ${{(m.checklist?.baseRate?.ok ? 'ÁNO' : 'NIE')}} - ${{m.checklist?.baseRate?.note || ''}}
+3. Frikcia: ${{(m.checklist?.friction?.ok ? 'ÁNO' : 'NIE')}} - ${{m.checklist?.friction?.note || ''}}
+4. Exit: ${{(m.checklist?.exit?.ok ? 'ÁNO' : 'NIE')}} - ${{m.checklist?.exit?.note || ''}}
+5. Catalyst: ${{(m.checklist?.catalyst?.ok ? 'ÁNO' : 'NIE')}} - ${{m.checklist?.catalyst?.note || ''}}
+6. Oracle Trap: ${{(m.checklist?.oracle?.ok ? 'ÁNO' : 'NIE')}} - ${{m.checklist?.oracle?.note || ''}}
 
 ANALÝZA EDGE-U:
-${m.autoDraft?.thesis || ''}
+${{m.autoDraft?.thesis || ''}}
 
 KDE JE MISPRICING:
-${m.autoDraft?.mispricing || ''}
+${{m.autoDraft?.mispricing || ''}}
 
 TYP EDGE:
-${m.autoDraft?.edge || ''}
+${{m.autoDraft?.edge || ''}}
 
 RESOLUTION ANALÝZA:
-${m.autoDraft?.resolution || ''}
+${{m.autoDraft?.resolution || ''}}
 
 PARAMETRE VSTUPU:
-Market: ${m.question || ''}
-Entry side: ${m.executionPlan?.entrySide || ''}
-Limit price: ${m.executionPlan?.limitPrice ?? ''}
-Stake: ${m.executionPlan?.stakeUSDC || 0} USDC
-Tranches: ${m.executionPlan?.tranche1USDC || 0} / ${m.executionPlan?.tranche2USDC || 0} / ${m.executionPlan?.tranche3USDC || 0} USDC
-YES cena: ${fmtPrice(m.yesPrice)}
-NO cena: ${fmtPrice(m.noPrice)}
-Likvidita: ${fmtInt(m.liquidity)}
-24h objem: ${fmtInt(m.volume24hr)}
-Dni do expirácie: ${fmtDays(m.daysToEnd)}
+Market: ${{m.question || ''}}
+Entry side: ${{m.executionPlan?.entrySide || ''}}
+Limit price: ${{m.executionPlan?.limitPrice ?? ''}}
+Stake: ${{m.executionPlan?.stakeUSDC || 0}} USDC
+Tranches: ${{m.executionPlan?.tranche1USDC || 0}} / ${{m.executionPlan?.tranche2USDC || 0}} / ${{m.executionPlan?.tranche3USDC || 0}} USDC
+YES cena: ${{fmtPrice(m.yesPrice)}}
+NO cena: ${{fmtPrice(m.noPrice)}}
+Likvidita: ${{fmtInt(m.liquidity)}}
+24h objem: ${{fmtInt(m.volume24hr)}}
+Dni do expirácie: ${{fmtDays(m.daysToEnd)}}
 
 PLÁN VÝSTUPU:
-TP1: ${m.executionPlan?.takeProfit1 || ''}
-TP2: ${m.executionPlan?.takeProfit2 || ''}
-Runner: ${m.executionPlan?.runnerRule || ''}
-Time-stop: ${m.executionPlan?.timeStop || ''}
+TP1: ${{m.executionPlan?.takeProfit1 || ''}} / predať ${{m.executionPlan?.tp1Pct || 0}}%
+TP2: ${{m.executionPlan?.takeProfit2 || ''}} / predať ${{m.executionPlan?.tp2Pct || 0}}%
+Runner: ${{m.executionPlan?.runnerPct || 0}}%
+TP1 action: ${{m.executionPlan?.tp1Action || ''}}
+TP2 action: ${{m.executionPlan?.tp2Action || ''}}
+Runner rule: ${{m.executionPlan?.runnerRule || ''}}
+Time-stop: ${{m.executionPlan?.timeStop || ''}}
 
 INVALIDÁCIA (FULL EXIT TRIGGER):
-${m.executionPlan?.fullExitTrigger || ''}
+${{m.executionPlan?.fullExitTrigger || ''}}
 
 KATALYZÁTOR:
-${m.autoDraft?.catalyst || ''}
+${{m.autoDraft?.catalyst || ''}}
 
 CONFIDENCE:
-${m.autoDraft?.confidence || ''}/10
+${{m.autoDraft?.confidence || ''}}/10
 
 BIAS:
-${m.autoDraft?.bias || ''}
+${{m.autoDraft?.bias || ''}}
 
 FINÁLNE ROZHODNUTIE:
-${m.autoDraft?.finalDecision || 'PASS'}
+${{m.autoDraft?.finalDecision || 'PASS'}}
 `;
-    }
+    }}
 
-    async function copyTradeLog() {
+    async function copyTradeLog() {{
       if (!selectedMarket) return;
       const text = buildTradeLogText(selectedMarket);
       await navigator.clipboard.writeText(text);
       const msg = document.getElementById('savedNote');
       if (msg) msg.textContent = 'Trade-log šablóna skopírovaná do schránky.';
-    }
+    }}
 
-    function downloadTradeLog() {
+    function downloadTradeLog() {{
       if (!selectedMarket) return;
       const text = buildTradeLogText(selectedMarket);
-      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+      const blob = new Blob([text], {{ type: 'text/plain;charset=utf-8' }});
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
       const safeSlug = (selectedMarket.slug || 'trade-log').replace(/[^a-z0-9-]/gi, '-');
@@ -1751,37 +1769,37 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       URL.revokeObjectURL(a.href);
       const msg = document.getElementById('savedNote');
       if (msg) msg.textContent = 'Trade-log šablóna stiahnutá.';
-    }
+    }}
 
-    function renderNonSports() {
-      if (!cachedNonSports || cachedNonSports.length === 0) {
+    function renderNonSports() {{
+      if (!cachedNonSports || cachedNonSports.length === 0) {{
         return `
           <div class="non-sports-box">
             <h3>Top mimo športu</h3>
             <div class="panel-muted">Aktuálne nebol nájdený žiadny zaujímavý non-sports kandidát podľa tvojich filtrov.</div>
           </div>
         `;
-      }
+      }}
 
       const cards = cachedNonSports.map(m => `
         <div class="mini-card">
-          <strong>${m.question || ''}</strong>
-          ${decisionBadge(m.autoDraft?.finalDecision || 'PASS')}
-          ${catBadge(m.categoryLabel || 'Ostatné')}
-          ${pill('Gate: ' + (m.gateScore ?? '') + '/6')}
-          <div style="margin-top:6px;">Cluster: ${m.cluster || ''}</div>
+          <strong>${{m.question || ''}}</strong>
+          ${{decisionBadge(m.autoDraft?.finalDecision || 'PASS')}}
+          ${{catBadge(m.categoryLabel || 'Ostatné')}}
+          ${{pill('Gate: ' + (m.gateScore ?? '') + '/6')}}
+          <div style="margin-top:6px;">Cluster: ${{m.cluster || ''}}</div>
         </div>
       `).join('');
 
       return `
         <div class="non-sports-box">
           <h3>Top mimo športu</h3>
-          <div class="mini-list">${cards}</div>
+          <div class="mini-list">${{cards}}</div>
         </div>
       `;
-    }
+    }}
 
-    function showDetail(m) {
+    function showDetail(m) {{
       selectedMarket = m;
       const panel = document.getElementById('detailPanel');
       const link = m.slug ? 'https://polymarket.com/market/' + m.slug : '';
@@ -1789,70 +1807,77 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       panel.innerHTML = `
         <div class="title-row">
           <div class="title-main">
-            <h3>${m.question || 'Detail marketu'}</h3>
+            <h3>${{m.question || 'Detail marketu'}}</h3>
             <div>
-              ${flagBadge(m.flagLabel)}
-              ${decisionBadge(m.autoDraft?.finalDecision || 'PASS')}
-              ${catBadge(m.categoryLabel)}
-              ${pill('Typ: ' + (m.tradeTypeLabel || 'Ostatné'))}
-              ${pill('Gate: ' + (m.gateScore ?? '') + '/6')}
+              ${{flagBadge(m.flagLabel)}}
+              ${{decisionBadge(m.autoDraft?.finalDecision || 'PASS')}}
+              ${{catBadge(m.categoryLabel)}}
+              ${{pill('Typ: ' + (m.tradeTypeLabel || 'Ostatné'))}}
+              ${{pill('Gate: ' + (m.gateScore ?? '') + '/6')}}
             </div>
           </div>
           <div>
-            ${link ? '<a class="trade-link" href="' + link + '" target="_blank" rel="noopener noreferrer">Otvoriť trade</a>' : ''}
+            ${{link ? '<a class="trade-link" href="' + link + '" target="_blank" rel="noopener noreferrer">Otvoriť trade</a>' : ''}}
           </div>
         </div>
 
-        <div class="draft-grid"><div>Cluster</div><div>${m.cluster || ''}</div></div>
-        <div class="draft-grid"><div>Fail point</div><div>${m.failPoint || ''}</div></div>
-        <div class="draft-grid"><div>Sizing cap</div><div>${m.sizingCap || ''}</div></div>
+        <div class="draft-grid"><div>Cluster</div><div>${{m.cluster || ''}}</div></div>
+        <div class="draft-grid"><div>Fail point</div><div>${{m.failPoint || ''}}</div></div>
+        <div class="draft-grid"><div>Sizing cap</div><div>${{m.sizingCap || ''}}</div></div>
 
         <h3 style="margin-top:14px;">Mini 6/6 checklist</h3>
-        ${renderChecklist(m.checklist || {})}
+        ${{renderChecklist(m.checklist || {{}})}}
 
         <div class="journal-box">
           <h3>Systémový draft</h3>
 
-          <div class="draft-grid"><div>Bias</div><div>${m.autoDraft?.bias || ''}</div></div>
-          <div class="draft-grid"><div>Rozhodnutie</div><div><strong>${m.autoDraft?.finalDecision || ''}</strong></div></div>
-          <div class="draft-grid"><div>Confidence</div><div>${m.autoDraft?.confidence || ''}/10</div></div>
-          <div class="draft-grid"><div>Sizing hint</div><div>${m.autoDraft?.sizingHint || ''}</div></div>
+          <div class="draft-grid"><div>Bias</div><div>${{m.autoDraft?.bias || ''}}</div></div>
+          <div class="draft-grid"><div>Rozhodnutie</div><div><strong>${{m.autoDraft?.finalDecision || ''}}</strong></div></div>
+          <div class="draft-grid"><div>Confidence</div><div>${{m.autoDraft?.confidence || ''}}/10</div></div>
+          <div class="draft-grid"><div>Sizing hint</div><div>${{m.autoDraft?.sizingHint || ''}}</div></div>
 
           <label class="block-label">Téza</label>
-          <div class="small" style="margin-bottom:4px;color:#666;">Prečo je tento market vôbec kandidát.</div>
-          <div class="panel-muted">${m.autoDraft?.thesis || ''}</div>
+          <div class="panel-muted">${{m.autoDraft?.thesis || ''}}</div>
 
           <label class="block-label">Mispricing</label>
-          <div class="small" style="margin-bottom:4px;color:#666;">Kde môže byť chyba v ocenení trhu.</div>
-          <div class="panel-muted">${m.autoDraft?.mispricing || ''}</div>
+          <div class="panel-muted">${{m.autoDraft?.mispricing || ''}}</div>
 
           <label class="block-label">Edge</label>
-          <div class="small" style="margin-bottom:4px;color:#666;">Aký typ výhody tu hľadáš.</div>
-          <div class="panel-muted">${m.autoDraft?.edge || ''}</div>
+          <div class="panel-muted">${{m.autoDraft?.edge || ''}}</div>
 
           <label class="block-label">Katalyzátor</label>
-          <div class="small" style="margin-bottom:4px;color:#666;">Čo môže pohnúť cenou alebo potvrdiť tézu.</div>
-          <div class="panel-muted">${m.autoDraft?.catalyst || ''}</div>
+          <div class="panel-muted">${{m.autoDraft?.catalyst || ''}}</div>
+
+          <label class="block-label">Resolution analýza</label>
+          <div class="panel-muted">${{m.autoDraft?.resolution || ''}}</div>
         </div>
 
         <div class="journal-box">
           <h3>Entry / Exit plán</h3>
 
-          <div class="draft-grid"><div>Side</div><div>${m.executionPlan?.entrySide || ''}</div></div>
-          <div class="draft-grid"><div>Limit price</div><div>${m.executionPlan?.limitPrice ?? ''}</div></div>
-          <div class="draft-grid"><div>Stake</div><div>${m.executionPlan?.stakeUSDC || 0} USDC (${m.executionPlan?.stakePct || '0%'})</div></div>
-          <div class="draft-grid"><div>Tranches</div><div>${m.executionPlan?.tranche1USDC || 0} / ${m.executionPlan?.tranche2USDC || 0} / ${m.executionPlan?.tranche3USDC || 0} USDC</div></div>
-          <div class="draft-grid"><div>TP1</div><div>${m.executionPlan?.takeProfit1 || ''}</div></div>
-          <div class="draft-grid"><div>TP2</div><div>${m.executionPlan?.takeProfit2 || ''}</div></div>
+          <div class="draft-grid"><div>Side</div><div>${{m.executionPlan?.entrySide || ''}}</div></div>
+          <div class="draft-grid"><div>Limit price</div><div>${{m.executionPlan?.limitPrice ?? ''}}</div></div>
+          <div class="draft-grid"><div>Stake</div><div>${{m.executionPlan?.stakeUSDC || 0}} USDC (${{m.executionPlan?.stakePct || '0%'}})</div></div>
+          <div class="draft-grid"><div>Tranches</div><div>${{m.executionPlan?.tranche1USDC || 0}} / ${{m.executionPlan?.tranche2USDC || 0}} / ${{m.executionPlan?.tranche3USDC || 0}} USDC</div></div>
+
+          <div class="draft-grid"><div>TP1</div><div>${{m.executionPlan?.takeProfit1 || ''}} / predať ${{m.executionPlan?.tp1Pct || 0}}%</div></div>
+          <div class="draft-grid"><div>TP2</div><div>${{m.executionPlan?.takeProfit2 || ''}} / predať ${{m.executionPlan?.tp2Pct || 0}}%</div></div>
+          <div class="draft-grid"><div>Runner</div><div>Nechať ${{m.executionPlan?.runnerPct || 0}}%</div></div>
+
+          <label class="block-label">TP1 action</label>
+          <div class="panel-muted">${{m.executionPlan?.tp1Action || ''}}</div>
+
+          <label class="block-label">TP2 action</label>
+          <div class="panel-muted">${{m.executionPlan?.tp2Action || ''}}</div>
 
           <label class="block-label">Runner rule</label>
-          <div class="panel-muted">${m.executionPlan?.runnerRule || ''}</div>
+          <div class="panel-muted">${{m.executionPlan?.runnerRule || ''}}</div>
 
           <label class="block-label">Time stop</label>
-          <div class="panel-muted">${m.executionPlan?.timeStop || ''}</div>
+          <div class="panel-muted">${{m.executionPlan?.timeStop || ''}}</div>
 
           <label class="block-label">Full exit trigger</label>
-          <div class="panel-muted">${m.executionPlan?.fullExitTrigger || ''}</div>
+          <div class="panel-muted">${{m.executionPlan?.fullExitTrigger || ''}}</div>
 
           <div class="action-row">
             <button class="btn-primary" onclick="copyTradeLog()">Kopírovať trade-log šablónu</button>
@@ -1862,11 +1887,11 @@ ${m.autoDraft?.finalDecision || 'PASS'}
           <div class="saved-note" id="savedNote"></div>
         </div>
 
-        ${renderNonSports()}
+        ${{renderNonSports()}}
       `;
-    }
+    }}
 
-    async function loadMarkets(manual = false) {
+    async function loadMarkets() {{
       const errorEl = document.getElementById('markets-error');
       const tbody = document.querySelector('#markets-table tbody');
       const countBox = document.getElementById('countBox');
@@ -1876,14 +1901,14 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       const hidePass = document.getElementById('hidePass').checked;
       const diversify = document.getElementById('diversify').checked;
 
-      try {
-        const params = new URLSearchParams({
+      try {{
+        const params = new URLSearchParams({{
           limit: '100',
           min_liquidity: minLiquidity,
           hide_pass: hidePass ? 'true' : 'false',
           category: category,
           diversify: diversify ? 'true' : 'false'
-        });
+        }});
 
         const res = await fetch('/markets?' + params.toString());
         if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -1896,121 +1921,64 @@ ${m.autoDraft?.finalDecision || 'PASS'}
         cachedMarkets = markets;
         tbody.innerHTML = '';
 
-        markets.forEach((m, idx) => {
+        markets.forEach((m, idx) => {{
           const tr = document.createElement('tr');
           tr.className = 'clickable';
 
           tr.innerHTML = `
-            <td>${flagBadge(m.flagLabel)}</td>
-            <td>${decisionBadge(m.autoDraft?.finalDecision || 'PASS')}</td>
-            <td>${m.gateScore ?? ''}/6</td>
-            <td>${m.candidateScore ?? ''}</td>
-            <td>${m.frictionLabelSk || ''}</td>
-            <td>${m.exitLabelSk || ''}</td>
-            <td>${m.tradeTypeLabel || ''}</td>
-            <td>${catBadge(m.categoryLabel)}</td>
-            <td>${oracleBadge(m.oracleRiskLabel)}</td>
-            <td class="question-cell"><div class="question-truncate">${m.question || ''}</div></td>
-            <td>${fmtPrice(m.yesPrice)}</td>
-            <td>${fmtPrice(m.noPrice)}</td>
-            <td>${fmtInt(m.volume24hr)}</td>
-            <td>${fmtInt(m.liquidity)}</td>
-            <td>${fmtDays(m.daysToEnd)}</td>
+            <td>${{flagBadge(m.flagLabel)}}</td>
+            <td>${{decisionBadge(m.autoDraft?.finalDecision || 'PASS')}}</td>
+            <td>${{m.gateScore ?? ''}}/6</td>
+            <td>${{m.candidateScore ?? ''}}</td>
+            <td>${{m.frictionLabelSk || ''}}</td>
+            <td>${{m.exitLabelSk || ''}}</td>
+            <td>${{m.tradeTypeLabel || ''}}</td>
+            <td>${{catBadge(m.categoryLabel)}}</td>
+            <td>${{oracleBadge(m.oracleRiskLabel)}}</td>
+            <td class="question-cell"><div class="question-truncate">${{m.question || ''}}</div></td>
+            <td>${{fmtPrice(m.yesPrice)}}</td>
+            <td>${{fmtPrice(m.noPrice)}}</td>
+            <td>${{fmtInt(m.volume24hr)}}</td>
+            <td>${{fmtInt(m.liquidity)}}</td>
+            <td>${{fmtDays(m.daysToEnd)}}</td>
           `;
 
-          tr.addEventListener('click', () => {
+          tr.addEventListener('click', () => {{
             showDetail(cachedMarkets[idx]);
-          });
+          }});
 
           tbody.appendChild(tr);
-        });
+        }});
 
         countBox.textContent = 'Zobrazené markety: ' + markets.length;
         errorEl.style.display = 'none';
-        lastRefreshAt = new Date();
-        updateStatusLine();
 
-        if (markets.length > 0) {
+        if (markets.length > 0) {{
           const matched = selectedSlug ? markets.find(x => x.slug === selectedSlug) : null;
           showDetail(matched || markets[0]);
-        } else {
+        }} else {{
           document.getElementById('detailPanel').innerHTML =
             '<h3>Detail marketu</h3><p class="panel-muted">Žiadny market nevyhovuje aktuálnym filtrom.</p>' +
             renderNonSports();
-        }
-      } catch (err) {
+        }}
+      }} catch (err) {{
         errorEl.textContent = 'Chyba pri načítaní marketov: ' + err.message;
         errorEl.style.display = 'block';
-      }
-    }
+      }}
+    }}
 
-    function scheduleNextRefresh() {
-      if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
-      updateStatusLine();
-      const delay = msUntilNextRefresh(new Date());
-      autoRefreshTimer = setTimeout(async () => {
-        await loadMarkets(false);
-        scheduleNextRefresh();
-      }, delay);
-    }
+    document.getElementById('category').addEventListener('change', loadMarkets);
+    document.getElementById('minLiquidity').addEventListener('change', loadMarkets);
+    document.getElementById('hidePass').addEventListener('change', loadMarkets);
+    document.getElementById('diversify').addEventListener('change', loadMarkets);
 
-    setInterval(updateStatusLine, 1000);
-
-    document.getElementById('category').addEventListener('change', async () => {
-      await loadMarkets(true);
-      scheduleNextRefresh();
-    });
-    document.getElementById('minLiquidity').addEventListener('change', async () => {
-      await loadMarkets(true);
-      scheduleNextRefresh();
-    });
-    document.getElementById('hidePass').addEventListener('change', async () => {
-      await loadMarkets(true);
-      scheduleNextRefresh();
-    });
-    document.getElementById('diversify').addEventListener('change', async () => {
-      await loadMarkets(true);
-      scheduleNextRefresh();
-    });
-
-    loadMarkets(true).then(() => {
-      scheduleNextRefresh();
-    });
+    loadMarkets();
   </script>
 </body>
 </html>
-    """
-
-
-@app.route("/analyze-market")
-def analyze_market():
-    slug = request.args.get("slug")
-    if not slug:
-        return jsonify({"error": "Missing slug parameter"}), 400
-
-    url = f"{GAMMA_BASE}/markets"
-    params = {
-        "slug": slug,
-        "limit": 1,
-        "active": "true",
-        "closed": "false",
-    }
-
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        r.raise_for_status()
-    except Exception as e:
-        return jsonify({"error": f"Gamma request failed: {e}"}), 502
-
-    data = r.json()
-    if not data:
-        return jsonify({"error": "No market found for given slug", "slug": slug}), 404
-
-    m = data[0]
-    row = build_market_row(m)
-
-    return jsonify(row)
+"""
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
