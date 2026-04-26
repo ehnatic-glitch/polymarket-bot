@@ -162,6 +162,156 @@ def oracle_risk_level(question):
     return "Low"
 
 
+def detect_catalyst(question, days_to_end):
+    q = (question or "").lower()
+
+    if any(k in q for k in ["vote", "voting", "election", "runoff"]):
+        return ("Vote/Election", "High")
+    if any(k in q for k in ["deadline", "by ", "before ", "by end of", "before end of"]):
+        return ("Deadline", "Medium")
+    if any(k in q for k in ["earnings", "cpi", "report", "announcement", "fomc", "fed"]):
+        return ("Report/Announcement", "High")
+    if any(k in q for k in ["finals", "world cup", "champions league", "ufc"]):
+        return ("Scheduled event", "Medium")
+    if days_to_end is not None and days_to_end <= 7:
+        return ("Near expiry", "Medium")
+    return ("Unclear", "Low")
+
+
+def price_extreme_bucket(yes_price):
+    if not isinstance(yes_price, (int, float)):
+        return "Missing"
+    if yes_price < 0.05 or yes_price > 0.95:
+        return "Very Extreme"
+    if yes_price < 0.12 or yes_price > 0.88:
+        return "Extreme"
+    if yes_price < 0.20 or yes_price > 0.80:
+        return "Stretched"
+    return "Balanced"
+
+
+def friction_score(liquidity, volume24hr, yes_price, days_to_end):
+    score = 0
+    notes = []
+
+    if liquidity >= 500000:
+        score += 3
+        notes.append("high_liquidity")
+    elif liquidity >= 250000:
+        score += 2
+        notes.append("good_liquidity")
+    elif liquidity >= 100000:
+        score += 1
+        notes.append("ok_liquidity")
+    else:
+        score -= 3
+        notes.append("thin_liquidity")
+
+    if volume24hr >= 250000:
+        score += 3
+        notes.append("high_volume")
+    elif volume24hr >= 100000:
+        score += 2
+        notes.append("good_volume")
+    elif volume24hr >= 25000:
+        score += 1
+        notes.append("ok_volume")
+    else:
+        score -= 2
+        notes.append("low_volume")
+
+    bucket = price_extreme_bucket(yes_price)
+    if bucket == "Balanced":
+        score += 2
+        notes.append("balanced_price")
+    elif bucket == "Stretched":
+        score += 0
+        notes.append("stretched_price")
+    elif bucket == "Extreme":
+        score -= 2
+        notes.append("extreme_price")
+    elif bucket == "Very Extreme":
+        score -= 3
+        notes.append("very_extreme_price")
+    else:
+        score -= 2
+        notes.append("missing_price")
+
+    if days_to_end is not None:
+        if days_to_end < 2:
+            score -= 2
+            notes.append("too_close_expiry")
+        elif days_to_end <= 30:
+            score += 1
+            notes.append("near_expiry_ok")
+        elif days_to_end > 365:
+            score -= 1
+            notes.append("too_far_expiry")
+
+    if score >= 6:
+        label = "Low friction"
+    elif score >= 3:
+        label = "Manageable"
+    elif score >= 0:
+        label = "Medium"
+    else:
+        label = "High friction"
+
+    return score, label, notes
+
+
+def exit_score(liquidity, volume24hr, yes_price, days_to_end):
+    score = 0
+    notes = []
+
+    if liquidity >= 500000:
+        score += 3
+        notes.append("deep_book_proxy")
+    elif liquidity >= 250000:
+        score += 2
+        notes.append("solid_book_proxy")
+    elif liquidity >= 100000:
+        score += 1
+        notes.append("acceptable_book_proxy")
+    else:
+        score -= 3
+        notes.append("weak_book_proxy")
+
+    if volume24hr >= 100000:
+        score += 2
+        notes.append("active_flow")
+    elif volume24hr >= 25000:
+        score += 1
+        notes.append("ok_flow")
+    else:
+        score -= 1
+        notes.append("weak_flow")
+
+    if isinstance(yes_price, (int, float)):
+        if 0.10 <= yes_price <= 0.90:
+            score += 1
+            notes.append("not_edge_of_book")
+        else:
+            score -= 1
+            notes.append("edge_of_book")
+    else:
+        score -= 2
+        notes.append("missing_price")
+
+    if days_to_end is not None and days_to_end < 2:
+        score -= 2
+        notes.append("expiry_exit_risk")
+
+    if score >= 5:
+        label = "Good exit"
+    elif score >= 2:
+        label = "Okay exit"
+    else:
+        label = "Weak exit"
+
+    return score, label, notes
+
+
 def score_market(m):
     score = 0
     notes = []
@@ -180,12 +330,16 @@ def score_market(m):
         days_to_end = (end_date - now).total_seconds() / 86400
 
     trade_type = detect_trade_type(m.get("question"), yes_price, days_to_end)
+    catalyst_type, catalyst_confidence = detect_catalyst(m.get("question"), days_to_end)
+
+    fr_score, fr_label, fr_notes = friction_score(liquidity, volume24hr, yes_price, days_to_end)
+    ex_score, ex_label, ex_notes = exit_score(liquidity, volume24hr, yes_price, days_to_end)
 
     gate_resolutability = oracle_risk == "Low"
     gate_base_rate = category in ["Politics", "Crypto", "Sports", "Other", "Geopolitics"]
-    gate_friction = liquidity >= 100000 and volume24hr >= 25000
-    gate_exit = liquidity >= 150000
-    gate_catalyst = days_to_end is not None and 1 <= days_to_end <= 180
+    gate_friction = fr_score >= 3
+    gate_exit = ex_score >= 2
+    gate_catalyst = catalyst_confidence in ["High", "Medium"] and days_to_end is not None and days_to_end <= 180
     gate_oracle = oracle_risk != "High"
 
     gate_score = sum([
@@ -197,48 +351,8 @@ def score_market(m):
         1 if gate_oracle else 0,
     ])
 
-    if liquidity >= 500000:
-        score += 4
-        notes.append("very_high_liquidity")
-    elif liquidity >= 250000:
-        score += 3
-        notes.append("high_liquidity")
-    elif liquidity >= 150000:
-        score += 2
-        notes.append("good_liquidity")
-    elif liquidity >= 50000:
-        score += 1
-        notes.append("ok_liquidity")
-    else:
-        score -= 5
-        notes.append("thin_liquidity")
-
-    if volume24hr >= 500000:
-        score += 3
-        notes.append("high_volume")
-    elif volume24hr >= 100000:
-        score += 2
-        notes.append("good_volume")
-    elif volume24hr >= 25000:
-        score += 1
-        notes.append("ok_volume")
-    else:
-        score -= 4
-        notes.append("low_volume")
-
-    if isinstance(yes_price, (int, float)):
-        if 0.12 <= yes_price <= 0.88:
-            score += 2
-            notes.append("balanced_price")
-        elif yes_price < 0.10 or yes_price > 0.90:
-            score -= 4
-            notes.append("extreme_price")
-        else:
-            score -= 1
-            notes.append("stretched_price")
-    else:
-        score -= 4
-        notes.append("missing_price")
+    score += fr_score
+    score += ex_score // 2
 
     if days_to_end is not None:
         if 7 <= days_to_end <= 180:
@@ -297,8 +411,8 @@ def score_market(m):
     hard_reject = (
         oracle_risk == "High" or
         "noise_market" in notes or
-        "thin_liquidity" in notes or
-        "missing_price" in notes
+        "thin_liquidity" in fr_notes or
+        "missing_price" in fr_notes
     )
 
     sports_exception_ok = (
@@ -317,8 +431,8 @@ def score_market(m):
         gate_score >= 5 and
         gate_oracle and
         gate_resolutability and
-        liquidity >= 150000 and
-        volume24hr >= 50000 and
+        gate_friction and
+        gate_exit and
         isinstance(yes_price, (int, float)) and
         0.12 <= yes_price <= 0.88 and
         trade_type != "Resolution" and
@@ -326,7 +440,7 @@ def score_market(m):
         sports_exception_ok
     )
 
-    if strict_watch and score >= 7:
+    if strict_watch and score >= 8:
         flag = "WATCH"
     elif not hard_reject and gate_score >= 3 and score >= 1:
         flag = "REVIEW"
@@ -351,34 +465,52 @@ def score_market(m):
     else:
         summary_parts.append("vysoký oracle risk")
 
-    if liquidity >= 250000:
-        summary_parts.append("likvidný")
-    elif liquidity >= 100000:
-        summary_parts.append("slušná likvidita")
-    else:
-        summary_parts.append("slabšia likvidita")
+    summary_parts.append(fr_label.lower())
+    summary_parts.append(ex_label.lower())
 
-    if volume24hr >= 100000:
-        summary_parts.append("dobrý objem")
-    elif volume24hr >= 25000:
-        summary_parts.append("ok objem")
-    else:
-        summary_parts.append("slabý objem")
-
-    if isinstance(yes_price, (int, float)):
-        if 0.12 <= yes_price <= 0.88:
-            summary_parts.append("vyvážená cena")
-        elif yes_price < 0.10 or yes_price > 0.90:
-            summary_parts.append("extrémna cena")
-        else:
-            summary_parts.append("natiahnutá cena")
-    else:
-        summary_parts.append("chýba cena")
+    if catalyst_type != "Unclear":
+        summary_parts.append(f"katalyzátor: {catalyst_type.lower()}")
 
     if "sports_hype_risk" in notes:
         summary_parts.append("šport needs stronger setup")
 
     summary = ", ".join(summary_parts)
+
+    checklist = {
+        "resolutability": {
+            "ok": gate_resolutability,
+            "note": "Pravidlá bez silnej ambiguity." if gate_resolutability else "Pravidlá/wording nesú ambiguity."
+        },
+        "baseRate": {
+            "ok": gate_base_rate,
+            "note": "Kategória je analyzovateľná base-rate prístupom." if gate_base_rate else "Slabý base-rate rámec."
+        },
+        "friction": {
+            "ok": gate_friction,
+            "note": f"{fr_label}, friction score {fr_score}."
+        },
+        "exit": {
+            "ok": gate_exit,
+            "note": f"{ex_label}, exit score {ex_score}."
+        },
+        "catalyst": {
+            "ok": gate_catalyst,
+            "note": f"{catalyst_type}, confidence {catalyst_confidence}."
+        },
+        "oracle": {
+            "ok": gate_oracle,
+            "note": f"Oracle risk {oracle_risk}."
+        }
+    }
+
+    detail_commentary = [
+        f"Trade type: {trade_type}.",
+        f"Oracle risk: {oracle_risk}.",
+        f"Friction: {fr_label} ({fr_score}).",
+        f"Exit: {ex_label} ({ex_score}).",
+        f"Catalyst: {catalyst_type} / {catalyst_confidence}.",
+        f"Gate: {gate_score}/6."
+    ]
 
     return {
         "candidateScore": score,
@@ -392,6 +524,14 @@ def score_market(m):
         "tradeType": trade_type,
         "oracleRisk": oracle_risk,
         "gateScore": gate_score,
+        "frictionScore": fr_score,
+        "frictionLabel": fr_label,
+        "exitScore": ex_score,
+        "exitLabel": ex_label,
+        "catalystType": catalyst_type,
+        "catalystConfidence": catalyst_confidence,
+        "checklist": checklist,
+        "detailCommentary": detail_commentary,
         "gate": {
             "resolutability": gate_resolutability,
             "baseRate": gate_base_rate,
@@ -432,6 +572,14 @@ def build_market_row(m):
         "oracleRisk": scored["oracleRisk"],
         "gateScore": scored["gateScore"],
         "gate": scored["gate"],
+        "frictionScore": scored["frictionScore"],
+        "frictionLabel": scored["frictionLabel"],
+        "exitScore": scored["exitScore"],
+        "exitLabel": scored["exitLabel"],
+        "catalystType": scored["catalystType"],
+        "catalystConfidence": scored["catalystConfidence"],
+        "checklist": scored["checklist"],
+        "detailCommentary": scored["detailCommentary"],
     }
 
 
@@ -543,7 +691,7 @@ def dashboard():
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Polymarket Candidate Dashboard v3</title>
+  <title>Polymarket Candidate Dashboard v4</title>
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -551,7 +699,7 @@ def dashboard():
       background: #f5f5f5;
       color: #222;
     }
-    h1, h2 {
+    h1, h2, h3 {
       margin-bottom: 0.3rem;
     }
     .section {
@@ -560,6 +708,12 @@ def dashboard():
       border-radius: 8px;
       margin-bottom: 20px;
       box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr);
+      gap: 16px;
+      align-items: start;
     }
     .controls {
       display: flex;
@@ -572,7 +726,7 @@ def dashboard():
       display: flex;
       flex-direction: column;
       gap: 4px;
-      min-width: 160px;
+      min-width: 150px;
     }
     label {
       font-size: 12px;
@@ -608,6 +762,12 @@ def dashboard():
       font-weight: 600;
       position: sticky;
       top: 0;
+    }
+    tr.clickable {
+      cursor: pointer;
+    }
+    tr.clickable:hover {
+      background: #fafcff;
     }
     .small {
       font-size: 12px;
@@ -658,12 +818,30 @@ def dashboard():
       color: #c5221f;
       font-weight: 700;
     }
-    a {
-      color: #1558d6;
-      text-decoration: none;
+    .panel {
+      position: sticky;
+      top: 20px;
     }
-    a:hover {
-      text-decoration: underline;
+    .panel-box {
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+      padding: 16px;
+    }
+    .panel-muted {
+      color: #666;
+      font-size: 13px;
+    }
+    .kv {
+      display: grid;
+      grid-template-columns: 120px 1fr;
+      gap: 8px;
+      font-size: 13px;
+      margin-bottom: 10px;
+    }
+    .kv div:first-child {
+      color: #666;
+      font-weight: 600;
     }
     .summary {
       font-size: 12px;
@@ -688,122 +866,191 @@ def dashboard():
       background: #fff;
       cursor: pointer;
     }
+    .check {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 8px 0;
+      border-bottom: 1px solid #f0f0f0;
+      font-size: 13px;
+    }
+    .check:last-child {
+      border-bottom: none;
+    }
+    .ok {
+      color: #137333;
+      font-weight: 700;
+    }
+    .no {
+      color: #c5221f;
+      font-weight: 700;
+    }
+    .metric-pill {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      margin-right: 6px;
+      margin-bottom: 6px;
+      background: #f3f4f6;
+      color: #333;
+    }
+    .link-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+    a {
+      color: #1558d6;
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+    ul.detail-list {
+      margin: 8px 0 0 18px;
+      padding: 0;
+      color: #444;
+      font-size: 13px;
+    }
+    @media (max-width: 1100px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+      .panel {
+        position: static;
+      }
+    }
   </style>
 </head>
 <body>
   <h1>Polymarket Candidate Dashboard</h1>
-  <p class="small">v3 podľa v6: trade type, oracle risk, gate score, REVIEW vrstva, užší WATCH filter a mäkká penalizácia pre šport.</p>
+  <p class="small">v4 podľa v6: detail panel, mini 6/6 checklist, friction score, exit score.</p>
 
-  <div class="section">
-    <h2>Top candidates</h2>
+  <div class="layout">
+    <div class="section">
+      <h2>Top candidates</h2>
 
-    <div class="controls">
-      <div class="control">
-        <label for="category">Category</label>
-        <select id="category">
-          <option value="">All</option>
-          <option value="Sports">Sports</option>
-          <option value="Politics">Politics</option>
-          <option value="Crypto">Crypto</option>
-          <option value="Geopolitics">Geopolitics</option>
-          <option value="Narrative">Narrative</option>
-          <option value="Other">Other</option>
-        </select>
+      <div class="controls">
+        <div class="control">
+          <label for="category">Category</label>
+          <select id="category">
+            <option value="">All</option>
+            <option value="Sports">Sports</option>
+            <option value="Politics">Politics</option>
+            <option value="Crypto">Crypto</option>
+            <option value="Geopolitics">Geopolitics</option>
+            <option value="Narrative">Narrative</option>
+            <option value="Other">Other</option>
+          </select>
+        </div>
+
+        <div class="control">
+          <label for="tradeType">Trade type</label>
+          <select id="tradeType">
+            <option value="">All</option>
+            <option value="Momentum">Momentum</option>
+            <option value="Time Decay">Time Decay</option>
+            <option value="Resolution">Resolution</option>
+            <option value="Centovka">Centovka</option>
+            <option value="Other">Other</option>
+          </select>
+        </div>
+
+        <div class="control">
+          <label for="maxOracleRisk">Max oracle risk</label>
+          <select id="maxOracleRisk">
+            <option value="">All</option>
+            <option value="Low" selected>Low</option>
+            <option value="Medium">Medium</option>
+            <option value="High">High</option>
+          </select>
+        </div>
+
+        <div class="control">
+          <label for="minLiquidity">Min liquidity</label>
+          <select id="minLiquidity">
+            <option value="0">0</option>
+            <option value="50000">50 000</option>
+            <option value="100000" selected>100 000</option>
+            <option value="150000">150 000</option>
+            <option value="250000">250 000</option>
+          </select>
+        </div>
+
+        <div class="control">
+          <label for="minVolume">Min 24h volume</label>
+          <select id="minVolume">
+            <option value="0">0</option>
+            <option value="25000" selected>25 000</option>
+            <option value="50000">50 000</option>
+            <option value="100000">100 000</option>
+            <option value="250000">250 000</option>
+          </select>
+        </div>
+
+        <div class="checkbox-wrap">
+          <input type="checkbox" id="hidePass" checked />
+          <label for="hidePass">Hide PASS</label>
+        </div>
+
+        <div class="checkbox-wrap">
+          <input type="checkbox" id="watchOnly" />
+          <label for="watchOnly">WATCH only</label>
+        </div>
+
+        <div class="checkbox-wrap">
+          <input type="checkbox" id="gateOnly" />
+          <label for="gateOnly">6/6 gate only</label>
+        </div>
+
+        <div class="control">
+          <button onclick="loadMarkets()">Refresh</button>
+        </div>
       </div>
 
-      <div class="control">
-        <label for="tradeType">Trade type</label>
-        <select id="tradeType">
-          <option value="">All</option>
-          <option value="Momentum">Momentum</option>
-          <option value="Time Decay">Time Decay</option>
-          <option value="Resolution">Resolution</option>
-          <option value="Centovka">Centovka</option>
-          <option value="Other">Other</option>
-        </select>
-      </div>
+      <div class="count" id="countBox"></div>
+      <div id="markets-error" class="error" style="display:none;"></div>
 
-      <div class="control">
-        <label for="maxOracleRisk">Max oracle risk</label>
-        <select id="maxOracleRisk">
-          <option value="">All</option>
-          <option value="Low" selected>Low</option>
-          <option value="Medium">Medium</option>
-          <option value="High">High</option>
-        </select>
-      </div>
-
-      <div class="control">
-        <label for="minLiquidity">Min liquidity</label>
-        <select id="minLiquidity">
-          <option value="0">0</option>
-          <option value="50000">50 000</option>
-          <option value="100000" selected>100 000</option>
-          <option value="150000">150 000</option>
-          <option value="250000">250 000</option>
-        </select>
-      </div>
-
-      <div class="control">
-        <label for="minVolume">Min 24h volume</label>
-        <select id="minVolume">
-          <option value="0">0</option>
-          <option value="25000" selected>25 000</option>
-          <option value="50000">50 000</option>
-          <option value="100000">100 000</option>
-          <option value="250000">250 000</option>
-        </select>
-      </div>
-
-      <div class="checkbox-wrap">
-        <input type="checkbox" id="hidePass" checked />
-        <label for="hidePass">Hide PASS</label>
-      </div>
-
-      <div class="checkbox-wrap">
-        <input type="checkbox" id="watchOnly" />
-        <label for="watchOnly">WATCH only</label>
-      </div>
-
-      <div class="checkbox-wrap">
-        <input type="checkbox" id="gateOnly" />
-        <label for="gateOnly">6/6 gate only</label>
-      </div>
-
-      <div class="control">
-        <button onclick="loadMarkets()">Refresh</button>
+      <div class="table-wrap">
+        <table id="markets-table">
+          <thead>
+            <tr>
+              <th>Flag</th>
+              <th>Gate</th>
+              <th>Score</th>
+              <th>Friction</th>
+              <th>Exit</th>
+              <th>Type</th>
+              <th>Category</th>
+              <th>Oracle</th>
+              <th>Question</th>
+              <th>Yes</th>
+              <th>No</th>
+              <th>24h volume</th>
+              <th>Liquidity</th>
+              <th>Days</th>
+              <th>Link</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
       </div>
     </div>
 
-    <div class="count" id="countBox"></div>
-    <div id="markets-error" class="error" style="display:none;"></div>
-
-    <div class="table-wrap">
-      <table id="markets-table">
-        <thead>
-          <tr>
-            <th>Flag</th>
-            <th>Gate</th>
-            <th>Score</th>
-            <th>Type</th>
-            <th>Category</th>
-            <th>Oracle</th>
-            <th>Question</th>
-            <th>Yes</th>
-            <th>No</th>
-            <th>24h volume</th>
-            <th>Liquidity</th>
-            <th>Days</th>
-            <th>Summary</th>
-            <th>Link</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+    <div class="panel">
+      <div class="panel-box" id="detailPanel">
+        <h3>Market detail</h3>
+        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa mini pre-trade panel podľa v6.</p>
+      </div>
     </div>
   </div>
 
   <script>
+    let cachedMarkets = [];
+
     function fmtInt(value) {
       const n = Number(value);
       if (!Number.isFinite(n)) return '';
@@ -836,6 +1083,71 @@ def dashboard():
       if (level === 'Low') return '<span class="risk-low">Low</span>';
       if (level === 'Medium') return '<span class="risk-medium">Medium</span>';
       return '<span class="risk-high">High</span>';
+    }
+
+    function pill(text) {
+      return '<span class="metric-pill">' + text + '</span>';
+    }
+
+    function renderChecklist(checklist) {
+      const order = [
+        ['resolutability', 'Resolutability'],
+        ['baseRate', 'Base Rate'],
+        ['friction', 'Frikcia'],
+        ['exit', 'Exit'],
+        ['catalyst', 'Catalyst'],
+        ['oracle', 'Oracle Trap']
+      ];
+
+      return order.map(([key, label]) => {
+        const item = checklist[key];
+        return `
+          <div class="check">
+            <div class="${item.ok ? 'ok' : 'no'}">${item.ok ? 'YES' : 'NO'}</div>
+            <div><strong>${label}</strong><br>${item.note || ''}</div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function showDetail(m) {
+      const panel = document.getElementById('detailPanel');
+      const link = m.slug ? 'https://polymarket.com/market/' + m.slug : '';
+
+      const commentary = (m.detailCommentary || [])
+        .map(x => '<li>' + x + '</li>')
+        .join('');
+
+      panel.innerHTML = `
+        <h3>${m.question || 'Market detail'}</h3>
+        <div style="margin-bottom:10px;">
+          ${flagBadge(m.flag)}
+          ${catBadge(m.category)}
+          ${pill('Type: ' + (m.tradeType || 'Other'))}
+          ${pill('Gate: ' + (m.gateScore ?? '') + '/6')}
+        </div>
+
+        <div class="kv"><div>Oracle</div><div>${oracleBadge(m.oracleRisk)}</div></div>
+        <div class="kv"><div>Yes / No</div><div>${fmtPrice(m.yesPrice)} / ${fmtPrice(m.noPrice)}</div></div>
+        <div class="kv"><div>Liquidity</div><div>${fmtInt(m.liquidity)}</div></div>
+        <div class="kv"><div>24h volume</div><div>${fmtInt(m.volume24hr)}</div></div>
+        <div class="kv"><div>Days</div><div>${fmtDays(m.daysToEnd)}</div></div>
+        <div class="kv"><div>Friction</div><div>${m.frictionLabel || ''} (${m.frictionScore ?? ''})</div></div>
+        <div class="kv"><div>Exit</div><div>${m.exitLabel || ''} (${m.exitScore ?? ''})</div></div>
+        <div class="kv"><div>Catalyst</div><div>${m.catalystType || ''} / ${m.catalystConfidence || ''}</div></div>
+        <div class="kv"><div>Summary</div><div>${m.summary || ''}</div></div>
+
+        <h3 style="margin-top:14px;">Mini 6/6 checklist</h3>
+        ${renderChecklist(m.checklist || {})}
+
+        <h3 style="margin-top:14px;">Quick notes</h3>
+        <ul class="detail-list">${commentary}</ul>
+
+        <div class="link-row">
+          ${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Open on Polymarket</a>' : ''}
+          ${m.slug ? '<a href="/analyze-market?slug=' + encodeURIComponent(m.slug) + '" target="_blank" rel="noopener noreferrer">Analyze JSON</a>' : ''}
+        </div>
+      `;
     }
 
     async function loadMarkets() {
@@ -874,10 +1186,12 @@ def dashboard():
           markets = markets.filter(m => m.flag === 'WATCH');
         }
 
+        cachedMarkets = markets;
         tbody.innerHTML = '';
 
-        markets.forEach(m => {
+        markets.forEach((m, idx) => {
           const tr = document.createElement('tr');
+          tr.className = 'clickable';
           const link = m.slug
             ? 'https://polymarket.com/market/' + m.slug
             : null;
@@ -886,6 +1200,8 @@ def dashboard():
             <td>${flagBadge(m.flag)}</td>
             <td>${m.gateScore ?? ''}/6</td>
             <td>${m.candidateScore ?? ''}</td>
+            <td>${m.frictionLabel || ''}</td>
+            <td>${m.exitLabel || ''}</td>
             <td>${m.tradeType || ''}</td>
             <td>${catBadge(m.category)}</td>
             <td>${oracleBadge(m.oracleRisk)}</td>
@@ -895,14 +1211,23 @@ def dashboard():
             <td>${fmtInt(m.volume24hr)}</td>
             <td>${fmtInt(m.liquidity)}</td>
             <td>${fmtDays(m.daysToEnd)}</td>
-            <td class="summary">${m.summary || ''}</td>
             <td>${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Open</a>' : ''}</td>
           `;
+
+          tr.addEventListener('click', (e) => {
+            if (e.target.tagName.toLowerCase() === 'a') return;
+            showDetail(cachedMarkets[idx]);
+          });
+
           tbody.appendChild(tr);
         });
 
         countBox.textContent = 'Zobrazené markety: ' + markets.length;
         errorEl.style.display = 'none';
+
+        if (markets.length > 0) {
+          showDetail(markets[0]);
+        }
       } catch (err) {
         errorEl.textContent = 'Chyba pri načítaní markets: ' + err.message;
         errorEl.style.display = 'block';
