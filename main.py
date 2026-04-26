@@ -79,7 +79,7 @@ def get_yes_no_prices(market):
         if isinstance(best_bid, (int, float)):
             yes_price = best_bid
         if isinstance(best_ask, (int, float)):
-            no_price = 1 - best_ask
+            no_price = 1 - best_ask if isinstance(best_ask, (int, float)) else None
 
     return yes_price, no_price
 
@@ -1273,6 +1273,16 @@ def dashboard():
       font-size: 13px;
       color: #444;
     }
+    .status-line {
+      margin-bottom: 10px;
+      font-size: 12px;
+      color: #666;
+      background: #fafafa;
+      border: 1px solid #eee;
+      border-radius: 6px;
+      padding: 8px 10px;
+      line-height: 1.5;
+    }
     button {
       padding: 8px 12px;
       border: 1px solid #ddd;
@@ -1474,10 +1484,11 @@ def dashboard():
         </div>
 
         <div class="control">
-          <button onclick="loadMarkets()">Obnoviť</button>
+          <button onclick="loadMarkets(true)">Obnoviť</button>
         </div>
       </div>
 
+      <div class="status-line" id="statusLine">Dashboard sa inicializuje...</div>
       <div class="count" id="countBox"></div>
       <div id="markets-error" class="error" style="display:none;"></div>
 
@@ -1519,6 +1530,10 @@ def dashboard():
     let cachedMarkets = [];
     let selectedMarket = null;
     let cachedNonSports = [];
+    let autoRefreshTimer = null;
+    let lastRefreshAt = null;
+
+    const REFRESH_HOURS = [7, 9, 11, 13, 15, 17, 19, 21];
 
     function fmtInt(value) {
       const n = Number(value);
@@ -1536,6 +1551,18 @@ def dashboard():
       const n = Number(value);
       if (!Number.isFinite(n)) return '';
       return Math.round(n).toString();
+    }
+
+    function fmtDateTime(dateObj) {
+      if (!(dateObj instanceof Date)) return '';
+      return dateObj.toLocaleString('sk-SK', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      });
     }
 
     function flagBadge(label) {
@@ -1562,6 +1589,67 @@ def dashboard():
 
     function pill(text) {
       return '<span class="metric-pill">' + text + '</span>';
+    }
+
+    function getScheduleInfo(now = new Date()) {
+      const currentHour = now.getHours();
+      const currentMinute = now.getMinutes();
+
+      const today = new Date(now);
+      const next = new Date(now);
+
+      for (const hour of REFRESH_HOURS) {
+        if (currentHour < hour || (currentHour === hour && currentMinute === 0 && now.getSeconds() === 0)) {
+          next.setHours(hour, 0, 0, 0);
+          return {
+            inWindow: currentHour >= 7 && currentHour <= 21,
+            nextRefresh: next
+          };
+        }
+        if (currentHour < hour || (currentHour === hour && currentMinute < 0)) {
+          next.setHours(hour, 0, 0, 0);
+          return {
+            inWindow: currentHour >= 7 && currentHour <= 21,
+            nextRefresh: next
+          };
+        }
+      }
+
+      const tomorrow = new Date(today);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      tomorrow.setHours(7, 0, 0, 0);
+
+      return {
+        inWindow: false,
+        nextRefresh: tomorrow
+      };
+    }
+
+    function msUntilNextRefresh(now = new Date()) {
+      const info = getScheduleInfo(now);
+      return Math.max(1000, info.nextRefresh.getTime() - now.getTime());
+    }
+
+    function updateStatusLine() {
+      const el = document.getElementById('statusLine');
+      if (!el) return;
+
+      const now = new Date();
+      const info = getScheduleInfo(now);
+      const lastText = lastRefreshAt
+        ? fmtDateTime(lastRefreshAt)
+        : 'ešte neprebehla';
+
+      const nextText = fmtDateTime(info.nextRefresh);
+      const windowText = info.inWindow
+        ? 'Sme v aktívnom okne 07:00–21:00.'
+        : 'Sme mimo aktívneho okna 07:00–21:00.';
+
+      el.innerHTML =
+        'Dashboard aktuálny k: <strong>' + lastText + '</strong><br>' +
+        'Aktuálny dátum a čas: <strong>' + fmtDateTime(now) + '</strong><br>' +
+        'Plán refreshu: <strong>07:00, 09:00, 11:00, 13:00, 15:00, 17:00, 19:00, 21:00</strong><br>' +
+        windowText + ' Ďalší plánovaný refresh: <strong>' + nextText + '</strong>';
     }
 
     function renderChecklist(checklist) {
@@ -1723,30 +1811,28 @@ ${m.autoDraft?.finalDecision || 'PASS'}
         ${renderChecklist(m.checklist || {})}
 
         <div class="journal-box">
-          <h3>Systémový draft podľa v6</h3>
+          <h3>Systémový draft</h3>
 
           <div class="draft-grid"><div>Bias</div><div>${m.autoDraft?.bias || ''}</div></div>
           <div class="draft-grid"><div>Rozhodnutie</div><div><strong>${m.autoDraft?.finalDecision || ''}</strong></div></div>
           <div class="draft-grid"><div>Confidence</div><div>${m.autoDraft?.confidence || ''}/10</div></div>
           <div class="draft-grid"><div>Sizing hint</div><div>${m.autoDraft?.sizingHint || ''}</div></div>
 
-          <label class="block-label">Navrhovaná téza</label>
+          <label class="block-label">Téza</label>
+          <div class="small" style="margin-bottom:4px;color:#666;">Prečo je tento market vôbec kandidát.</div>
           <div class="panel-muted">${m.autoDraft?.thesis || ''}</div>
 
-          <label class="block-label">Kde je mispricing</label>
+          <label class="block-label">Mispricing</label>
+          <div class="small" style="margin-bottom:4px;color:#666;">Kde môže byť chyba v ocenení trhu.</div>
           <div class="panel-muted">${m.autoDraft?.mispricing || ''}</div>
 
-          <label class="block-label">Typ edge</label>
+          <label class="block-label">Edge</label>
+          <div class="small" style="margin-bottom:4px;color:#666;">Aký typ výhody tu hľadáš.</div>
           <div class="panel-muted">${m.autoDraft?.edge || ''}</div>
 
           <label class="block-label">Katalyzátor</label>
+          <div class="small" style="margin-bottom:4px;color:#666;">Čo môže pohnúť cenou alebo potvrdiť tézu.</div>
           <div class="panel-muted">${m.autoDraft?.catalyst || ''}</div>
-
-          <label class="block-label">Resolution analýza</label>
-          <div class="panel-muted">${m.autoDraft?.resolution || ''}</div>
-
-          <label class="block-label">Invalidácia</label>
-          <div class="panel-muted">${m.autoDraft?.invalidation || ''}</div>
         </div>
 
         <div class="journal-box">
@@ -1780,7 +1866,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       `;
     }
 
-    async function loadMarkets() {
+    async function loadMarkets(manual = false) {
       const errorEl = document.getElementById('markets-error');
       const tbody = document.querySelector('#markets-table tbody');
       const countBox = document.getElementById('countBox');
@@ -1806,6 +1892,7 @@ ${m.autoDraft?.finalDecision || 'PASS'}
         const markets = data.markets || [];
         cachedNonSports = data.topNonSports || [];
 
+        let selectedSlug = selectedMarket?.slug || null;
         cachedMarkets = markets;
         tbody.innerHTML = '';
 
@@ -1840,9 +1927,12 @@ ${m.autoDraft?.finalDecision || 'PASS'}
 
         countBox.textContent = 'Zobrazené markety: ' + markets.length;
         errorEl.style.display = 'none';
+        lastRefreshAt = new Date();
+        updateStatusLine();
 
         if (markets.length > 0) {
-          showDetail(markets[0]);
+          const matched = selectedSlug ? markets.find(x => x.slug === selectedSlug) : null;
+          showDetail(matched || markets[0]);
         } else {
           document.getElementById('detailPanel').innerHTML =
             '<h3>Detail marketu</h3><p class="panel-muted">Žiadny market nevyhovuje aktuálnym filtrom.</p>' +
@@ -1854,12 +1944,38 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       }
     }
 
-    document.getElementById('category').addEventListener('change', loadMarkets);
-    document.getElementById('minLiquidity').addEventListener('change', loadMarkets);
-    document.getElementById('hidePass').addEventListener('change', loadMarkets);
-    document.getElementById('diversify').addEventListener('change', loadMarkets);
+    function scheduleNextRefresh() {
+      if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+      updateStatusLine();
+      const delay = msUntilNextRefresh(new Date());
+      autoRefreshTimer = setTimeout(async () => {
+        await loadMarkets(false);
+        scheduleNextRefresh();
+      }, delay);
+    }
 
-    loadMarkets();
+    setInterval(updateStatusLine, 1000);
+
+    document.getElementById('category').addEventListener('change', async () => {
+      await loadMarkets(true);
+      scheduleNextRefresh();
+    });
+    document.getElementById('minLiquidity').addEventListener('change', async () => {
+      await loadMarkets(true);
+      scheduleNextRefresh();
+    });
+    document.getElementById('hidePass').addEventListener('change', async () => {
+      await loadMarkets(true);
+      scheduleNextRefresh();
+    });
+    document.getElementById('diversify').addEventListener('change', async () => {
+      await loadMarkets(true);
+      scheduleNextRefresh();
+    });
+
+    loadMarkets(true).then(() => {
+      scheduleNextRefresh();
+    });
   </script>
 </body>
 </html>
@@ -1894,3 +2010,7 @@ def analyze_market():
     row = build_market_row(m)
 
     return jsonify(row)
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
