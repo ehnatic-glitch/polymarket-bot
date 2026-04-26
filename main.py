@@ -456,7 +456,7 @@ def build_auto_draft(question, category, trade_type, yes_price, no_price, days_t
     else:
         resolution = "Oracle riziko je nízke; wording zatiaľ nepôsobí ako výrazný oracle trap."
 
-    invalidation = "Full exit alebo PASS nastáva pri novej informácii, ktorá ruší pôvodnú asymetriu, pri zhoršení likvidity, pri rozpade katalyzátora alebo pri novom oracle/dispute riziku."
+    invalidation = "Full exit alebo PASS nastáva pri novej informácii, ktorá ruší pôvodnú asymetriu, pri zhoršení likvidity, pri rozpade katalyzátora alebo pri novom oracle alebo dispute riziku."
 
     confidence_map = {
         "PASS": 3,
@@ -680,15 +680,6 @@ def score_market(m):
         }
     }
 
-    detail_commentary = [
-        f"Typ trhu: {sk_trade_type(trade_type)}.",
-        f"Oracle riziko: {sk_oracle_risk(oracle_risk)}.",
-        f"Frikcia: {sk_friction_label(fr_label)} ({fr_score}).",
-        f"Exit: {sk_exit_label(ex_label)} ({ex_score}).",
-        f"Katalyzátor: {sk_catalyst_type(catalyst_type)} / {sk_oracle_risk(catalyst_confidence)}.",
-        f"Gate: {gate_score}/6."
-    ]
-
     auto_draft = build_auto_draft(
         question=raw_question,
         category=category,
@@ -738,7 +729,6 @@ def score_market(m):
         "catalystConfidence": catalyst_confidence,
         "catalystConfidenceLabel": sk_oracle_risk(catalyst_confidence),
         "checklist": checklist,
-        "detailCommentary": detail_commentary,
         "gate": {
             "resolutability": gate_resolutability,
             "baseRate": gate_base_rate,
@@ -795,7 +785,6 @@ def build_market_row(m):
         "catalystConfidence": scored["catalystConfidence"],
         "catalystConfidenceLabel": scored["catalystConfidenceLabel"],
         "checklist": scored["checklist"],
-        "detailCommentary": scored["detailCommentary"],
         "autoDraft": scored["autoDraft"],
     }
 
@@ -912,7 +901,7 @@ def dashboard():
 <html lang="sk">
 <head>
   <meta charset="utf-8">
-  <title>Polymarket Kandidátny Dashboard v5.1</title>
+  <title>Polymarket Kandidátny Dashboard v5.2</title>
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -954,7 +943,7 @@ def dashboard():
       color: #555;
       font-weight: 600;
     }
-    input, select, textarea {
+    input, select {
       padding: 8px 10px;
       border: 1px solid #ddd;
       border-radius: 6px;
@@ -1058,17 +1047,6 @@ def dashboard():
       border-radius: 6px;
       padding: 10px;
     }
-    .kv {
-      display: grid;
-      grid-template-columns: 130px 1fr;
-      gap: 8px;
-      font-size: 13px;
-      margin-bottom: 10px;
-    }
-    .kv div:first-child {
-      color: #666;
-      font-weight: 600;
-    }
     .table-wrap {
       overflow: auto;
       max-height: 78vh;
@@ -1105,10 +1083,12 @@ def dashboard():
     .ok {
       color: #137333;
       font-weight: 700;
+      min-width: 28px;
     }
     .no {
       color: #c5221f;
       font-weight: 700;
+      min-width: 28px;
     }
     .metric-pill {
       display: inline-block;
@@ -1121,24 +1101,37 @@ def dashboard():
       background: #f3f4f6;
       color: #333;
     }
-    .link-row, .action-row {
+    .action-row {
       display: flex;
       gap: 10px;
       flex-wrap: wrap;
       margin-top: 12px;
     }
-    a {
-      color: #1558d6;
-      text-decoration: none;
+    .title-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 8px;
     }
-    a:hover {
-      text-decoration: underline;
+    .title-main {
+      min-width: 0;
+      flex: 1;
     }
-    ul.detail-list {
-      margin: 8px 0 0 18px;
-      padding: 0;
-      color: #444;
+    .title-main h3 {
+      margin: 0 0 8px 0;
+      line-height: 1.25;
+    }
+    .trade-link {
+      white-space: nowrap;
       font-size: 13px;
+      text-decoration: none;
+      color: #1558d6;
+      font-weight: 600;
+      margin-top: 2px;
+    }
+    .trade-link:hover {
+      text-decoration: underline;
     }
     .journal-box {
       margin-top: 16px;
@@ -1149,6 +1142,24 @@ def dashboard():
       margin-top: 8px;
       font-size: 12px;
       color: #137333;
+    }
+    .draft-grid {
+      display: grid;
+      grid-template-columns: 110px 1fr;
+      gap: 8px;
+      font-size: 13px;
+      margin-bottom: 10px;
+    }
+    .draft-grid div:first-child {
+      color: #666;
+      font-weight: 600;
+    }
+    .block-label {
+      margin-top: 10px;
+      display: block;
+      font-size: 12px;
+      color: #555;
+      font-weight: 600;
     }
     @media (max-width: 1200px) {
       .layout {
@@ -1162,7 +1173,7 @@ def dashboard():
 </head>
 <body>
   <h1>Polymarket kandidátny dashboard</h1>
-  <p class="small">v5.1: bez ručných inputov, so systémovým draftom podľa v6, auto biasom a auto trade-log exportom.</p>
+  <p class="small">v5.2: odľahčený pravý panel, bez duplicity metrík, s checklistom a systémovým draftom podľa v6.</p>
 
   <div class="layout">
     <div class="section">
@@ -1278,7 +1289,6 @@ def dashboard():
               <th>24h objem</th>
               <th>Likvidita</th>
               <th>Dni</th>
-              <th>Link</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -1289,7 +1299,7 @@ def dashboard():
     <div class="panel">
       <div class="panel-box" id="detailPanel">
         <h3>Detail marketu</h3>
-        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa systémový draft podľa v6.</p>
+        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa checklist a systémový draft podľa v6.</p>
       </div>
     </div>
   </div>
@@ -1443,64 +1453,49 @@ ${m.autoDraft?.finalDecision || 'PASS'}
       const panel = document.getElementById('detailPanel');
       const link = m.slug ? 'https://polymarket.com/market/' + m.slug : '';
 
-      const commentary = (m.detailCommentary || [])
-        .map(x => '<li>' + x + '</li>')
-        .join('');
-
       panel.innerHTML = `
-        <h3>${m.question || 'Detail marketu'}</h3>
-        <div style="margin-bottom:10px;">
-          ${flagBadge(m.flag)}
-          ${catBadge(m.categoryLabel)}
-          ${pill('Typ: ' + (m.tradeTypeLabel || 'Ostatné'))}
-          ${pill('Gate: ' + (m.gateScore ?? '') + '/6')}
+        <div class="title-row">
+          <div class="title-main">
+            <h3>${m.question || 'Detail marketu'}</h3>
+            <div>
+              ${flagBadge(m.flag)}
+              ${catBadge(m.categoryLabel)}
+              ${pill('Typ: ' + (m.tradeTypeLabel || 'Ostatné'))}
+              ${pill('Gate: ' + (m.gateScore ?? '') + '/6')}
+            </div>
+          </div>
+          <div>
+            ${link ? '<a class="trade-link" href="' + link + '" target="_blank" rel="noopener noreferrer">Otvoriť trade</a>' : ''}
+          </div>
         </div>
-
-        <div class="kv"><div>Oracle</div><div>${oracleBadge(m.oracleRiskLabel)}</div></div>
-        <div class="kv"><div>Yes / No</div><div>${fmtPrice(m.yesPrice)} / ${fmtPrice(m.noPrice)}</div></div>
-        <div class="kv"><div>Likvidita</div><div>${fmtInt(m.liquidity)}</div></div>
-        <div class="kv"><div>24h objem</div><div>${fmtInt(m.volume24hr)}</div></div>
-        <div class="kv"><div>Dni</div><div>${fmtDays(m.daysToEnd)}</div></div>
-        <div class="kv"><div>Frikcia</div><div>${m.frictionLabelSk || ''} (${m.frictionScore ?? ''})</div></div>
-        <div class="kv"><div>Exit</div><div>${m.exitLabelSk || ''} (${m.exitScore ?? ''})</div></div>
-        <div class="kv"><div>Katalyzátor</div><div>${m.catalystTypeLabel || ''} / ${m.catalystConfidenceLabel || ''}</div></div>
-        <div class="kv"><div>Zhrnutie</div><div>${m.summary || ''}</div></div>
 
         <h3 style="margin-top:14px;">Mini 6/6 checklist</h3>
         ${renderChecklist(m.checklist || {})}
 
-        <h3 style="margin-top:14px;">Rýchle poznámky</h3>
-        <ul class="detail-list">${commentary}</ul>
-
-        <div class="link-row">
-          ${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Otvoriť na Polymarkete</a>' : ''}
-          ${m.slug ? '<a href="/analyze-market?slug=' + encodeURIComponent(m.slug) + '" target="_blank" rel="noopener noreferrer">Zobraziť JSON analýzu</a>' : ''}
-        </div>
-
         <div class="journal-box">
           <h3>Systémový draft podľa v6</h3>
 
-          <div class="kv"><div>Bias</div><div>${m.autoDraft?.bias || ''}</div></div>
-          <div class="kv"><div>Rozhodnutie</div><div><strong>${m.autoDraft?.finalDecision || ''}</strong></div></div>
-          <div class="kv"><div>Confidence</div><div>${m.autoDraft?.confidence || ''}/10</div></div>
-          <div class="kv"><div>Sizing hint</div><div>${m.autoDraft?.sizingHint || ''}</div></div>
+          <div class="draft-grid"><div>Bias</div><div>${m.autoDraft?.bias || ''}</div></div>
+          <div class="draft-grid"><div>Rozhodnutie</div><div><strong>${m.autoDraft?.finalDecision || ''}</strong></div></div>
+          <div class="draft-grid"><div>Confidence</div><div>${m.autoDraft?.confidence || ''}/10</div></div>
+          <div class="draft-grid"><div>Sizing hint</div><div>${m.autoDraft?.sizingHint || ''}</div></div>
 
-          <label style="margin-top:10px; display:block;">Navrhovaná téza</label>
+          <label class="block-label">Navrhovaná téza</label>
           <div class="panel-muted">${m.autoDraft?.thesis || ''}</div>
 
-          <label style="margin-top:10px; display:block;">Kde je mispricing</label>
+          <label class="block-label">Kde je mispricing</label>
           <div class="panel-muted">${m.autoDraft?.mispricing || ''}</div>
 
-          <label style="margin-top:10px; display:block;">Typ edge</label>
+          <label class="block-label">Typ edge</label>
           <div class="panel-muted">${m.autoDraft?.edge || ''}</div>
 
-          <label style="margin-top:10px; display:block;">Katalyzátor</label>
+          <label class="block-label">Katalyzátor</label>
           <div class="panel-muted">${m.autoDraft?.catalyst || ''}</div>
 
-          <label style="margin-top:10px; display:block;">Resolution analýza</label>
+          <label class="block-label">Resolution analýza</label>
           <div class="panel-muted">${m.autoDraft?.resolution || ''}</div>
 
-          <label style="margin-top:10px; display:block;">Invalidácia</label>
+          <label class="block-label">Invalidácia</label>
           <div class="panel-muted">${m.autoDraft?.invalidation || ''}</div>
 
           <div class="action-row">
@@ -1557,9 +1552,6 @@ ${m.autoDraft?.finalDecision || 'PASS'}
         markets.forEach((m, idx) => {
           const tr = document.createElement('tr');
           tr.className = 'clickable';
-          const link = m.slug
-            ? 'https://polymarket.com/market/' + m.slug
-            : null;
 
           tr.innerHTML = `
             <td>${flagBadge(m.flag)}</td>
@@ -1577,11 +1569,9 @@ ${m.autoDraft?.finalDecision || 'PASS'}
             <td>${fmtInt(m.volume24hr)}</td>
             <td>${fmtInt(m.liquidity)}</td>
             <td>${fmtDays(m.daysToEnd)}</td>
-            <td>${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Otvoriť</a>' : ''}</td>
           `;
 
-          tr.addEventListener('click', (e) => {
-            if (e.target.tagName.toLowerCase() === 'a') return;
+          tr.addEventListener('click', () => {
             showDetail(cachedMarkets[idx]);
           });
 
