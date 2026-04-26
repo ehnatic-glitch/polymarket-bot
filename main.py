@@ -2,7 +2,6 @@ from flask import Flask, jsonify, request
 import requests
 import json
 import re
-import os
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -1405,6 +1404,34 @@ def dashboard():
       gap: 14px;
       align-items: start;
     }
+    .header-strip {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(340px, 460px);
+      gap: 16px;
+      align-items: start;
+      margin-bottom: 14px;
+    }
+    .header-left h1 {
+      margin: 0 0 4px 0;
+    }
+    .header-left .small {
+      margin: 0;
+    }
+    .header-right {
+      display: flex;
+      justify-content: flex-end;
+    }
+    .status-card {
+      width: 100%;
+      font-size: 12px;
+      color: #555;
+      background: #ffffff;
+      border: 1px solid #e8e8e8;
+      border-radius: 8px;
+      padding: 10px 12px;
+      line-height: 1.45;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
     .controls {
       display: flex;
       flex-wrap: wrap;
@@ -1671,7 +1698,7 @@ def dashboard():
     .trade-link:hover {
       text-decoration: underline;
     }
-    .journal-box, .non-sports-box, .watchlist-box, .portfolio-box, .alerts-box {
+    .journal-box, .non-sports-box, .watchlist-box, .alerts-box {
       margin-top: 16px;
       padding-top: 12px;
       border-top: 1px solid #eee;
@@ -1728,17 +1755,54 @@ def dashboard():
       display: block;
       margin-bottom: 4px;
     }
-    .top-grid {
+    .top-strip {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
       gap: 12px;
       margin-bottom: 14px;
+      align-items: start;
     }
-    .warning {
-      color: #c5221f;
-      font-weight: 700;
+    .compact-section {
+      padding: 12px;
+    }
+    .compact-box {
+      padding: 8px 10px;
       font-size: 12px;
-      margin-top: 6px;
+      line-height: 1.4;
+    }
+    .alerts-section .compact-box {
+      min-height: 44px;
+    }
+    .watchlist-compact {
+      display: grid;
+      gap: 6px;
+    }
+    .watchlist-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: center;
+      padding: 6px 0;
+      border-bottom: 1px solid #f0f0f0;
+      font-size: 12px;
+    }
+    .watchlist-row:last-child {
+      border-bottom: none;
+    }
+    .watchlist-meta {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 3px;
+    }
+    .alert-line {
+      padding: 4px 0;
+      border-bottom: 1px solid #f0f0f0;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .alert-line:last-child {
+      border-bottom: none;
     }
     @media (max-width: 1200px) {
       .layout {
@@ -1747,28 +1811,37 @@ def dashboard():
       .panel {
         position: static;
       }
-      .top-grid {
+      .top-strip {
         grid-template-columns: 1fr;
+      }
+      .header-strip {
+        grid-template-columns: 1fr;
+      }
+      .header-right {
+        justify-content: stretch;
       }
     }
   </style>
 </head>
 <body>
-  <h1>__TITLE__</h1>
-  <p class="small">v6.0.1: bezpečná dashboard route bez Python f-string braces problému.</p>
+  <div class="header-strip">
+    <div class="header-left">
+      <h1>__TITLE__</h1>
+      <p class="small">v6.0.1: bezpečná dashboard route bez Python f-string braces problému.</p>
+    </div>
+    <div class="header-right">
+      <div class="status-card" id="statusLine">Dashboard sa inicializuje...</div>
+    </div>
+  </div>
 
-  <div class="top-grid">
-    <div class="section">
-      <h2>Watchlist</h2>
-      <div id="watchlistBox" class="panel-muted">Načítavam watchlist...</div>
+  <div class="top-strip">
+    <div class="section compact-section">
+      <h2>Na sledovanie</h2>
+      <div id="watchlistBox" class="panel-muted compact-box">Načítavam watchlist...</div>
     </div>
-    <div class="section">
-      <h2>Portfolio panel</h2>
-      <div id="portfolioBox" class="panel-muted">Načítavam portfolio panel...</div>
-    </div>
-    <div class="section">
-      <h2>Rare alerts</h2>
-      <div id="alertsBox" class="panel-muted">Zatiaľ bez alertov.</div>
+    <div class="section compact-section alerts-section">
+      <h2>Alerty</h2>
+      <div id="alertsBox" class="panel-muted compact-box">Zatiaľ bez alertov.</div>
     </div>
   </div>
 
@@ -1825,7 +1898,6 @@ def dashboard():
         </div>
       </div>
 
-      <div class="status-line" id="statusLine">Dashboard sa inicializuje...</div>
       <div class="count" id="countBox"></div>
       <div id="markets-error" class="error" style="display:none;"></div>
 
@@ -1869,7 +1941,6 @@ def dashboard():
     let selectedMarket = null;
     let cachedNonSports = [];
     let cachedWatchlist = [];
-    let cachedPortfolio = null;
     let previousSnapshot = new Map();
     let currentDeltaMap = new Map();
     let rareAlerts = [];
@@ -1946,17 +2017,17 @@ def dashboard():
       const info = getScheduleInfo(now);
       const lastText = lastRefreshAt ? fmtDateTime(lastRefreshAt) : 'ešte neprebehla';
       const nextText = fmtDateTime(info.nextRefresh);
+      const strictValue = document.getElementById('strictMode')?.checked ? 'ON' : 'OFF';
       const windowText = info.inWindow
         ? 'Sme v aktívnom okne 07:00–21:00.'
         : 'Sme mimo aktívneho okna 07:00–21:00.';
-      const strictOn = document.getElementById('strictMode')?.checked ? 'ON' : 'OFF';
 
       el.innerHTML =
-        'Dashboard aktuálny k: <strong>' + lastText + '</strong><br>' +
-        'Aktuálny dátum a čas: <strong>' + fmtDateTime(now) + '</strong><br>' +
-        'Plán refreshu: <strong>07:00, 09:00, 11:00, 13:00, 15:00, 17:00, 19:00, 21:00</strong><br>' +
-        'Strict v6 mode: <strong>' + strictOn + '</strong><br>' +
-        windowText + ' Ďalší plánovaný refresh: <strong>' + nextText + '</strong>';
+        '<strong>Dashboard aktuálny k:</strong> ' + lastText + '<br>' +
+        '<strong>Aktuálny dátum a čas:</strong> ' + fmtDateTime(now) + '<br>' +
+        '<strong>Plán refreshu:</strong> 07:00, 09:00, 11:00, 13:00, 15:00, 17:00, 19:00, 21:00<br>' +
+        '<strong>Strict v6 mode:</strong> ' + strictValue + '<br>' +
+        windowText + ' <strong>Ďalší plánovaný refresh:</strong> ' + nextText;
     }
 
     function scheduleNextRefresh() {
@@ -2143,48 +2214,31 @@ def dashboard():
         return;
       }
 
-      box.innerHTML = cachedWatchlist.map(function(m) {
+      const shortList = cachedWatchlist.slice(0, 6);
+
+      box.innerHTML = '<div class="watchlist-compact">' + shortList.map(function(m) {
+        const safeSlug = String(m.slug || '').replace(/'/g, "\\\\'");
         return ''
-          + '<div class="mini-card">'
-          +   '<strong>' + (m.question || '') + '</strong>'
-          +   decisionBadge((m.autoDraft && m.autoDraft.finalDecision) || 'PASS')
-          +   zoneBadge(m.entryZone)
-          +   pill('Gate: ' + (m.gateScore ?? '') + '/6')
-          +   '<div style="margin-top:6px;">' + (m.whyNow || '') + '</div>'
+          + '<div class="watchlist-row">'
+          +   '<div>'
+          +     '<div><strong>' + (m.question || '') + '</strong></div>'
+          +     '<div class="watchlist-meta">'
+          +       decisionBadge((m.autoDraft && m.autoDraft.finalDecision) || 'PASS')
+          +       zoneBadge(m.entryZone)
+          +       pill('Gate ' + (m.gateScore ?? '') + '/6')
+          +     '</div>'
+          +   '</div>'
+          +   '<div><button onclick="selectWatchlistItem(\\'' + safeSlug + '\\')">Otvoriť</button></div>'
           + '</div>';
-      }).join('');
+      }).join('') + '</div>';
     }
 
-    function renderPortfolio() {
-      const box = document.getElementById('portfolioBox');
-      if (!box) return;
+    function selectWatchlistItem(slug) {
+      if (!slug) return;
+      const found = cachedMarkets.find(function(m) { return m.slug === slug; })
+        || cachedWatchlist.find(function(m) { return m.slug === slug; });
 
-      const p = cachedPortfolio;
-      if (!p) {
-        box.innerHTML = 'Portfolio panel nie je dostupný.';
-        return;
-      }
-
-      let html = ''
-        + '<div>' + pill('Bankroll: ' + fmtInt(p.bankrollTotal) + ' USDC') + '</div>'
-        + '<div>' + pill('Rezerva: ' + fmtInt(p.cashReserve) + ' USDC') + '</div>'
-        + '<div>' + pill('Active risk: ' + fmtInt(p.activeExposure) + ' USDC') + '</div>'
-        + '<div>' + pill('Free risk: ' + fmtInt(p.freeRiskBudget) + ' USDC') + '</div>'
-        + '<div>' + pill('Pozície: ' + (p.activePositions || 0) + '/3') + '</div>';
-
-      if (p.narrativeExposure && p.narrativeExposure.length) {
-        html += '<div style="margin-top:8px;">' + p.narrativeExposure.map(function(x) {
-          return pill(x.cluster + ': ' + fmtInt(x.exposure) + ' USDC');
-        }).join(' ') + '</div>';
-      }
-
-      if (p.warnings && p.warnings.length) {
-        html += p.warnings.map(function(w) {
-          return '<div class="warning">' + w + '</div>';
-        }).join('');
-      }
-
-      box.innerHTML = html;
+      if (found) showDetail(found);
     }
 
     function renderAlerts() {
@@ -2196,8 +2250,8 @@ def dashboard():
         return;
       }
 
-      box.innerHTML = rareAlerts.map(function(a) {
-        return '<div class="mini-card">' + a + '</div>';
+      box.innerHTML = rareAlerts.slice(0, 5).map(function(a) {
+        return '<div class="alert-line">' + a + '</div>';
       }).join('');
     }
 
@@ -2211,44 +2265,45 @@ def dashboard():
         + '4. Exit: ' + ((m.checklist?.exit?.ok ? 'ÁNO' : 'NIE')) + ' - ' + (m.checklist?.exit?.note || '') + '\\n'
         + '5. Catalyst: ' + ((m.checklist?.catalyst?.ok ? 'ÁNO' : 'NIE')) + ' - ' + (m.checklist?.catalyst?.note || '') + '\\n'
         + '6. Oracle Trap: ' + ((m.checklist?.oracle?.ok ? 'ÁNO' : 'NIE')) + ' - ' + (m.checklist?.oracle?.note || '') + '\\n\\n'
-        + 'ANALÝZA EDGE-U:\\n' + (m.autoDraft?.thesis || '') + '\\n\\n'
-        + 'KDE JE MISPRICING:\\n' + (m.autoDraft?.mispricing || '') + '\\n\\n'
-        + 'TYP EDGE:\\n' + (m.autoDraft?.edge || '') + '\\n\\n'
-        + 'RESOLUTION ANALÝZA:\\n' + (m.autoDraft?.resolution || '') + '\\n\\n'
-        + 'WHY NOW:\\n' + (m.whyNow || '') + '\\n\\n'
+        + 'ANALÝZA EDGE-U:\\n'
+        + (m.autoDraft?.thesis || '') + '\\n\\n'
+        + 'KDE JE MISPRICING:\\n'
+        + (m.autoDraft?.mispricing || '') + '\\n\\n'
+        + 'TYP EDGE:\\n'
+        + (m.autoDraft?.edge || '') + '\\n\\n'
+        + 'RESOLUTION ANALÝZA:\\n'
+        + (m.autoDraft?.resolution || '') + '\\n\\n'
         + 'PARAMETRE VSTUPU:\\n'
         + 'Market: ' + (m.question || '') + '\\n'
-        + 'Entry side: ' + (m.executionPlan?.entrySide || '') + '\\n'
-        + 'Limit price: ' + (m.executionPlan?.limitPrice ?? '') + '\\n'
-        + 'Stake: ' + (m.executionPlan?.stakeUSDC || 0) + ' USDC\\n'
-        + 'Tranches: ' + (m.executionPlan?.tranche1USDC || 0) + ' / ' + (m.executionPlan?.tranche2USDC || 0) + ' / ' + (m.executionPlan?.tranche3USDC || 0) + ' USDC\\n'
-        + 'Entry zone: ' + (m.entryZone?.label || '') + '\\n'
         + 'YES cena: ' + fmtPrice(m.yesPrice) + '\\n'
         + 'NO cena: ' + fmtPrice(m.noPrice) + '\\n'
         + 'Likvidita: ' + fmtInt(m.liquidity) + '\\n'
         + '24h objem: ' + fmtInt(m.volume24hr) + '\\n'
-        + 'Dni do expirácie: ' + fmtDays(m.daysToEnd) + '\\n\\n'
+        + 'Dni do expirácie: ' + fmtDays(m.daysToEnd) + '\\n'
+        + 'Sizing hint: ' + (m.autoDraft?.sizingHint || '') + '\\n\\n'
         + 'PLÁN VÝSTUPU:\\n'
-        + 'TP1: ' + (m.executionPlan?.takeProfit1 || '') + ' / predať ' + (m.executionPlan?.tp1Pct || 0) + '%\\n'
-        + 'TP2: ' + (m.executionPlan?.takeProfit2 || '') + ' / predať ' + (m.executionPlan?.tp2Pct || 0) + '%\\n'
-        + 'Runner: ' + (m.executionPlan?.runnerPct || 0) + '%\\n'
-        + 'TP1 action: ' + (m.executionPlan?.tp1Action || '') + '\\n'
-        + 'TP2 action: ' + (m.executionPlan?.tp2Action || '') + '\\n'
-        + 'Runner rule: ' + (m.executionPlan?.runnerRule || '') + '\\n'
-        + 'Time-stop: ' + (m.executionPlan?.timeStop || '') + '\\n\\n'
-        + 'INVALIDÁCIA (FULL EXIT TRIGGER):\\n' + (m.executionPlan?.fullExitTrigger || '') + '\\n\\n'
-        + 'KATALYZÁTOR:\\n' + (m.autoDraft?.catalyst || '') + '\\n\\n'
-        + 'CONFIDENCE:\\n' + (m.autoDraft?.confidence || '') + '/10\\n\\n'
-        + 'BIAS:\\n' + (m.autoDraft?.bias || '') + '\\n\\n'
-        + 'FINÁLNE ROZHODNUTIE:\\n' + (m.autoDraft?.finalDecision || 'PASS') + '\\n';
+        + 'Fáza 1: podľa typu setupu a liquidity conditions\\n'
+        + 'Fáza 2: partial de-risk pri repricingu\\n'
+        + 'Runner: len ak edge ostáva platný\\n'
+        + 'Time-stop limit: 24–72h po očakávanom katalyzátore bez pohybu\\n\\n'
+        + 'INVALIDÁCIA (FULL EXIT TRIGGER):\\n'
+        + (m.autoDraft?.invalidation || '') + '\\n\\n'
+        + 'KATALYZÁTOR:\\n'
+        + (m.autoDraft?.catalyst || '') + '\\n\\n'
+        + 'CONFIDENCE:\\n'
+        + (m.autoDraft?.confidence || '') + '/10\\n\\n'
+        + 'BIAS:\\n'
+        + (m.autoDraft?.bias || '') + '\\n\\n'
+        + 'FINÁLNE ROZHODNUTIE:\\n'
+        + (m.autoDraft?.finalDecision || 'PASS') + '\\n';
     }
 
     async function copyTradeLog() {
       if (!selectedMarket) return;
       const text = buildTradeLogText(selectedMarket);
       await navigator.clipboard.writeText(text);
-      const msg = document.getElementById('savedNote');
-      if (msg) msg.textContent = 'Trade-log šablóna skopírovaná do schránky.';
+      const note = document.getElementById('savedNote');
+      if (note) note.textContent = 'Trade-log skopírovaný do clipboardu.';
     }
 
     function downloadTradeLog() {
@@ -2257,181 +2312,174 @@ def dashboard():
       const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      const safeSlug = (selectedMarket.slug || 'trade-log').replace(/[^a-z0-9-]/gi, '-');
-      a.download = safeSlug + '-trade-log.txt';
+      a.download = 'trade-log.txt';
       a.click();
       URL.revokeObjectURL(a.href);
-      const msg = document.getElementById('savedNote');
-      if (msg) msg.textContent = 'Trade-log šablóna stiahnutá.';
+      const note = document.getElementById('savedNote');
+      if (note) note.textContent = 'Trade-log stiahnutý.';
     }
 
-    function renderNonSports() {
-      if (!cachedNonSports || cachedNonSports.length === 0) {
-        return ''
-          + '<div class="non-sports-box">'
-          +   '<h3>Top mimo športu</h3>'
-          +   '<div class="panel-muted">Aktuálne nebol nájdený žiadny zaujímavý non-sports kandidát podľa tvojich filtrov.</div>'
-          + '</div>';
-      }
-
-      const cards = cachedNonSports.map(function(m) {
-        return ''
-          + '<div class="mini-card">'
-          +   '<strong>' + (m.question || '') + '</strong>'
-          +   decisionBadge((m.autoDraft && m.autoDraft.finalDecision) || 'PASS')
-          +   catBadge(m.categoryLabel || 'Ostatné')
-          +   pill('Gate: ' + (m.gateScore ?? '') + '/6')
-          +   '<div style="margin-top:6px;">Cluster: ' + (m.cluster || '') + '</div>'
-          + '</div>';
-      }).join('');
-
-      return ''
-        + '<div class="non-sports-box">'
-        +   '<h3>Top mimo športu</h3>'
-        +   '<div class="mini-list">' + cards + '</div>'
-        + '</div>';
-    }
-
-    function renderDeltaSection(m) {
+    function renderDeltaTracking(m) {
       const key = m.slug || m.question;
-      const d = currentDeltaMap.get(key);
+      const delta = currentDeltaMap.get(key);
 
-      if (!d) {
-        return '<div class="panel-muted">Delta tracking zatiaľ nie je k dispozícii.</div>';
+      if (!delta) {
+        return '<div class="panel-muted">Bez delta dát.</div>';
       }
-
-      const yesLine = d.yesDelta === null
-        ? 'YES delta: bez predošlého snapshotu.'
-        : 'YES delta: <span class="' + deltaClass(d.yesDelta) + '">' + fmtDelta(d.yesDelta) + '</span>';
-
-      const gateLine = d.gateDelta === null
-        ? 'Gate delta: bez predošlého snapshotu.'
-        : 'Gate delta: <span class="' + deltaClass(d.gateDelta) + '">' + (d.gateDelta > 0 ? '+' : '') + d.gateDelta + '</span>';
-
-      const liqLine = d.liquidityDeltaPct === null
-        ? 'Likvidita delta: bez predošlého snapshotu.'
-        : 'Likvidita delta: <span class="' + deltaClass(d.liquidityDeltaPct) + '">' + (d.liquidityDeltaPct > 0 ? '+' : '') + d.liquidityDeltaPct.toFixed(1) + '%</span>';
-
-      const summary = d.summary && d.summary.length
-        ? d.summary.join(' | ')
-        : 'Bez významnej zmeny od posledného refreshu.';
 
       return ''
         + '<div class="panel-muted">'
-        + yesLine + '<br>'
-        + gateLine + '<br>'
-        + liqLine + '<br>'
-        + 'Zhrnutie: ' + summary
+        +   'YES delta: <span class="' + deltaClass(delta.yesDelta || 0) + '">' + fmtDelta(delta.yesDelta || 0) + '</span><br>'
+        +   'Gate delta: <span class="' + deltaClass(delta.gateDelta || 0) + '">' + (delta.gateDelta > 0 ? '+' : '') + (delta.gateDelta || 0) + '</span><br>'
+        +   'Likvidita delta: <span class="' + deltaClass(delta.liquidityDeltaPct || 0) + '">' + ((delta.liquidityDeltaPct || 0).toFixed(1)) + '%</span><br>'
+        +   'Zhrnutie: ' + (delta.summary.length ? delta.summary.join(' | ') : 'Bez významnej zmeny od posledného refreshu.')
         + '</div>';
     }
 
     function showDetail(m) {
       selectedMarket = m;
       const panel = document.getElementById('detailPanel');
-      const link = m.slug ? 'https://polymarket.com/market/' + m.slug : '';
+      const tradeUrl = m.slug ? ('https://polymarket.com/event/' + m.slug) : 'https://polymarket.com';
 
-      let html = ''
+      panel.innerHTML = ''
         + '<div class="title-row">'
         +   '<div class="title-main">'
-        +     '<h3>' + (m.question || 'Detail marketu') + '</h3>'
-        +     '<div>'
-        +       flagBadge(m.flagLabel)
-        +       decisionBadge((m.autoDraft && m.autoDraft.finalDecision) || 'PASS')
-        +       catBadge(m.categoryLabel)
-        +       pill('Typ: ' + (m.tradeTypeLabel || 'Ostatné'))
-        +       pill('Gate: ' + (m.gateScore ?? '') + '/6')
-        +       pill('Entry zóna: ' + ((m.entryZone && m.entryZone.label) || ''))
-        +     '</div>'
+        +     '<h3>' + (m.question || '') + '</h3>'
+        +     flagBadge(m.flagLabel)
+        +     ' '
+        +     decisionBadge(m.autoDraft?.finalDecision || 'PASS')
+        +     ' '
+        +     catBadge(m.categoryLabel || '')
+        +     ' '
+        +     '<span class="small">Typ: ' + (m.tradeTypeLabel || '') + '</span>'
+        +     ' '
+        +     '<span class="small">Gate: ' + (m.gateScore ?? '') + '/6</span>'
         +   '</div>'
-        +   '<div>'
-        +     (link ? '<a class="trade-link" href="' + link + '" target="_blank" rel="noopener noreferrer">Otvoriť trade</a>' : '')
-        +   '</div>'
+        +   '<a class="trade-link" href="' + tradeUrl + '" target="_blank" rel="noopener noreferrer">Otvoriť trade</a>'
         + '</div>'
 
-        + '<div class="draft-grid"><div>Cluster</div><div>' + (m.cluster || '') + '</div></div>'
-        + '<div class="draft-grid"><div>Fail point</div><div>' + (m.failPoint || '') + '</div></div>'
-        + '<div class="draft-grid"><div>Sizing cap</div><div>' + (m.sizingCap || '') + '</div></div>'
-        + '<div class="draft-grid"><div>Why now</div><div>' + (m.whyNow || '') + '</div></div>'
-
-        + '<h3 style="margin-top:14px;">Delta tracking</h3>'
-        + renderDeltaSection(m)
-
-        + '<h3 style="margin-top:14px;">Mini 6/6 checklist</h3>'
-        + renderChecklist(m.checklist || {})
+        + '<div class="draft-grid">'
+        +   '<div>Entry zóna</div><div>' + zoneBadge(m.entryZone) + '</div>'
+        +   '<div>Cluster</div><div>' + (m.cluster || '') + '</div>'
+        +   '<div>Fail point</div><div>' + (m.failPoint || '') + '</div>'
+        +   '<div>Sizing cap</div><div>' + (m.sizingCap || '') + '</div>'
+        +   '<div>Why now</div><div>' + (m.whyNow || '') + '</div>'
+        + '</div>'
 
         + '<div class="journal-box">'
-        +   '<h3>Systémový draft</h3>'
-        +   '<div class="draft-grid"><div>Bias</div><div>' + ((m.autoDraft && m.autoDraft.bias) || '') + '</div></div>'
-        +   '<div class="draft-grid"><div>Rozhodnutie</div><div><strong>' + ((m.autoDraft && m.autoDraft.finalDecision) || '') + '</strong></div></div>'
-        +   '<div class="draft-grid"><div>Confidence</div><div>' + ((m.autoDraft && m.autoDraft.confidence) || '') + '/10</div></div>'
-        +   '<div class="draft-grid"><div>Sizing hint</div><div>' + ((m.autoDraft && m.autoDraft.sizingHint) || '') + '</div></div>'
+        +   '<h3>Delta tracking</h3>'
+        +   renderDeltaTracking(m)
+        + '</div>'
 
-        +   '<label class="block-label">Téza</label>'
-        +   '<div class="panel-muted">' + ((m.autoDraft && m.autoDraft.thesis) || '') + '</div>'
+        + '<div class="journal-box">'
+        +   '<h3>Mini 6/6 checklist</h3>'
+        +   renderChecklist(m.checklist || {})
+        + '</div>'
 
-        +   '<label class="block-label">Mispricing</label>'
-        +   '<div class="panel-muted">' + ((m.autoDraft && m.autoDraft.mispricing) || '') + '</div>'
+        + '<div class="journal-box">'
+        +   '<h3>Systémový draft podľa v6</h3>'
+        +   '<div class="draft-grid">'
+        +     '<div>Bias</div><div>' + (m.autoDraft?.bias || '') + '</div>'
+        +     '<div>Rozhodnutie</div><div><strong>' + (m.autoDraft?.finalDecision || '') + '</strong></div>'
+        +     '<div>Confidence</div><div>' + (m.autoDraft?.confidence || '') + '/10</div>'
+        +     '<div>Sizing hint</div><div>' + (m.autoDraft?.sizingHint || '') + '</div>'
+        +   '</div>'
 
-        +   '<label class="block-label">Edge</label>'
-        +   '<div class="panel-muted">' + ((m.autoDraft && m.autoDraft.edge) || '') + '</div>'
+        +   '<label class="block-label">Navrhovaná téza</label>'
+        +   '<div class="panel-muted">' + (m.autoDraft?.thesis || '') + '</div>'
+
+        +   '<label class="block-label">Kde je mispricing</label>'
+        +   '<div class="panel-muted">' + (m.autoDraft?.mispricing || '') + '</div>'
+
+        +   '<label class="block-label">Typ edge</label>'
+        +   '<div class="panel-muted">' + (m.autoDraft?.edge || '') + '</div>'
 
         +   '<label class="block-label">Katalyzátor</label>'
-        +   '<div class="panel-muted">' + ((m.autoDraft && m.autoDraft.catalyst) || '') + '</div>'
+        +   '<div class="panel-muted">' + (m.autoDraft?.catalyst || '') + '</div>'
 
         +   '<label class="block-label">Resolution analýza</label>'
-        +   '<div class="panel-muted">' + ((m.autoDraft && m.autoDraft.resolution) || '') + '</div>'
-        + '</div>'
+        +   '<div class="panel-muted">' + (m.autoDraft?.resolution || '') + '</div>'
 
-        + '<div class="journal-box">'
-        +   '<h3>Entry / Exit plán</h3>'
-        +   '<div class="draft-grid"><div>Side</div><div>' + ((m.executionPlan && m.executionPlan.entrySide) || '') + '</div></div>'
-        +   '<div class="draft-grid"><div>Limit price</div><div>' + ((m.executionPlan && m.executionPlan.limitPrice) ?? '') + '</div></div>'
-        +   '<div class="draft-grid"><div>Entry zóna</div><div>' + ((m.entryZone && m.entryZone.label) || '') + '</div></div>'
-        +   '<div class="draft-grid"><div>Stake</div><div>' + ((m.executionPlan && m.executionPlan.stakeUSDC) || 0) + ' USDC (' + ((m.executionPlan && m.executionPlan.stakePct) || '0%') + ')</div></div>'
-        +   '<div class="draft-grid"><div>Tranches</div><div>' + ((m.executionPlan && m.executionPlan.tranche1USDC) || 0) + ' / ' + ((m.executionPlan && m.executionPlan.tranche2USDC) || 0) + ' / ' + ((m.executionPlan && m.executionPlan.tranche3USDC) || 0) + ' USDC</div></div>'
-
-        +   '<div class="draft-grid"><div>TP1</div><div>' + ((m.executionPlan && m.executionPlan.takeProfit1) || '') + ' / predať ' + ((m.executionPlan && m.executionPlan.tp1Pct) || 0) + '%</div></div>'
-        +   '<div class="draft-grid"><div>TP2</div><div>' + ((m.executionPlan && m.executionPlan.takeProfit2) || '') + ' / predať ' + ((m.executionPlan && m.executionPlan.tp2Pct) || 0) + '%</div></div>'
-        +   '<div class="draft-grid"><div>Runner</div><div>Nechať ' + ((m.executionPlan && m.executionPlan.runnerPct) || 0) + '%</div></div>'
-
-        +   '<label class="block-label">TP1 action</label>'
-        +   '<div class="panel-muted">' + ((m.executionPlan && m.executionPlan.tp1Action) || '') + '</div>'
-
-        +   '<label class="block-label">TP2 action</label>'
-        +   '<div class="panel-muted">' + ((m.executionPlan && m.executionPlan.tp2Action) || '') + '</div>'
-
-        +   '<label class="block-label">Runner rule</label>'
-        +   '<div class="panel-muted">' + ((m.executionPlan && m.executionPlan.runnerRule) || '') + '</div>'
-
-        +   '<label class="block-label">Time stop</label>'
-        +   '<div class="panel-muted">' + ((m.executionPlan && m.executionPlan.timeStop) || '') + '</div>'
-
-        +   '<label class="block-label">Full exit trigger</label>'
-        +   '<div class="panel-muted">' + ((m.executionPlan && m.executionPlan.fullExitTrigger) || '') + '</div>'
+        +   '<label class="block-label">Invalidácia</label>'
+        +   '<div class="panel-muted">' + (m.autoDraft?.invalidation || '') + '</div>'
 
         +   '<div class="action-row">'
-        +     '<button class="btn-primary" id="copyBtn">Kopírovať trade-log šablónu</button>'
-        +     '<button id="downloadBtn">Stiahnuť trade-log</button>'
+        +     '<button class="btn-primary" onclick="copyTradeLog()">Kopírovať trade-log šablónu</button>'
+        +     '<button onclick="downloadTradeLog()">Stiahnuť trade-log</button>'
         +   '</div>'
 
         +   '<div class="saved-note" id="savedNote"></div>'
         + '</div>'
 
-        + renderNonSports();
+        + '<div class="journal-box">'
+        +   '<h3>Entry / Exit plán</h3>'
+        +   '<div class="draft-grid">'
+        +     '<div>Entry side</div><div>' + (m.executionPlan?.entrySide || '') + '</div>'
+        +     '<div>Limit</div><div>' + (m.executionPlan?.limitPrice ?? '') + '</div>'
+        +     '<div>Stake</div><div>' + (m.executionPlan?.stakeUSDC ?? 0) + ' USDC (' + (m.executionPlan?.stakePct || '0%') + ')</div>'
+        +     '<div>Tranche</div><div>' + (m.executionPlan?.tranche1USDC ?? 0) + ' / ' + (m.executionPlan?.tranche2USDC ?? 0) + ' / ' + (m.executionPlan?.tranche3USDC ?? 0) + ' USDC</div>'
+        +     '<div>TP1</div><div>' + (m.executionPlan?.takeProfit1 || '') + '</div>'
+        +     '<div>TP2</div><div>' + (m.executionPlan?.takeProfit2 || '') + '</div>'
+        +   '</div>'
+        +   '<div class="panel-muted">' + (m.executionPlan?.tp1Action || '') + '</div>'
+        +   '<div style="height:8px;"></div>'
+        +   '<div class="panel-muted">' + (m.executionPlan?.tp2Action || '') + '</div>'
+        +   '<label class="block-label">Runner rule</label>'
+        +   '<div class="panel-muted">' + (m.executionPlan?.runnerRule || '') + '</div>'
+        +   '<label class="block-label">Time-stop</label>'
+        +   '<div class="panel-muted">' + (m.executionPlan?.timeStop || '') + '</div>'
+        +   '<label class="block-label">Full exit trigger</label>'
+        +   '<div class="panel-muted">' + (m.executionPlan?.fullExitTrigger || '') + '</div>'
+        + '</div>';
+    }
 
-      panel.innerHTML = html;
+    function renderTable(markets) {
+      const tbody = document.querySelector('#markets-table tbody');
+      tbody.innerHTML = '';
 
-      const copyBtn = document.getElementById('copyBtn');
-      const downloadBtn = document.getElementById('downloadBtn');
+      markets.forEach(function(m) {
+        const tr = document.createElement('tr');
+        tr.className = 'clickable';
 
-      if (copyBtn) copyBtn.addEventListener('click', copyTradeLog);
-      if (downloadBtn) downloadBtn.addEventListener('click', downloadTradeLog);
+        tr.innerHTML = ''
+          + '<td>' + flagBadge(m.flagLabel) + '</td>'
+          + '<td>' + decisionBadge(m.autoDraft?.finalDecision || 'PASS') + '</td>'
+          + '<td>' + zoneBadge(m.entryZone) + '</td>'
+          + '<td>' + (m.gateScore ?? '') + '/6</td>'
+          + '<td>' + (m.candidateScore ?? '') + '</td>'
+          + '<td>' + (m.frictionLabelSk || '') + '</td>'
+          + '<td>' + (m.exitLabelSk || '') + '</td>'
+          + '<td>' + (m.tradeTypeLabel || '') + '</td>'
+          + '<td>' + catBadge(m.categoryLabel || '') + '</td>'
+          + '<td>' + oracleBadge(m.oracleRiskLabel || '') + '</td>'
+          + '<td class="question-cell"><div class="question-truncate">' + (m.question || '') + '</div></td>'
+          + '<td>' + fmtPrice(m.yesPrice) + '</td>'
+          + '<td>' + fmtPrice(m.noPrice) + '</td>'
+          + '<td>' + fmtInt(m.volume24hr) + '</td>'
+          + '<td>' + fmtInt(m.liquidity) + '</td>'
+          + '<td>' + fmtDays(m.daysToEnd) + '</td>';
+
+        tr.addEventListener('click', function() {
+          showDetail(m);
+        });
+
+        tbody.appendChild(tr);
+      });
+
+      if (markets.length > 0 && !selectedMarket) {
+        showDetail(markets[0]);
+      } else if (markets.length > 0 && selectedMarket) {
+        const found = markets.find(function(x) {
+          return x.slug === selectedMarket.slug;
+        });
+        if (found) showDetail(found);
+      }
     }
 
     async function loadMarkets() {
-      const errorEl = document.getElementById('markets-error');
-      const tbody = document.querySelector('#markets-table tbody');
-      const countBox = document.getElementById('countBox');
+      const errorBox = document.getElementById('markets-error');
+      errorBox.style.display = 'none';
+      errorBox.textContent = '';
 
       const category = document.getElementById('category').value;
       const minLiquidity = document.getElementById('minLiquidity').value;
@@ -2440,110 +2488,66 @@ def dashboard():
       const watchlistOnly = document.getElementById('watchlistOnly').checked;
       const strictMode = document.getElementById('strictMode').checked;
 
+      updateStatusLine();
+
+      const params = new URLSearchParams({
+        limit: '80',
+        min_liquidity: minLiquidity,
+        hide_pass: hidePass ? 'true' : 'false',
+        diversify: diversify ? 'true' : 'false',
+        watchlist_only: watchlistOnly ? 'true' : 'false',
+        strict_mode: strictMode ? 'true' : 'false',
+      });
+
+      if (category) params.set('category', category);
+
       try {
-        const params = new URLSearchParams({
-          limit: '120',
-          min_liquidity: minLiquidity,
-          hide_pass: hidePass ? 'true' : 'false',
-          category: category,
-          diversify: diversify ? 'true' : 'false',
-          watchlist_only: watchlistOnly ? 'true' : 'false',
-          strict_mode: strictMode ? 'true' : 'false'
-        });
-
         const res = await fetch('/markets?' + params.toString());
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-
+        if (!res.ok) {
+          throw new Error('HTTP ' + res.status);
+        }
         const data = await res.json();
-        const markets = data.markets || [];
+
+        cachedMarkets = data.markets || [];
         cachedNonSports = data.topNonSports || [];
         cachedWatchlist = data.watchlist || [];
-        cachedPortfolio = data.portfolio || null;
 
-        computeDeltaMap(markets);
+        computeDeltaMap(cachedMarkets);
+        renderWatchlist();
+        renderAlerts();
+        renderTable(cachedMarkets);
 
-        let selectedSlug = selectedMarket?.slug || null;
-        cachedMarkets = markets;
-        tbody.innerHTML = '';
+        document.getElementById('countBox').textContent =
+          'Zobrazené markety: ' + (data.count || 0);
 
-        markets.forEach(function(m, idx) {
-          const tr = document.createElement('tr');
-          tr.className = 'clickable';
-
-          tr.innerHTML = ''
-            + '<td>' + flagBadge(m.flagLabel) + '</td>'
-            + '<td>' + decisionBadge((m.autoDraft && m.autoDraft.finalDecision) || 'PASS') + '</td>'
-            + '<td>' + zoneBadge(m.entryZone) + '</td>'
-            + '<td>' + (m.gateScore ?? '') + '/6</td>'
-            + '<td>' + (m.candidateScore ?? '') + '</td>'
-            + '<td>' + (m.frictionLabelSk || '') + '</td>'
-            + '<td>' + (m.exitLabelSk || '') + '</td>'
-            + '<td>' + (m.tradeTypeLabel || '') + '</td>'
-            + '<td>' + catBadge(m.categoryLabel) + '</td>'
-            + '<td>' + oracleBadge(m.oracleRiskLabel) + '</td>'
-            + '<td class="question-cell"><div class="question-truncate">' + (m.question || '') + '</div></td>'
-            + '<td>' + fmtPrice(m.yesPrice) + '</td>'
-            + '<td>' + fmtPrice(m.noPrice) + '</td>'
-            + '<td>' + fmtInt(m.volume24hr) + '</td>'
-            + '<td>' + fmtInt(m.liquidity) + '</td>'
-            + '<td>' + fmtDays(m.daysToEnd) + '</td>';
-
-          tr.addEventListener('click', function() {
-            showDetail(cachedMarkets[idx]);
-          });
-
-          tbody.appendChild(tr);
-        });
-
-        countBox.textContent = 'Zobrazené markety: ' + markets.length;
-        errorEl.style.display = 'none';
         lastRefreshAt = new Date();
         updateStatusLine();
-        renderWatchlist();
-        renderPortfolio();
-        renderAlerts();
-
-        if (markets.length > 0) {
-          const matched = selectedSlug ? markets.find(function(x) { return x.slug === selectedSlug; }) : null;
-          showDetail(matched || markets[0]);
-        } else {
-          document.getElementById('detailPanel').innerHTML =
-            '<h3>Detail marketu</h3><p class="panel-muted">Žiadny market nevyhovuje aktuálnym filtrom.</p>' +
-            renderNonSports();
-        }
       } catch (err) {
-        errorEl.textContent = 'Chyba pri načítaní marketov: ' + err.message;
-        errorEl.style.display = 'block';
+        errorBox.style.display = 'block';
+        errorBox.textContent = 'Nepodarilo sa načítať markety: ' + err.message;
       }
     }
 
-    document.getElementById('category').addEventListener('change', loadMarkets);
-    document.getElementById('minLiquidity').addEventListener('change', loadMarkets);
-    document.getElementById('hidePass').addEventListener('change', loadMarkets);
-    document.getElementById('diversify').addEventListener('change', loadMarkets);
-    document.getElementById('watchlistOnly').addEventListener('change', loadMarkets);
+    document.getElementById('refreshBtn').addEventListener('click', loadMarkets);
     document.getElementById('strictMode').addEventListener('change', function() {
       updateStatusLine();
-      loadMarkets();
     });
-    document.getElementById('refreshBtn').addEventListener('click', loadMarkets);
 
     loadMarkets();
-    updateStatusLine();
     scheduleNextRefresh();
-    setInterval(updateStatusLine, 1000);
   </script>
 </body>
 </html>
 """
     html = html.replace("__TITLE__", title)
-    html = html.replace(
-        "__MIN_LIQ_SELECTED__",
-        "selected" if default_min_liquidity == 100000 else ""
-    )
+
+    if default_min_liquidity == 100000:
+        html = html.replace("__MIN_LIQ_SELECTED__", "selected")
+    else:
+        html = html.replace("__MIN_LIQ_SELECTED__", "")
+
     return html
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=True)
