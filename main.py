@@ -531,38 +531,14 @@ def compute_exit_targets(entry_side, entry_price, trade_type):
 
 def exit_split_for_trade(trade_type):
     if trade_type == "Centovka":
-        return {
-            "tp1Pct": 50,
-            "tp2Pct": 30,
-            "runnerPct": 20,
-        }
-
+        return {"tp1Pct": 50, "tp2Pct": 30, "runnerPct": 20}
     if trade_type == "Momentum":
-        return {
-            "tp1Pct": 50,
-            "tp2Pct": 30,
-            "runnerPct": 20,
-        }
-
+        return {"tp1Pct": 50, "tp2Pct": 30, "runnerPct": 20}
     if trade_type == "Time Decay":
-        return {
-            "tp1Pct": 40,
-            "tp2Pct": 40,
-            "runnerPct": 20,
-        }
-
+        return {"tp1Pct": 40, "tp2Pct": 40, "runnerPct": 20}
     if trade_type == "Resolution":
-        return {
-            "tp1Pct": 40,
-            "tp2Pct": 35,
-            "runnerPct": 25,
-        }
-
-    return {
-        "tp1Pct": 50,
-        "tp2Pct": 30,
-        "runnerPct": 20,
-    }
+        return {"tp1Pct": 40, "tp2Pct": 35, "runnerPct": 25}
+    return {"tp1Pct": 50, "tp2Pct": 30, "runnerPct": 20}
 
 
 def build_execution_plan(flag, trade_type, final_decision, yes_price, no_price, liquidity, volume24hr, days_to_end):
@@ -1194,7 +1170,7 @@ def dashboard():
 <html lang="sk">
 <head>
   <meta charset="utf-8">
-  <title>{title} v5.7</title>
+  <title>{title} v5.8</title>
   <style>
     body {{
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -1536,7 +1512,7 @@ def dashboard():
 </head>
 <body>
   <h1>{title}</h1>
-  <p class="small">v5.7: auto-draft bez písania, TP1/TP2 s percentami výstupu, runner a v6-style execution plán. [file:454]</p>
+  <p class="small">v5.8: auto-draft bez písania, TP1/TP2 s percentami výstupu, runner a status refresh panel. [cite:544][cite:548]</p>
 
   <div class="layout">
     <div class="section">
@@ -1581,6 +1557,7 @@ def dashboard():
         </div>
       </div>
 
+      <div class="status-line" id="statusLine">Dashboard sa inicializuje...</div>
       <div class="count" id="countBox"></div>
       <div id="markets-error" class="error" style="display:none;"></div>
 
@@ -1613,7 +1590,7 @@ def dashboard():
     <div class="panel">
       <div class="panel-box" id="detailPanel">
         <h3>Detail marketu</h3>
-        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa checklist, systémový draft a presný entry/exit plán.</p>
+        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa checklist, systémový draft a presný entry/exit plán. [cite:548]</p>
       </div>
     </div>
   </div>
@@ -1622,6 +1599,10 @@ def dashboard():
     let cachedMarkets = [];
     let selectedMarket = null;
     let cachedNonSports = [];
+    let autoRefreshTimer = null;
+    let lastRefreshAt = null;
+
+    const REFRESH_HOURS = [7, 9, 11, 13, 15, 17, 19, 21];
 
     function fmtInt(value) {{
       const n = Number(value);
@@ -1639,6 +1620,77 @@ def dashboard():
       const n = Number(value);
       if (!Number.isFinite(n)) return '';
       return Math.round(n).toString();
+    }}
+
+    function fmtDateTime(dateObj) {{
+      if (!(dateObj instanceof Date)) return '';
+      return dateObj.toLocaleString('sk-SK', {{
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      }});
+    }}
+
+    function getScheduleInfo(now = new Date()) {{
+      const currentHour = now.getHours();
+      const today = new Date(now);
+      const next = new Date(now);
+
+      for (const hour of REFRESH_HOURS) {{
+        if (currentHour < hour || (currentHour === hour && now.getMinutes() === 0 && now.getSeconds() === 0)) {{
+          next.setHours(hour, 0, 0, 0);
+          return {{
+            inWindow: currentHour >= 7 && currentHour <= 21,
+            nextRefresh: next
+          }};
+        }}
+      }}
+
+      const tomorrow = new Date(today);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      tomorrow.setHours(7, 0, 0, 0);
+
+      return {{
+        inWindow: false,
+        nextRefresh: tomorrow
+      }};
+    }}
+
+    function msUntilNextRefresh(now = new Date()) {{
+      const info = getScheduleInfo(now);
+      return Math.max(1000, info.nextRefresh.getTime() - now.getTime());
+    }}
+
+    function updateStatusLine() {{
+      const el = document.getElementById('statusLine');
+      if (!el) return;
+
+      const now = new Date();
+      const info = getScheduleInfo(now);
+      const lastText = lastRefreshAt ? fmtDateTime(lastRefreshAt) : 'ešte neprebehla';
+      const nextText = fmtDateTime(info.nextRefresh);
+      const windowText = info.inWindow
+        ? 'Sme v aktívnom okne 07:00–21:00.'
+        : 'Sme mimo aktívneho okna 07:00–21:00.';
+
+      el.innerHTML =
+        'Dashboard aktuálny k: <strong>' + lastText + '</strong><br>' +
+        'Aktuálny dátum a čas: <strong>' + fmtDateTime(now) + '</strong><br>' +
+        'Plán refreshu: <strong>07:00, 09:00, 11:00, 13:00, 15:00, 17:00, 19:00, 21:00</strong><br>' +
+        windowText + ' Ďalší plánovaný refresh: <strong>' + nextText + '</strong>';
+    }}
+
+    function scheduleNextRefresh() {{
+      if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+
+      const waitMs = msUntilNextRefresh();
+      autoRefreshTimer = setTimeout(async () => {{
+        await loadMarkets();
+        scheduleNextRefresh();
+      }}, waitMs);
     }}
 
     function flagBadge(label) {{
@@ -1952,6 +2004,8 @@ ${{m.autoDraft?.finalDecision || 'PASS'}}
 
         countBox.textContent = 'Zobrazené markety: ' + markets.length;
         errorEl.style.display = 'none';
+        lastRefreshAt = new Date();
+        updateStatusLine();
 
         if (markets.length > 0) {{
           const matched = selectedSlug ? markets.find(x => x.slug === selectedSlug) : null;
@@ -1973,6 +2027,9 @@ ${{m.autoDraft?.finalDecision || 'PASS'}}
     document.getElementById('diversify').addEventListener('change', loadMarkets);
 
     loadMarkets();
+    updateStatusLine();
+    scheduleNextRefresh();
+    setInterval(updateStatusLine, 1000);
   </script>
 </body>
 </html>
