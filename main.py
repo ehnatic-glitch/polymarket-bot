@@ -375,6 +375,119 @@ def exit_score(liquidity, volume24hr, yes_price, days_to_end):
     return score, label, notes
 
 
+def decision_bias(flag, yes_price, oracle_risk, trade_type, gate_score, fr_score, ex_score):
+    if flag == "PASS":
+        return "No trade", "PASS"
+
+    if not isinstance(yes_price, (int, float)):
+        return "No trade", "PASS"
+
+    if oracle_risk == "High":
+        return "No trade", "PASS"
+
+    if yes_price < 0.15:
+        if gate_score >= 5 and fr_score >= 3 and ex_score >= 2 and trade_type == "Centovka":
+            return "Lean YES", "BUY YES"
+        return "Lean NO", "BUY NO"
+
+    if yes_price > 0.85:
+        return "Lean NO", "BUY NO"
+
+    if 0.15 <= yes_price <= 0.45:
+        if flag == "WATCH" and gate_score >= 5:
+            return "Lean YES", "BUY YES"
+
+    if 0.55 <= yes_price <= 0.85:
+        if flag == "WATCH" and gate_score >= 5:
+            return "Lean NO", "BUY NO"
+
+    return "No trade", "PASS"
+
+
+def build_auto_draft(question, category, trade_type, yes_price, no_price, days_to_end,
+                     oracle_risk, fr_label_sk, ex_label_sk, catalyst_type_sk,
+                     catalyst_confidence_sk, flag, gate_score, notes, checklist,
+                     liquidity, volume24hr, fr_score, ex_score):
+    bias, final_decision = decision_bias(
+        flag=flag,
+        yes_price=yes_price,
+        oracle_risk=oracle_risk,
+        trade_type=trade_type,
+        gate_score=gate_score,
+        fr_score=fr_score,
+        ex_score=ex_score,
+    )
+
+    if flag == "PASS":
+        thesis = "Default zostáva PASS. Setup zatiaľ nevyzerá ako čistý after-cost edge."
+    elif flag == "REVIEW":
+        thesis = "Market stojí za review, ale zatiaľ nie je dosť čistý na okamžitý vstup."
+    else:
+        thesis = "Market je kandidát na WATCH, pretože má relatívne čistý setup, použiteľný katalyzátor a prijateľnú frikciu."
+
+    if isinstance(yes_price, (int, float)) and yes_price < 0.15:
+        mispricing = "YES je v longshot pásme pod 15%, takže najprv treba preveriť, či retail neprepláca outsidera a či nie je value skôr na NO strane."
+    elif isinstance(yes_price, (int, float)) and yes_price > 0.85:
+        mispricing = "YES je v pásme nad 85%, takže treba preveriť certainty bias a možnú value na NO strane."
+    elif "noise_market" in notes:
+        mispricing = "Trh skôr pripomína noise market bez stabilného edge-u."
+    else:
+        mispricing = "Mispricing môže byť v načasovaní katalyzátora, správaní retailu alebo v tom, že trh ešte plne nezacenil relevantný scenár."
+
+    if trade_type == "Momentum":
+        edge = "Pravdepodobný edge je timing/news edge; trh sa môže preceňovať až po potvrdení správy."
+    elif trade_type == "Time Decay":
+        edge = "Pravdepodobný edge je time-decay setup; čas pracuje proti jednej strane a trh to nemusí správne diskontovať."
+    elif trade_type == "Resolution":
+        edge = "Ak edge existuje, je hlavne resolution/oracle charakteru; bez 100% jasných pravidiel však treba zostať extrémne konzervatívny."
+    elif trade_type == "Centovka":
+        edge = "Ak edge existuje, je asymetrický; ide o centovku, kde malý sizing môže dávať zmysel len pri čistom technickom alebo scenárovom edge-i."
+    else:
+        edge = "Edge nie je úplne zrejmý; treba ho chápať skôr ako predbežný kandidát na ďalšie filtrovanie než hotový trade."
+
+    catalyst = f"Hlavný katalyzátor: {catalyst_type_sk} / {catalyst_confidence_sk}."
+    if days_to_end is not None:
+        catalyst += f" Do expirácie ostáva približne {int(round(days_to_end))} dní."
+
+    if oracle_risk == "High":
+        resolution = "Oracle riziko je vysoké; tento setup je bližšie k trapu než k čistému tradu."
+    elif oracle_risk == "Medium":
+        resolution = "Oracle riziko je stredné; treba overiť wording, official source a media consensus."
+    else:
+        resolution = "Oracle riziko je nízke; wording zatiaľ nepôsobí ako výrazný oracle trap."
+
+    invalidation = "Full exit alebo PASS nastáva pri novej informácii, ktorá ruší pôvodnú asymetriu, pri zhoršení likvidity, pri rozpade katalyzátora alebo pri novom oracle/dispute riziku."
+
+    confidence_map = {
+        "PASS": 3,
+        "REVIEW": 5,
+        "WATCH": 7,
+    }
+    confidence = confidence_map.get(flag, 4)
+
+    sizing_hint = "Žiadny sizing."
+    if final_decision in ["BUY YES", "BUY NO"]:
+        if trade_type == "Centovka":
+            sizing_hint = "Orientačný sizing podľa v6: 5–12 USDC."
+        elif flag == "WATCH":
+            sizing_hint = "Orientačný sizing podľa v6: 25–40 USDC len ak zostane setup čistý."
+        else:
+            sizing_hint = "Orientačný sizing podľa v6: 10–20 USDC až po ďalšom potvrdení edge-u."
+
+    return {
+        "thesis": thesis,
+        "mispricing": mispricing,
+        "edge": edge,
+        "catalyst": catalyst,
+        "resolution": resolution,
+        "invalidation": invalidation,
+        "bias": bias,
+        "finalDecision": final_decision,
+        "confidence": confidence,
+        "sizingHint": sizing_hint,
+    }
+
+
 def score_market(m):
     score = 0
     notes = []
@@ -382,18 +495,19 @@ def score_market(m):
     liquidity = to_float(m.get("liquidity"))
     volume24hr = to_float(m.get("volume24hr"))
     yes_price, no_price = get_yes_no_prices(m)
-    question = (m.get("question") or "").lower()
-    category = categorize_market(m.get("question"))
+    raw_question = m.get("question") or ""
+    question = raw_question.lower()
+    category = categorize_market(raw_question)
     end_date = parse_date(m.get("endDate"))
-    oracle_risk = oracle_risk_level(m.get("question"))
+    oracle_risk = oracle_risk_level(raw_question)
 
     now = datetime.now(timezone.utc)
     days_to_end = None
     if end_date:
         days_to_end = (end_date - now).total_seconds() / 86400
 
-    trade_type = detect_trade_type(m.get("question"), yes_price, days_to_end)
-    catalyst_type, catalyst_confidence = detect_catalyst(m.get("question"), days_to_end)
+    trade_type = detect_trade_type(raw_question, yes_price, days_to_end)
+    catalyst_type, catalyst_confidence = detect_catalyst(raw_question, days_to_end)
 
     fr_score, fr_label, fr_notes = friction_score(liquidity, volume24hr, yes_price, days_to_end)
     ex_score, ex_label, ex_notes = exit_score(liquidity, volume24hr, yes_price, days_to_end)
@@ -575,6 +689,28 @@ def score_market(m):
         f"Gate: {gate_score}/6."
     ]
 
+    auto_draft = build_auto_draft(
+        question=raw_question,
+        category=category,
+        trade_type=trade_type,
+        yes_price=yes_price,
+        no_price=no_price,
+        days_to_end=days_to_end,
+        oracle_risk=oracle_risk,
+        fr_label_sk=sk_friction_label(fr_label),
+        ex_label_sk=sk_exit_label(ex_label),
+        catalyst_type_sk=sk_catalyst_type(catalyst_type),
+        catalyst_confidence_sk=sk_oracle_risk(catalyst_confidence),
+        flag=flag,
+        gate_score=gate_score,
+        notes=notes,
+        checklist=checklist,
+        liquidity=liquidity,
+        volume24hr=volume24hr,
+        fr_score=fr_score,
+        ex_score=ex_score,
+    )
+
     return {
         "candidateScore": score,
         "flag": flag,
@@ -610,7 +746,8 @@ def score_market(m):
             "exit": gate_exit,
             "catalyst": gate_catalyst,
             "oracle": gate_oracle,
-        }
+        },
+        "autoDraft": auto_draft,
     }
 
 
@@ -659,6 +796,7 @@ def build_market_row(m):
         "catalystConfidenceLabel": scored["catalystConfidenceLabel"],
         "checklist": scored["checklist"],
         "detailCommentary": scored["detailCommentary"],
+        "autoDraft": scored["autoDraft"],
     }
 
 
@@ -774,7 +912,7 @@ def dashboard():
 <html lang="sk">
 <head>
   <meta charset="utf-8">
-  <title>Polymarket Kandidátny Dashboard v5</title>
+  <title>Polymarket Kandidátny Dashboard v5.1</title>
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -822,11 +960,6 @@ def dashboard():
       border-radius: 6px;
       font: inherit;
       background: #fff;
-    }
-    textarea {
-      width: 100%;
-      min-height: 74px;
-      resize: vertical;
     }
     .checkbox-wrap {
       display: flex;
@@ -917,8 +1050,13 @@ def dashboard():
       padding: 16px;
     }
     .panel-muted {
-      color: #666;
+      color: #444;
       font-size: 13px;
+      line-height: 1.5;
+      background: #fafafa;
+      border: 1px solid #eee;
+      border-radius: 6px;
+      padding: 10px;
     }
     .kv {
       display: grid;
@@ -1024,7 +1162,7 @@ def dashboard():
 </head>
 <body>
   <h1>Polymarket kandidátny dashboard</h1>
-  <p class="small">v5 podľa v6: detail panel, mini 6/6 checklist, journaling, filter katalyzátora, export trade-log šablóny.</p>
+  <p class="small">v5.1: bez ručných inputov, so systémovým draftom podľa v6, auto biasom a auto trade-log exportom.</p>
 
   <div class="layout">
     <div class="section">
@@ -1151,7 +1289,7 @@ def dashboard():
     <div class="panel">
       <div class="panel-box" id="detailPanel">
         <h3>Detail marketu</h3>
-        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa mini pre-trade panel podľa v6.</p>
+        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa systémový draft podľa v6.</p>
       </div>
     </div>
   </div>
@@ -1159,10 +1297,6 @@ def dashboard():
   <script>
     let cachedMarkets = [];
     let selectedMarket = null;
-
-    function journalKey(slug) {
-      return 'poly_journal_' + (slug || 'unknown');
-    }
 
     function fmtInt(value) {
       const n = Number(value);
@@ -1223,45 +1357,7 @@ def dashboard():
       }).join('');
     }
 
-    function loadJournal(slug) {
-      try {
-        const raw = localStorage.getItem(journalKey(slug));
-        return raw ? JSON.parse(raw) : {
-          thesis: '',
-          mispricing: '',
-          catalyst: '',
-          invalidation: '',
-          confidence: '',
-        };
-      } catch (e) {
-        return {
-          thesis: '',
-          mispricing: '',
-          catalyst: '',
-          invalidation: '',
-          confidence: '',
-        };
-      }
-    }
-
-    function saveJournal() {
-      if (!selectedMarket || !selectedMarket.slug) return;
-      const payload = {
-        thesis: document.getElementById('journalThesis')?.value || '',
-        mispricing: document.getElementById('journalMispricing')?.value || '',
-        catalyst: document.getElementById('journalCatalyst')?.value || '',
-        invalidation: document.getElementById('journalInvalidation')?.value || '',
-        confidence: document.getElementById('journalConfidence')?.value || '',
-      };
-      localStorage.setItem(journalKey(selectedMarket.slug), JSON.stringify(payload));
-      const msg = document.getElementById('savedNote');
-      if (msg) {
-        msg.textContent = 'Poznámky uložené lokálne v prehliadači.';
-      }
-    }
-
     function buildTradeLogText(m) {
-      const journal = loadJournal(m.slug);
       return `KATEGORIZÁCIA TRHU: ${m.tradeTypeLabel || ''}
 
 PRE-TRADE CHECKLIST:
@@ -1273,15 +1369,16 @@ PRE-TRADE CHECKLIST:
 6. Oracle Trap: ${(m.checklist?.oracle?.ok ? 'ÁNO' : 'NIE')} - ${m.checklist?.oracle?.note || ''}
 
 ANALÝZA EDGE-U:
-${journal.thesis || ''}
+${m.autoDraft?.thesis || ''}
 
 KDE JE MISPRICING:
-${journal.mispricing || ''}
+${m.autoDraft?.mispricing || ''}
+
+TYP EDGE:
+${m.autoDraft?.edge || ''}
 
 RESOLUTION ANALÝZA:
-Oracle riziko: ${m.oracleRiskLabel || ''}
-Katalyzátor: ${m.catalystTypeLabel || ''} / ${m.catalystConfidenceLabel || ''}
-Zhrnutie: ${m.summary || ''}
+${m.autoDraft?.resolution || ''}
 
 PARAMETRE VSTUPU:
 Market: ${m.question || ''}
@@ -1290,27 +1387,28 @@ NO cena: ${fmtPrice(m.noPrice)}
 Likvidita: ${fmtInt(m.liquidity)}
 24h objem: ${fmtInt(m.volume24hr)}
 Dni do expirácie: ${fmtDays(m.daysToEnd)}
-Plánovaný sizing: 
-Limit order cena:
-Tranches: 40 / 35 / 25
+Sizing hint: ${m.autoDraft?.sizingHint || ''}
 
 PLÁN VÝSTUPU:
-Fáza 1:
-Fáza 2:
-Runner:
-Time-stop limit:
+Fáza 1: podľa typu setupu a liquidity conditions
+Fáza 2: partial de-risk pri repricingu
+Runner: len ak edge ostáva platný
+Time-stop limit: 24–72h po očakávanom katalyzátore bez pohybu
 
 INVALIDÁCIA (FULL EXIT TRIGGER):
-${journal.invalidation || ''}
+${m.autoDraft?.invalidation || ''}
 
 KATALYZÁTOR:
-${journal.catalyst || ''}
+${m.autoDraft?.catalyst || ''}
 
 CONFIDENCE:
-${journal.confidence || ''}
+${m.autoDraft?.confidence || ''}/10
+
+BIAS:
+${m.autoDraft?.bias || ''}
 
 FINÁLNE ROZHODNUTIE:
-BUY YES / BUY NO / PASS
+${m.autoDraft?.finalDecision || 'PASS'}
 `;
     }
 
@@ -1344,7 +1442,6 @@ BUY YES / BUY NO / PASS
       selectedMarket = m;
       const panel = document.getElementById('detailPanel');
       const link = m.slug ? 'https://polymarket.com/market/' + m.slug : '';
-      const journal = loadJournal(m.slug);
 
       const commentary = (m.detailCommentary || [])
         .map(x => '<li>' + x + '</li>')
@@ -1381,25 +1478,32 @@ BUY YES / BUY NO / PASS
         </div>
 
         <div class="journal-box">
-          <h3>Moje poznámky k setupu</h3>
+          <h3>Systémový draft podľa v6</h3>
 
-          <label for="journalThesis">Moja téza</label>
-          <textarea id="journalThesis" placeholder="Prečo tento market vôbec stojí za ďalší review?">${journal.thesis || ''}</textarea>
+          <div class="kv"><div>Bias</div><div>${m.autoDraft?.bias || ''}</div></div>
+          <div class="kv"><div>Rozhodnutie</div><div><strong>${m.autoDraft?.finalDecision || ''}</strong></div></div>
+          <div class="kv"><div>Confidence</div><div>${m.autoDraft?.confidence || ''}/10</div></div>
+          <div class="kv"><div>Sizing hint</div><div>${m.autoDraft?.sizingHint || ''}</div></div>
 
-          <label for="journalMispricing" style="margin-top:10px; display:block;">Kde je mispricing</label>
-          <textarea id="journalMispricing" placeholder="Čo trh podľa mňa nevidí alebo ignoruje?">${journal.mispricing || ''}</textarea>
+          <label style="margin-top:10px; display:block;">Navrhovaná téza</label>
+          <div class="panel-muted">${m.autoDraft?.thesis || ''}</div>
 
-          <label for="journalCatalyst" style="margin-top:10px; display:block;">Môj katalyzátor</label>
-          <textarea id="journalCatalyst" placeholder="Aký konkrétny trigger má repricing spôsobiť?">${journal.catalyst || ''}</textarea>
+          <label style="margin-top:10px; display:block;">Kde je mispricing</label>
+          <div class="panel-muted">${m.autoDraft?.mispricing || ''}</div>
 
-          <label for="journalInvalidation" style="margin-top:10px; display:block;">Invalidácia</label>
-          <textarea id="journalInvalidation" placeholder="Čo presne ruší tézu a spustí exit?">${journal.invalidation || ''}</textarea>
+          <label style="margin-top:10px; display:block;">Typ edge</label>
+          <div class="panel-muted">${m.autoDraft?.edge || ''}</div>
 
-          <label for="journalConfidence" style="margin-top:10px; display:block;">Confidence (1-10)</label>
-          <input id="journalConfidence" type="text" value="${journal.confidence || ''}" placeholder="napr. 6/10" />
+          <label style="margin-top:10px; display:block;">Katalyzátor</label>
+          <div class="panel-muted">${m.autoDraft?.catalyst || ''}</div>
+
+          <label style="margin-top:10px; display:block;">Resolution analýza</label>
+          <div class="panel-muted">${m.autoDraft?.resolution || ''}</div>
+
+          <label style="margin-top:10px; display:block;">Invalidácia</label>
+          <div class="panel-muted">${m.autoDraft?.invalidation || ''}</div>
 
           <div class="action-row">
-            <button onclick="saveJournal()">Uložiť poznámky</button>
             <button class="btn-primary" onclick="copyTradeLog()">Kopírovať trade-log šablónu</button>
             <button onclick="downloadTradeLog()">Stiahnuť trade-log</button>
           </div>
