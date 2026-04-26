@@ -181,9 +181,8 @@ def score_market(m):
 
     trade_type = detect_trade_type(m.get("question"), yes_price, days_to_end)
 
-    # Gate components
     gate_resolutability = oracle_risk == "Low"
-    gate_base_rate = category in ["Politics", "Crypto", "Sports", "Other"]
+    gate_base_rate = category in ["Politics", "Crypto", "Sports", "Other", "Geopolitics"]
     gate_friction = liquidity >= 100000 and volume24hr >= 25000
     gate_exit = liquidity >= 150000
     gate_catalyst = days_to_end is not None and 1 <= days_to_end <= 180
@@ -280,7 +279,7 @@ def score_market(m):
         notes.append("medium_oracle_risk")
 
     if category == "Sports":
-        score -= 2
+        score -= 3
         notes.append("sports_hype_risk")
 
     if category == "Narrative":
@@ -302,6 +301,17 @@ def score_market(m):
         "missing_price" in notes
     )
 
+    sports_exception_ok = (
+        category != "Sports" or (
+            liquidity >= 400000 and
+            volume24hr >= 150000 and
+            isinstance(yes_price, (int, float)) and
+            0.18 <= yes_price <= 0.82 and
+            days_to_end is not None and
+            7 <= days_to_end <= 120
+        )
+    )
+
     strict_watch = (
         not hard_reject and
         gate_score >= 5 and
@@ -312,7 +322,8 @@ def score_market(m):
         isinstance(yes_price, (int, float)) and
         0.12 <= yes_price <= 0.88 and
         trade_type != "Resolution" and
-        "narrative_risk" not in notes
+        "narrative_risk" not in notes and
+        sports_exception_ok
     )
 
     if strict_watch and score >= 7:
@@ -363,6 +374,9 @@ def score_market(m):
             summary_parts.append("natiahnutá cena")
     else:
         summary_parts.append("chýba cena")
+
+    if "sports_hype_risk" in notes:
+        summary_parts.append("šport needs stronger setup")
 
     summary = ", ".join(summary_parts)
 
@@ -678,7 +692,7 @@ def dashboard():
 </head>
 <body>
   <h1>Polymarket Candidate Dashboard</h1>
-  <p class="small">v3 podľa v6: trade type, oracle risk, gate score, REVIEW vrstva, užší WATCH filter.</p>
+  <p class="small">v3 podľa v6: trade type, oracle risk, gate score, REVIEW vrstva, užší WATCH filter a mäkká penalizácia pre šport.</p>
 
   <div class="section">
     <h2>Top candidates</h2>
