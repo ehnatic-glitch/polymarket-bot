@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 app = Flask(__name__)
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
+DATA_API_BASE = "https://data-api.polymarket.com"
+
 APP_CONFIG = {
     "dashboard_title": "Polymarket kandidátny dashboard",
     "default_min_liquidity": 100000.0,
@@ -29,6 +31,7 @@ def home():
             "/markets/top",
             "/dashboard",
             "/analyze-market",
+            "/leaderboard",
         ],
         "config": APP_CONFIG,
     })
@@ -44,6 +47,15 @@ def to_float(value, default=0.0):
         if value is None or value == "":
             return default
         return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
     except Exception:
         return default
 
@@ -70,26 +82,48 @@ def parse_date(date_str):
         return None
 
 
+def safe_num_or_none(value):
+    try:
+        if value is None or value == "":
+            return None
+        n = float(value)
+        if n != n:
+            return None
+        return n
+    except Exception:
+        return None
+
+
 def get_yes_no_prices(market):
     prices = parse_json_list(market.get("outcomePrices"))
-
     yes_price = None
     no_price = None
 
     if len(prices) >= 2:
-        yes_price = to_float(prices[0], None)
-        no_price = to_float(prices[1], None)
+        yes_price = safe_num_or_none(prices[0])
+        no_price = safe_num_or_none(prices[1])
     elif len(prices) == 1:
-        yes_price = to_float(prices[0], None)
+        yes_price = safe_num_or_none(prices[0])
         no_price = (1 - yes_price) if isinstance(yes_price, (int, float)) else None
     else:
-        best_bid = to_float(market.get("bestBid"), None)
-        best_ask = to_float(market.get("bestAsk"), None)
+        best_bid = safe_num_or_none(market.get("bestBid"))
+        best_ask = safe_num_or_none(market.get("bestAsk"))
+        last_trade = safe_num_or_none(market.get("lastTradePrice"))
 
         if isinstance(best_bid, (int, float)):
             yes_price = best_bid
+        elif isinstance(last_trade, (int, float)):
+            yes_price = last_trade
+
         if isinstance(best_ask, (int, float)):
-            no_price = 1 - best_ask if isinstance(best_ask, (int, float)) else None
+            no_price = 1 - best_ask
+        elif isinstance(yes_price, (int, float)):
+            no_price = 1 - yes_price
+
+    if isinstance(yes_price, (int, float)):
+        yes_price = max(0.0, min(1.0, round(yes_price, 3)))
+    if isinstance(no_price, (int, float)):
+        no_price = max(0.0, min(1.0, round(no_price, 3)))
 
     return yes_price, no_price
 
@@ -769,6 +803,54 @@ def entry_zone_status(final_decision, limit_price, yes_price, no_price):
     }
 
 
+def build_whale_signal(yes_price, days_to_end, liquidity, volume24hr, oracle_risk, auto_draft):
+    late_certainty = (
+        isinstance(yes_price, (int, float)) and
+        yes_price >= 0.80 and
+        days_to_end is not None and
+        days_to_end <= 7
+    )
+
+    score = 0
+    reasons = []
+
+    if liquidity >= 500000:
+        score += 1
+        reasons.append("vyššia likvidita")
+    if volume24hr >= 100000:
+        score += 1
+        reasons.append("silnejší 24h flow")
+    if late_certainty:
+        score += 1
+        reasons.append(">80% a krátky čas do expirácie")
+    if oracle_risk == "Low":
+        score += 1
+        reasons.append("nízke oracle riziko")
+
+    if score >= 4:
+        label = "Silný flow signál"
+    elif score >= 2:
+        label = "Stredný flow signál"
+    else:
+        label = "Slabý flow signál"
+
+    copy_ok = False
+    copy_note = "Whale signal je iba sekundárny filter; nesmie otočiť PASS na BUY."
+
+    if auto_draft.get("finalDecision") in ["BUY YES", "BUY NO"] and late_certainty and oracle_risk == "Low":
+        copy_note = "Aj pri čistom markete nad 80% je to len review signal; nie auto-copy."
+    elif auto_draft.get("finalDecision") == "PASS":
+        copy_note = "PASS ostáva PASS, aj keby leaderboard alebo flow vyzeral bullish."
+
+    return {
+        "label": label,
+        "lateCertainty": late_certainty,
+        "copyOk": copy_ok,
+        "copyNote": copy_note,
+        "reasons": reasons[:4],
+    }
+
+
 def score_market(m, strict_mode=False):
     score = 0
     notes = []
@@ -884,7 +966,10 @@ def score_market(m, strict_mode=False):
         oracle_risk == "High" or
         "noise_market" in notes or
         "thin_liquidity" in fr_notes or
-        "missing_price" in fr_notes
+        "missing_price" in fr_notes or
+        yes_price is None or
+        liquidity <= 0 or
+        volume24hr < 0
     )
 
     sports_exception_ok = (
@@ -1025,8 +1110,17 @@ def score_market(m, strict_mode=False):
         entry_zone["code"] in ["entry", "near"]
     )
 
+    whale_signal = build_whale_signal(
+        yes_price=yes_price,
+        days_to_end=days_to_end,
+        liquidity=liquidity,
+        volume24hr=volume24hr,
+        oracle_risk=oracle_risk,
+        auto_draft=auto_draft,
+    )
+
     return {
-        "candidateScore": score,
+        "candidateScore": score if isinstance(score, (int, float)) else 0,
         "flag": flag,
         "flagLabel": display_flag,
         "notes": notes,
@@ -1068,6 +1162,7 @@ def score_market(m, strict_mode=False):
         "whyNow": why_now_text,
         "isWatchlist": is_watchlist,
         "strictModeApplied": strict_mode,
+        "whaleSignal": whale_signal,
     }
 
 
@@ -1123,6 +1218,7 @@ def build_market_row(m, strict_mode=False):
         "whyNow": scored["whyNow"],
         "isWatchlist": scored["isWatchlist"],
         "strictModeApplied": scored["strictModeApplied"],
+        "whaleSignal": scored["whaleSignal"],
     }
 
 
@@ -1203,9 +1299,43 @@ def build_watchlist(rows, limit=12):
     return watch[:limit]
 
 
+def fetch_leaderboard(limit=8):
+    url = f"{DATA_API_BASE}/v1/leaderboard"
+    params = {"limit": limit}
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(data, dict):
+            rows = data.get("results") or data.get("data") or data.get("leaderboard") or []
+        else:
+            rows = []
+
+        output = []
+        for item in rows[:limit]:
+            output.append({
+                "name": item.get("name") or item.get("username") or item.get("user") or "unknown",
+                "profit": item.get("profit") or item.get("pnl") or item.get("realized_pnl") or 0,
+                "volume": item.get("volume") or item.get("trade_volume") or 0,
+                "wallet": item.get("wallet") or item.get("address") or "",
+            })
+        return output
+    except Exception:
+        return []
+
+
+@app.route("/leaderboard")
+def leaderboard():
+    limit = safe_int(request.args.get("limit", "8"), 8)
+    data = fetch_leaderboard(limit=limit)
+    return jsonify({"count": len(data), "leaders": data})
+
+
 @app.route("/markets")
 def markets():
-    limit = int(request.args.get("limit", "80"))
+    limit = safe_int(request.args.get("limit", "80"), 80)
     active = request.args.get("active", "true")
     closed = request.args.get("closed", "false")
     min_liquidity = to_float(
@@ -1311,428 +1441,96 @@ def dashboard():
 <html lang="sk">
 <head>
   <meta charset="utf-8">
-  <title>__TITLE__ v6.0.1</title>
+  <title>__TITLE__ v6.1</title>
   <style>
-    body {
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      margin: 16px;
-      background: #f5f5f5;
-      color: #222;
-    }
-    h1, h2, h3 {
-      margin-bottom: 0.3rem;
-    }
-    .section {
-      background: #ffffff;
-      padding: 14px;
-      border-radius: 8px;
-      margin-bottom: 16px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-    }
-    .header-strip {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(340px, 460px);
-      gap: 16px;
-      align-items: start;
-      margin-bottom: 14px;
-    }
-    .header-left h1 {
-      margin: 0 0 4px 0;
-    }
-    .header-left .small {
-      margin: 0;
-    }
-    .header-right {
-      display: flex;
-      justify-content: flex-end;
-    }
-    .status-card {
-      width: 100%;
-      font-size: 12px;
-      color: #555;
-      background: #ffffff;
-      border: 1px solid #e8e8e8;
-      border-radius: 8px;
-      padding: 10px 12px;
-      line-height: 1.45;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-    }
-    .top-strip {
-      display: grid;
-      grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr);
-      gap: 12px;
-      margin-bottom: 14px;
-      align-items: start;
-    }
-    .compact-section {
-      padding: 12px;
-    }
-    .compact-box {
-      padding: 8px 10px;
-      font-size: 12px;
-      line-height: 1.4;
-    }
-    .controls {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-bottom: 10px;
-      align-items: end;
-    }
-    .control {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-      min-width: 150px;
-    }
-    label {
-      font-size: 12px;
-      color: #555;
-      font-weight: 600;
-    }
-    input, select {
-      padding: 7px 9px;
-      border: 1px solid #ddd;
-      border-radius: 6px;
-      font: inherit;
-      background: #fff;
-    }
-    .checkbox-wrap {
-      display: flex;
-      align-items: center;
-      gap: 7px;
-      padding-top: 20px;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 12.5px;
-      table-layout: fixed;
-    }
-    th, td {
-      padding: 5px 6px;
-      border-bottom: 1px solid #eee;
-      text-align: left;
-      vertical-align: top;
-    }
-    th {
-      background: #fafafa;
-      font-weight: 700;
-      position: sticky;
-      top: 0;
-      z-index: 1;
-    }
-    tr.clickable {
-      cursor: pointer;
-    }
-    tr.clickable:hover {
-      background: #fafcff;
-    }
-    .small {
-      font-size: 12px;
-      color: #555;
-    }
-    .error {
-      color: #c5221f;
-      margin-bottom: 8px;
-      font-size: 13px;
-    }
-    .badge {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 700;
-      white-space: nowrap;
-    }
-    .watch {
-      background: #e6f4ea;
-      color: #137333;
-    }
-    .review {
-      background: #fff4e5;
-      color: #b06000;
-    }
-    .pass {
-      background: #fce8e6;
-      color: #c5221f;
-    }
-    .decision-buy-yes {
-      background: #e8f5e9;
-      color: #137333;
-    }
-    .decision-buy-no {
-      background: #e8f0fe;
-      color: #1558d6;
-    }
-    .decision-pass {
-      background: #f3f4f6;
-      color: #555;
-    }
-    .cat {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 999px;
-      font-size: 11px;
-      background: #eef2ff;
-      color: #3949ab;
-      font-weight: 600;
-      white-space: nowrap;
-    }
-    .risk-low {
-      color: #137333;
-      font-weight: 700;
-    }
-    .risk-medium {
-      color: #b06000;
-      font-weight: 700;
-    }
-    .risk-high {
-      color: #c5221f;
-      font-weight: 700;
-    }
-    .zone-entry {
-      color: #137333;
-      font-weight: 700;
-    }
-    .zone-near {
-      color: #b06000;
-      font-weight: 700;
-    }
-    .zone-far {
-      color: #666;
-      font-weight: 700;
-    }
-    .zone-chase {
-      color: #c5221f;
-      font-weight: 700;
-    }
-    .zone-none {
-      color: #888;
-      font-weight: 700;
-    }
-    .panel-muted {
-      color: #444;
-      font-size: 13px;
-      line-height: 1.5;
-      background: #fafafa;
-      border: 1px solid #eee;
-      border-radius: 6px;
-      padding: 10px;
-    }
-    .table-wrap {
-      overflow: auto;
-      max-height: 62vh;
-      border-radius: 8px;
-    }
-    .count {
-      margin-bottom: 10px;
-      font-size: 13px;
-      color: #444;
-    }
-    button {
-      padding: 8px 12px;
-      border: 1px solid #ddd;
-      border-radius: 6px;
-      background: #fff;
-      cursor: pointer;
-    }
-    .btn-primary {
-      background: #1558d6;
-      border-color: #1558d6;
-      color: white;
-    }
-    .check {
-      display: flex;
-      align-items: flex-start;
-      gap: 8px;
-      padding: 8px 0;
-      border-bottom: 1px solid #f0f0f0;
-      font-size: 13px;
-    }
-    .check:last-child {
-      border-bottom: none;
-    }
-    .ok {
-      color: #137333;
-      font-weight: 700;
-      min-width: 28px;
-    }
-    .no {
-      color: #c5221f;
-      font-weight: 700;
-      min-width: 28px;
-    }
-    .metric-pill {
-      display: inline-block;
-      padding: 3px 8px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 700;
-      margin-right: 6px;
-      margin-bottom: 6px;
-      background: #f3f4f6;
-      color: #333;
-    }
-    .delta-up {
-      color: #137333;
-      font-weight: 700;
-    }
-    .delta-down {
-      color: #c5221f;
-      font-weight: 700;
-    }
-    .delta-flat {
-      color: #666;
-      font-weight: 700;
-    }
-    .action-row {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      margin-top: 12px;
-    }
-    .title-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 12px;
-      margin-bottom: 8px;
-    }
-    .title-main {
-      min-width: 0;
-      flex: 1;
-    }
-    .title-main h3 {
-      margin: 0 0 8px 0;
-      line-height: 1.25;
-    }
-    .trade-link {
-      white-space: nowrap;
-      font-size: 13px;
-      text-decoration: none;
-      color: #1558d6;
-      font-weight: 600;
-      margin-top: 2px;
-    }
-    .trade-link:hover {
-      text-decoration: underline;
-    }
-    .journal-box {
-      margin-top: 16px;
-      padding-top: 12px;
-      border-top: 1px solid #eee;
-    }
-    .saved-note {
-      margin-top: 8px;
-      font-size: 12px;
-      color: #137333;
-    }
-    .draft-grid {
-      display: grid;
-      grid-template-columns: 140px 1fr;
-      gap: 8px;
-      font-size: 13px;
-      margin-bottom: 10px;
-    }
-    .draft-grid div:first-child {
-      color: #666;
-      font-weight: 600;
-    }
-    .block-label {
-      margin-top: 10px;
-      display: block;
-      font-size: 12px;
-      color: #555;
-      font-weight: 600;
-    }
-    .question-cell {
-      max-width: 320px;
-    }
-    .question-truncate {
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
-      overflow: hidden;
-      line-height: 1.35;
-      max-height: 2.7em;
-      word-break: break-word;
-    }
-    .watchlist-compact {
-      display: grid;
-      gap: 4px;
-    }
-    .watchlist-row {
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 8px;
-      align-items: center;
-      padding: 6px 0;
-      border-bottom: 1px solid #f0f0f0;
-      font-size: 12px;
-    }
-    .watchlist-row:last-child {
-      border-bottom: none;
-    }
-    .watchlist-meta {
-      display: flex;
-      gap: 6px;
-      flex-wrap: wrap;
-      margin-top: 3px;
-    }
-    .alert-line {
-      padding: 4px 0;
-      border-bottom: 1px solid #f0f0f0;
-      font-size: 12px;
-      line-height: 1.35;
-    }
-    .alert-line:last-child {
-      border-bottom: none;
-    }
-    .detail-shell {
-      display: grid;
-      gap: 14px;
-    }
-    .detail-top {
-      display: grid;
-      grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
-      gap: 14px;
-      align-items: start;
-    }
-    .detail-grid {
-      display: grid;
-      grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.35fr) minmax(300px, 1fr);
-      gap: 14px;
-      align-items: start;
-    }
-    .detail-card {
-      background: #fff;
-      border-radius: 8px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-      padding: 14px;
-      min-height: 100%;
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 16px; background: #f5f5f5; color: #222; }
+    h1, h2, h3 { margin-bottom: 0.3rem; }
+    .section { background: #ffffff; padding: 14px; border-radius: 8px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .header-strip { display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 460px); gap: 16px; align-items: start; margin-bottom: 14px; }
+    .header-left h1 { margin: 0 0 4px 0; }
+    .header-left .small { margin: 0; }
+    .header-right { display: flex; justify-content: flex-end; }
+    .status-card { width: 100%; font-size: 12px; color: #555; background: #ffffff; border: 1px solid #e8e8e8; border-radius: 8px; padding: 10px 12px; line-height: 1.45; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    .top-strip { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(250px, 0.7fr) minmax(280px, 0.8fr); gap: 12px; margin-bottom: 14px; align-items: start; }
+    .compact-section { padding: 12px; }
+    .compact-box { padding: 8px 10px; font-size: 12px; line-height: 1.4; }
+    .controls { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; align-items: end; }
+    .control { display: flex; flex-direction: column; gap: 4px; min-width: 150px; }
+    label { font-size: 12px; color: #555; font-weight: 600; }
+    input, select { padding: 7px 9px; border: 1px solid #ddd; border-radius: 6px; font: inherit; background: #fff; }
+    .checkbox-wrap { display: flex; align-items: center; gap: 7px; padding-top: 20px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12.5px; table-layout: fixed; }
+    th, td { padding: 5px 6px; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }
+    th { background: #fafafa; font-weight: 700; position: sticky; top: 0; z-index: 1; }
+    tr.clickable { cursor: pointer; }
+    tr.clickable:hover { background: #fafcff; }
+    .small { font-size: 12px; color: #555; }
+    .error { color: #c5221f; margin-bottom: 8px; font-size: 13px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+    .watch { background: #e6f4ea; color: #137333; }
+    .review { background: #fff4e5; color: #b06000; }
+    .pass { background: #fce8e6; color: #c5221f; }
+    .decision-buy-yes { background: #e8f5e9; color: #137333; }
+    .decision-buy-no { background: #e8f0fe; color: #1558d6; }
+    .decision-pass { background: #f3f4f6; color: #555; }
+    .cat { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #eef2ff; color: #3949ab; font-weight: 600; white-space: nowrap; }
+    .risk-low { color: #137333; font-weight: 700; }
+    .risk-medium { color: #b06000; font-weight: 700; }
+    .risk-high { color: #c5221f; font-weight: 700; }
+    .zone-entry { color: #137333; font-weight: 700; }
+    .zone-near { color: #b06000; font-weight: 700; }
+    .zone-far { color: #666; font-weight: 700; }
+    .zone-chase { color: #c5221f; font-weight: 700; }
+    .zone-none { color: #888; font-weight: 700; }
+    .panel-muted { color: #444; font-size: 13px; line-height: 1.5; background: #fafafa; border: 1px solid #eee; border-radius: 6px; padding: 10px; }
+    .table-wrap { overflow: auto; max-height: 62vh; border-radius: 8px; }
+    .count { margin-bottom: 10px; font-size: 13px; color: #444; }
+    button { padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; background: #fff; cursor: pointer; }
+    .btn-primary { background: #1558d6; border-color: #1558d6; color: white; }
+    .check { display: flex; align-items: flex-start; gap: 8px; padding: 8px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
+    .check:last-child { border-bottom: none; }
+    .ok { color: #137333; font-weight: 700; min-width: 28px; }
+    .no { color: #c5221f; font-weight: 700; min-width: 28px; }
+    .metric-pill { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; margin-right: 6px; margin-bottom: 6px; background: #f3f4f6; color: #333; }
+    .delta-up { color: #137333; font-weight: 700; }
+    .delta-down { color: #c5221f; font-weight: 700; }
+    .delta-flat { color: #666; font-weight: 700; }
+    .action-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+    .title-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 8px; }
+    .title-main { min-width: 0; flex: 1; }
+    .title-main h3 { margin: 0 0 8px 0; line-height: 1.25; }
+    .trade-link { white-space: nowrap; font-size: 13px; text-decoration: none; color: #1558d6; font-weight: 600; margin-top: 2px; }
+    .trade-link:hover { text-decoration: underline; }
+    .saved-note { margin-top: 8px; font-size: 12px; color: #137333; }
+    .draft-grid { display: grid; grid-template-columns: 140px 1fr; gap: 8px; font-size: 13px; margin-bottom: 10px; }
+    .draft-grid div:first-child { color: #666; font-weight: 600; }
+    .block-label { margin-top: 10px; display: block; font-size: 12px; color: #555; font-weight: 600; }
+    .question-cell { max-width: 320px; }
+    .question-truncate { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.35; max-height: 2.7em; word-break: break-word; }
+    .watchlist-compact { display: grid; gap: 4px; }
+    .watchlist-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; }
+    .watchlist-row:last-child { border-bottom: none; }
+    .watchlist-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 3px; }
+    .alert-line { padding: 4px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; line-height: 1.35; }
+    .alert-line:last-child { border-bottom: none; }
+    .leader-line { display: grid; grid-template-columns: 20px 1fr auto; gap: 8px; align-items: center; padding: 5px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; }
+    .leader-line:last-child { border-bottom: none; }
+    .detail-shell { display: grid; gap: 14px; }
+    .detail-top { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr); gap: 14px; align-items: start; }
+    .detail-grid { display: grid; grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.35fr) minmax(300px, 1fr) minmax(260px, 0.9fr); gap: 14px; align-items: start; }
+    .detail-card { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); padding: 14px; min-height: 100%; }
+    @media (max-width: 1350px) {
+      .top-strip { grid-template-columns: 1fr 1fr; }
+      .detail-grid { grid-template-columns: 1fr 1fr; }
     }
     @media (max-width: 1200px) {
-      .header-strip {
-        grid-template-columns: 1fr;
-      }
-      .header-right {
-        justify-content: stretch;
-      }
-      .top-strip {
-        grid-template-columns: 1fr;
-      }
-      .detail-top {
-        grid-template-columns: 1fr;
-      }
-      .detail-grid {
-        grid-template-columns: 1fr 1fr;
-      }
+      .header-strip { grid-template-columns: 1fr; }
+      .header-right { justify-content: stretch; }
+      .top-strip { grid-template-columns: 1fr; }
+      .detail-top { grid-template-columns: 1fr; }
     }
     @media (max-width: 900px) {
-      .detail-grid {
-        grid-template-columns: 1fr;
-      }
+      .detail-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -1740,7 +1538,7 @@ def dashboard():
   <div class="header-strip">
     <div class="header-left">
       <h1>__TITLE__</h1>
-      <p class="small">v6.0.1: bezpečná dashboard route bez Python f-string braces problému.</p>
+      <p class="small">v6.1: leaderboard + whale signal ako sekundárny filter, nie auto-copy trading.</p>
     </div>
     <div class="header-right">
       <div class="status-card" id="statusLine">Dashboard sa inicializuje...</div>
@@ -1755,6 +1553,10 @@ def dashboard():
     <div class="section compact-section">
       <h2>Alerty</h2>
       <div id="alertsBox" class="panel-muted compact-box">Zatiaľ bez alertov.</div>
+    </div>
+    <div class="section compact-section">
+      <h2>Leaderboard</h2>
+      <div id="leaderboardBox" class="panel-muted compact-box">Načítavam leaderboard...</div>
     </div>
   </div>
 
@@ -1843,7 +1645,7 @@ def dashboard():
   <div id="detailPanel">
     <div class="section">
       <h3>Detail marketu</h3>
-      <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa detail trhu, checklist, systémový draft a entry/exit plán.</p>
+      <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa detail trhu, checklist, systémový draft, entry/exit plán a whale signal.</p>
     </div>
   </div>
 
@@ -1851,6 +1653,7 @@ def dashboard():
     let cachedMarkets = [];
     let selectedMarket = null;
     let cachedWatchlist = [];
+    let cachedLeaders = [];
     let previousSnapshot = new Map();
     let currentDeltaMap = new Map();
     let rareAlerts = [];
@@ -1877,6 +1680,13 @@ def dashboard():
       return Math.round(n).toString();
     }
 
+    function fmtPnL(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return '';
+      const sign = n > 0 ? '+' : '';
+      return sign + Math.round(n).toLocaleString('sk-SK');
+    }
+
     function fmtDateTime(dateObj) {
       if (!(dateObj instanceof Date)) return '';
       return dateObj.toLocaleString('sk-SK', {
@@ -1897,10 +1707,7 @@ def dashboard():
       for (const hour of REFRESH_HOURS) {
         if (currentHour < hour || (currentHour === hour && now.getMinutes() === 0 && now.getSeconds() === 0)) {
           next.setHours(hour, 0, 0, 0);
-          return {
-            inWindow: currentHour >= 7 && currentHour <= 21,
-            nextRefresh: next
-          };
+          return { inWindow: currentHour >= 7 && currentHour <= 21, nextRefresh: next };
         }
       }
 
@@ -1908,10 +1715,7 @@ def dashboard():
       tomorrow.setDate(tomorrow.getDate() + 1);
       tomorrow.setHours(7, 0, 0, 0);
 
-      return {
-        inWindow: false,
-        nextRefresh: tomorrow
-      };
+      return { inWindow: false, nextRefresh: tomorrow };
     }
 
     function msUntilNextRefresh(now = new Date()) {
@@ -1942,10 +1746,9 @@ def dashboard():
 
     function scheduleNextRefresh() {
       if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
-
       const waitMs = msUntilNextRefresh();
       autoRefreshTimer = setTimeout(async () => {
-        await loadMarkets();
+        await loadAll();
         scheduleNextRefresh();
       }, waitMs);
     }
@@ -2056,9 +1859,7 @@ def dashboard():
         if (prev) {
           if (Number.isFinite(Number(snap.yesPrice)) && Number.isFinite(Number(prev.yesPrice))) {
             delta.yesDelta = Number((snap.yesPrice - prev.yesPrice).toFixed(3));
-            if (Math.abs(delta.yesDelta) >= 0.02) {
-              delta.summary.push('YES ' + fmtDelta(delta.yesDelta));
-            }
+            if (Math.abs(delta.yesDelta) >= 0.02) delta.summary.push('YES ' + fmtDelta(delta.yesDelta));
           }
 
           if (Number.isFinite(Number(snap.noPrice)) && Number.isFinite(Number(prev.noPrice))) {
@@ -2067,9 +1868,7 @@ def dashboard():
 
           if (Number.isFinite(Number(snap.gateScore)) && Number.isFinite(Number(prev.gateScore))) {
             delta.gateDelta = Number(snap.gateScore) - Number(prev.gateScore);
-            if (delta.gateDelta !== 0) {
-              delta.summary.push('Gate ' + (delta.gateDelta > 0 ? '+' : '') + delta.gateDelta);
-            }
+            if (delta.gateDelta !== 0) delta.summary.push('Gate ' + (delta.gateDelta > 0 ? '+' : '') + delta.gateDelta);
           }
 
           if (snap.flag !== prev.flag) {
@@ -2087,24 +1886,12 @@ def dashboard():
             delta.liquidityDeltaPct = Number(pct.toFixed(1));
           }
 
-          if (snap.flag === 'WATCH' && prev.flag != 'WATCH') {
-            alerts.push('Nový WATCH: ' + (m.question || ''));
-          }
-          if (prev.decision === 'PASS' && (snap.decision === 'BUY YES' || snap.decision === 'BUY NO')) {
-            alerts.push('PASS -> ' + snap.decision + ': ' + (m.question || ''));
-          }
-          if (prev.entryZone !== 'entry' && snap.entryZone === 'entry') {
-            alerts.push('Market vošiel do entry zóny: ' + (m.question || ''));
-          }
-          if (snap.oracleRisk === 'Vysoké' && prev.oracleRisk !== 'Vysoké') {
-            alerts.push('Oracle risk vyskočil na vysoké: ' + (m.question || ''));
-          }
-          if (Number.isFinite(delta.liquidityDeltaPct) && delta.liquidityDeltaPct <= -30) {
-            alerts.push('Likvidita prudko padla: ' + (m.question || ''));
-          }
-          if (m.daysToEnd !== null && Number(m.daysToEnd) <= 3 && (snap.decision === 'BUY YES' || snap.decision === 'BUY NO')) {
-            alerts.push('Blíži sa time-stop / expiry risk: ' + (m.question || ''));
-          }
+          if (snap.flag === 'WATCH' && prev.flag !== 'WATCH') alerts.push('Nový WATCH: ' + (m.question || ''));
+          if (prev.decision === 'PASS' && (snap.decision === 'BUY YES' || snap.decision === 'BUY NO')) alerts.push('PASS -> ' + snap.decision + ': ' + (m.question || ''));
+          if (prev.entryZone !== 'entry' && snap.entryZone === 'entry') alerts.push('Market vošiel do entry zóny: ' + (m.question || ''));
+          if (snap.oracleRisk === 'Vysoké' && prev.oracleRisk !== 'Vysoké') alerts.push('Oracle risk vyskočil na vysoké: ' + (m.question || ''));
+          if (Number.isFinite(delta.liquidityDeltaPct) && delta.liquidityDeltaPct <= -30) alerts.push('Likvidita prudko padla: ' + (m.question || ''));
+          if (m.daysToEnd !== null && Number(m.daysToEnd) <= 3 && (snap.decision === 'BUY YES' || snap.decision === 'BUY NO')) alerts.push('Blíži sa time-stop / expiry risk: ' + (m.question || ''));
         }
 
         deltaMap.set(key, delta);
@@ -2143,14 +1930,6 @@ def dashboard():
       }).join('') + '</div>';
     }
 
-    function selectWatchlistItem(slug) {
-      if (!slug) return;
-      const found = cachedMarkets.find(function(m) { return m.slug === slug; })
-        || cachedWatchlist.find(function(m) { return m.slug === slug; });
-
-      if (found) showDetail(found);
-    }
-
     function renderAlerts() {
       const box = document.getElementById('alertsBox');
       if (!box) return;
@@ -2163,6 +1942,32 @@ def dashboard():
       box.innerHTML = rareAlerts.slice(0, 4).map(function(a) {
         return '<div class="alert-line">' + a + '</div>';
       }).join('');
+    }
+
+    function renderLeaderboard() {
+      const box = document.getElementById('leaderboardBox');
+      if (!box) return;
+
+      if (!cachedLeaders || cachedLeaders.length === 0) {
+        box.innerHTML = 'Leaderboard sa nepodarilo načítať.';
+        return;
+      }
+
+      box.innerHTML = cachedLeaders.slice(0, 5).map(function(row, idx) {
+        return ''
+          + '<div class="leader-line">'
+          +   '<div><strong>' + (idx + 1) + '.</strong></div>'
+          +   '<div><strong>' + (row.name || 'unknown') + '</strong><br><span class="small">Vol: ' + fmtInt(row.volume) + '</span></div>'
+          +   '<div><span class="' + ((Number(row.profit) >= 0) ? 'delta-up' : 'delta-down') + '">' + fmtPnL(row.profit) + '</span></div>'
+          + '</div>';
+      }).join('') + '<div class="small" style="margin-top:6px;">Leaderboard je len kontext; nie copy trading engine.</div>';
+    }
+
+    function selectWatchlistItem(slug) {
+      if (!slug) return;
+      const found = cachedMarkets.find(function(m) { return m.slug === slug; })
+        || cachedWatchlist.find(function(m) { return m.slug === slug; });
+      if (found) showDetail(found);
     }
 
     function buildTradeLogText(m) {
@@ -2200,6 +2005,8 @@ def dashboard():
         + (m.autoDraft?.invalidation || '') + '\\n\\n'
         + 'KATALYZÁTOR:\\n'
         + (m.autoDraft?.catalyst || '') + '\\n\\n'
+        + 'WHALE SIGNAL:\\n'
+        + (m.whaleSignal?.label || '') + ' | ' + (m.whaleSignal?.copyNote || '') + '\\n\\n'
         + 'CONFIDENCE:\\n'
         + (m.autoDraft?.confidence || '') + '/10\\n\\n'
         + 'BIAS:\\n'
@@ -2246,6 +2053,25 @@ def dashboard():
         + '</div>';
     }
 
+    function renderWhaleSignal(m) {
+      const ws = m.whaleSignal || {};
+      const reasons = Array.isArray(ws.reasons) && ws.reasons.length
+        ? ws.reasons.map(function(r) { return '<div class="alert-line">' + r + '</div>'; }).join('')
+        : '<div class="alert-line">Bez výrazného flow kontextu.</div>';
+
+      return ''
+        + '<div class="draft-grid">'
+        +   '<div>Whale signal</div><div>' + (ws.label || '') + '</div>'
+        +   '<div>Late certainty</div><div>' + ((ws.lateCertainty) ? 'Áno' : 'Nie') + '</div>'
+        +   '<div>Copy režim</div><div>' + ((ws.copyOk) ? 'Povolený' : 'Zakázaný') + '</div>'
+        + '</div>'
+        + '<div class="panel-muted">' + (ws.copyNote || '') + '</div>'
+        + '<label class="block-label">Dôvody</label>'
+        + '<div class="panel-muted">' + reasons + '</div>'
+        + '<label class="block-label">Pravidlo v6</label>'
+        + '<div class="panel-muted">Whale alebo leaderboard signál nikdy nesmie zmeniť PASS na BUY. Môže len zvýšiť prioritu review alebo doplniť why now.</div>';
+    }
+
     function showDetail(m) {
       selectedMarket = m;
       const panel = document.getElementById('detailPanel');
@@ -2257,15 +2083,15 @@ def dashboard():
         +     '<div class="title-row">'
         +       '<div class="title-main">'
         +         '<h3>' + (m.question || '') + '</h3>'
-        +         + flagBadge(m.flagLabel)
+        +         flagBadge(m.flagLabel)
         +         ' '
-        +         + decisionBadge(m.autoDraft?.finalDecision || 'PASS')
+        +         decisionBadge(m.autoDraft?.finalDecision || 'PASS')
         +         ' '
-        +         + catBadge(m.categoryLabel || '')
+        +         catBadge(m.categoryLabel || '')
         +         ' '
-        +         + '<span class="small">Typ: ' + (m.tradeTypeLabel || '') + '</span>'
+        +         '<span class="small">Typ: ' + (m.tradeTypeLabel || '') + '</span>'
         +         ' '
-        +         + '<span class="small">Gate: ' + (m.gateScore ?? '') + '/6</span>'
+        +         '<span class="small">Gate: ' + (Number.isFinite(Number(m.gateScore)) ? m.gateScore : '') + '/6</span>'
         +       '</div>'
         +       '<a class="trade-link" href="' + tradeUrl + '" target="_blank" rel="noopener noreferrer">Otvoriť trade</a>'
         +     '</div>'
@@ -2332,7 +2158,7 @@ def dashboard():
         +       '<h3>Entry / Exit plán</h3>'
         +       '<div class="draft-grid">'
         +         '<div>Entry side</div><div>' + (m.executionPlan?.entrySide || '') + '</div>'
-        +         '<div>Limit</div><div>' + (m.executionPlan?.limitPrice ?? '') + '</div>'
+        +         '<div>Limit</div><div>' + (fmtPrice(m.executionPlan?.limitPrice) || '') + '</div>'
         +         '<div>Stake</div><div>' + (m.executionPlan?.stakeUSDC ?? 0) + ' USDC (' + (m.executionPlan?.stakePct || '0%') + ')</div>'
         +         '<div>Tranche</div><div>' + (m.executionPlan?.tranche1USDC ?? 0) + ' / ' + (m.executionPlan?.tranche2USDC ?? 0) + ' / ' + (m.executionPlan?.tranche3USDC ?? 0) + ' USDC</div>'
         +         '<div>TP1</div><div>' + (m.executionPlan?.takeProfit1 || '') + '</div>'
@@ -2347,6 +2173,11 @@ def dashboard():
         +       '<div class="panel-muted">' + (m.executionPlan?.timeStop || '') + '</div>'
         +       '<label class="block-label">Full exit trigger</label>'
         +       '<div class="panel-muted">' + (m.executionPlan?.fullExitTrigger || '') + '</div>'
+        +     '</div>'
+
+        +     '<div class="detail-card">'
+        +       '<h3>Whale / Flow signal</h3>'
+        +       renderWhaleSignal(m)
         +     '</div>'
         +   '</div>'
         + '</div>';
@@ -2364,8 +2195,8 @@ def dashboard():
           + '<td>' + flagBadge(m.flagLabel) + '</td>'
           + '<td>' + decisionBadge(m.autoDraft?.finalDecision || 'PASS') + '</td>'
           + '<td>' + zoneBadge(m.entryZone) + '</td>'
-          + '<td>' + (m.gateScore ?? '') + '/6</td>'
-          + '<td>' + (m.candidateScore ?? '') + '</td>'
+          + '<td>' + (Number.isFinite(Number(m.gateScore)) ? m.gateScore : '') + '/6</td>'
+          + '<td>' + (Number.isFinite(Number(m.candidateScore)) ? m.candidateScore : '') + '</td>'
           + '<td>' + (m.frictionLabelSk || '') + '</td>'
           + '<td>' + (m.exitLabelSk || '') + '</td>'
           + '<td>' + (m.tradeTypeLabel || '') + '</td>'
@@ -2395,6 +2226,18 @@ def dashboard():
       }
     }
 
+    async function loadLeaderboard() {
+      try {
+        const res = await fetch('/leaderboard?limit=8');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        cachedLeaders = data.leaders || [];
+      } catch (err) {
+        cachedLeaders = [];
+      }
+      renderLeaderboard();
+    }
+
     async function loadMarkets() {
       const errorBox = document.getElementById('markets-error');
       errorBox.style.display = 'none';
@@ -2422,9 +2265,7 @@ def dashboard():
 
       try {
         const res = await fetch('/markets?' + params.toString());
-        if (!res.ok) {
-          throw new Error('HTTP ' + res.status);
-        }
+        if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
 
         cachedMarkets = data.markets || [];
@@ -2446,12 +2287,16 @@ def dashboard():
       }
     }
 
-    document.getElementById('refreshBtn').addEventListener('click', loadMarkets);
+    async function loadAll() {
+      await Promise.all([loadLeaderboard(), loadMarkets()]);
+    }
+
+    document.getElementById('refreshBtn').addEventListener('click', loadAll);
     document.getElementById('strictMode').addEventListener('change', function() {
       updateStatusLine();
     });
 
-    loadMarkets();
+    loadAll();
     scheduleNextRefresh();
   </script>
 </body>
