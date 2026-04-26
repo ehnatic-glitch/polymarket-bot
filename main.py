@@ -91,15 +91,16 @@ def categorize_market(question):
     ]
     politics_keywords = [
         "presidential", "election", "senate", "house", "democratic",
-        "republican", "nomination", "trump", "vance", "rubio", "newsom"
+        "republican", "nomination", "trump", "vance", "rubio", "newsom",
+        "macron", "prime minister", "parliament"
     ]
     crypto_keywords = [
         "bitcoin", "btc", "ethereum", "eth", "solana", "xrp", "crypto",
-        "kraken", "coinbase", "ipo"
+        "kraken", "coinbase", "ipo", "microstrategy"
     ]
     geopolitics_keywords = [
-        "ukraine", "nato", "china", "india", "macron", "military",
-        "war", "troops", "ceasefire", "taiwan"
+        "ukraine", "nato", "china", "india", "military",
+        "war", "troops", "ceasefire", "taiwan", "iran", "israel", "hezbollah"
     ]
     meme_keywords = [
         "gta", "jesus christ", "$1m", "meme"
@@ -118,6 +119,49 @@ def categorize_market(question):
     return "Other"
 
 
+def detect_trade_type(question, yes_price, days_to_end):
+    q = (question or "").lower()
+
+    if isinstance(yes_price, (int, float)) and 0.01 <= yes_price <= 0.05:
+        return "Centovka"
+
+    resolution_keywords = [
+        "called by", "out by", "official sources", "good faith",
+        "materially", "substantially", "at any time"
+    ]
+    if any(k in q for k in resolution_keywords):
+        return "Resolution"
+
+    if days_to_end is not None and days_to_end <= 7:
+        return "Time Decay"
+
+    momentum_keywords = [
+        "ipo", "ceasefire", "announcement", "report", "vote", "deadline"
+    ]
+    if any(k in q for k in momentum_keywords):
+        return "Momentum"
+
+    return "Other"
+
+
+def oracle_risk_level(question):
+    q = (question or "").lower()
+    high_risk_keywords = [
+        "good faith", "sole discretion", "official sources only",
+        "materially", "substantially", "at any time"
+    ]
+    medium_risk_keywords = [
+        "called by", "out by", "military clash", "any country leave",
+        "official sources"
+    ]
+
+    if any(k in q for k in high_risk_keywords):
+        return "High"
+    if any(k in q for k in medium_risk_keywords):
+        return "Medium"
+    return "Low"
+
+
 def score_market(m):
     score = 0
     notes = []
@@ -128,6 +172,31 @@ def score_market(m):
     question = (m.get("question") or "").lower()
     category = categorize_market(m.get("question"))
     end_date = parse_date(m.get("endDate"))
+    oracle_risk = oracle_risk_level(m.get("question"))
+
+    now = datetime.now(timezone.utc)
+    days_to_end = None
+    if end_date:
+        days_to_end = (end_date - now).total_seconds() / 86400
+
+    trade_type = detect_trade_type(m.get("question"), yes_price, days_to_end)
+
+    # Gate components
+    gate_resolutability = oracle_risk == "Low"
+    gate_base_rate = category in ["Politics", "Crypto", "Sports", "Other"]
+    gate_friction = liquidity >= 100000 and volume24hr >= 25000
+    gate_exit = liquidity >= 150000
+    gate_catalyst = days_to_end is not None and 1 <= days_to_end <= 180
+    gate_oracle = oracle_risk != "High"
+
+    gate_score = sum([
+        1 if gate_resolutability else 0,
+        1 if gate_base_rate else 0,
+        1 if gate_friction else 0,
+        1 if gate_exit else 0,
+        1 if gate_catalyst else 0,
+        1 if gate_oracle else 0,
+    ])
 
     if liquidity >= 500000:
         score += 4
@@ -142,7 +211,7 @@ def score_market(m):
         score += 1
         notes.append("ok_liquidity")
     else:
-        score -= 4
+        score -= 5
         notes.append("thin_liquidity")
 
     if volume24hr >= 500000:
@@ -155,7 +224,7 @@ def score_market(m):
         score += 1
         notes.append("ok_volume")
     else:
-        score -= 3
+        score -= 4
         notes.append("low_volume")
 
     if isinstance(yes_price, (int, float)):
@@ -169,13 +238,10 @@ def score_market(m):
             score -= 1
             notes.append("stretched_price")
     else:
-        score -= 3
+        score -= 4
         notes.append("missing_price")
 
-    now = datetime.now(timezone.utc)
-    days_to_end = None
-    if end_date:
-        days_to_end = (end_date - now).total_seconds() / 86400
+    if days_to_end is not None:
         if 7 <= days_to_end <= 180:
             score += 2
             notes.append("good_time_window")
@@ -203,49 +269,76 @@ def score_market(m):
         "daily", "minute", "opens up or down"
     ]
     if any(k in question for k in noise_keywords):
-        score -= 5
+        score -= 6
         notes.append("noise_market")
 
-    ambiguity_keywords = [
-        "called by", "out by", "any country leave", "military clash",
-        "good faith", "official sources"
-    ]
-    if any(k in question for k in ambiguity_keywords):
-        score -= 3
-        notes.append("possible_ambiguity")
+    if oracle_risk == "High":
+        score -= 5
+        notes.append("high_oracle_risk")
+    elif oracle_risk == "Medium":
+        score -= 2
+        notes.append("medium_oracle_risk")
 
     if category == "Sports":
         score -= 2
         notes.append("sports_hype_risk")
 
     if category == "Narrative":
-        score -= 3
+        score -= 4
         notes.append("narrative_risk")
 
-    if category == "Politics" and end_date:
-        if days_to_end is not None and days_to_end > 365:
-            score -= 2
-            notes.append("long_dated_politics")
+    if category == "Politics" and days_to_end is not None and days_to_end > 365:
+        score -= 2
+        notes.append("long_dated_politics")
+
+    if trade_type == "Centovka":
+        score += 1
+        notes.append("asymmetric_centovka")
+
+    hard_reject = (
+        oracle_risk == "High" or
+        "noise_market" in notes or
+        "thin_liquidity" in notes or
+        "missing_price" in notes
+    )
 
     strict_watch = (
+        not hard_reject and
+        gate_score >= 5 and
+        gate_oracle and
+        gate_resolutability and
         liquidity >= 150000 and
         volume24hr >= 50000 and
         isinstance(yes_price, (int, float)) and
         0.12 <= yes_price <= 0.88 and
-        "possible_ambiguity" not in notes and
-        "noise_market" not in notes and
-        "extreme_price" not in notes and
+        trade_type != "Resolution" and
         "narrative_risk" not in notes
     )
 
-    if strict_watch and score >= 6:
+    if strict_watch and score >= 7:
         flag = "WATCH"
-    elif score >= 2:
-        flag = "MAYBE"
+    elif not hard_reject and gate_score >= 3 and score >= 1:
+        flag = "REVIEW"
     else:
         flag = "PASS"
 
     summary_parts = []
+
+    if trade_type == "Momentum":
+        summary_parts.append("momentum/news")
+    elif trade_type == "Time Decay":
+        summary_parts.append("time decay")
+    elif trade_type == "Resolution":
+        summary_parts.append("resolution risk")
+    elif trade_type == "Centovka":
+        summary_parts.append("centovka")
+
+    if oracle_risk == "Low":
+        summary_parts.append("nízky oracle risk")
+    elif oracle_risk == "Medium":
+        summary_parts.append("stredný oracle risk")
+    else:
+        summary_parts.append("vysoký oracle risk")
 
     if liquidity >= 250000:
         summary_parts.append("likvidný")
@@ -271,15 +364,6 @@ def score_market(m):
     else:
         summary_parts.append("chýba cena")
 
-    if "possible_ambiguity" in notes:
-        summary_parts.append("ambiguity risk")
-    if "sports_hype_risk" in notes:
-        summary_parts.append("športový hype")
-    if "narrative_risk" in notes:
-        summary_parts.append("narrative risk")
-    if "long_dated_politics" in notes:
-        summary_parts.append("príliš vzdialené expiry")
-
     summary = ", ".join(summary_parts)
 
     return {
@@ -291,6 +375,17 @@ def score_market(m):
         "noPrice": no_price,
         "daysToEnd": days_to_end,
         "category": category,
+        "tradeType": trade_type,
+        "oracleRisk": oracle_risk,
+        "gateScore": gate_score,
+        "gate": {
+            "resolutability": gate_resolutability,
+            "baseRate": gate_base_rate,
+            "friction": gate_friction,
+            "exit": gate_exit,
+            "catalyst": gate_catalyst,
+            "oracle": gate_oracle,
+        }
     }
 
 
@@ -319,26 +414,41 @@ def build_market_row(m):
         "noPrice": scored["noPrice"],
         "daysToEnd": scored["daysToEnd"],
         "category": scored["category"],
+        "tradeType": scored["tradeType"],
+        "oracleRisk": scored["oracleRisk"],
+        "gateScore": scored["gateScore"],
+        "gate": scored["gate"],
     }
 
 
 def flag_priority(flag):
     if flag == "WATCH":
         return 0
-    if flag == "MAYBE":
+    if flag == "REVIEW":
+        return 1
+    return 2
+
+
+def oracle_priority(level):
+    if level == "Low":
+        return 0
+    if level == "Medium":
         return 1
     return 2
 
 
 @app.route("/markets")
 def markets():
-    limit = int(request.args.get("limit", "50"))
+    limit = int(request.args.get("limit", "80"))
     active = request.args.get("active", "true")
     closed = request.args.get("closed", "false")
     min_liquidity = to_float(request.args.get("min_liquidity", "0"))
     min_volume = to_float(request.args.get("min_volume", "0"))
-    hide_pass = request.args.get("hide_pass", "false").lower() == "true"
+    hide_pass = request.args.get("hide_pass", "true").lower() == "true"
     category_filter = request.args.get("category", "").strip()
+    trade_type_filter = request.args.get("trade_type", "").strip()
+    max_oracle_risk = request.args.get("max_oracle_risk", "").strip()
+    gate_only = request.args.get("gate_only", "false").lower() == "true"
 
     params = {
         "limit": 200,
@@ -368,12 +478,22 @@ def markets():
             continue
         if category_filter and row.get("category") != category_filter:
             continue
+        if trade_type_filter and row.get("tradeType") != trade_type_filter:
+            continue
+        if max_oracle_risk:
+            allowed = {"Low": 0, "Medium": 1, "High": 2}
+            if allowed.get(row.get("oracleRisk"), 2) > allowed.get(max_oracle_risk, 2):
+                continue
+        if gate_only and row.get("gateScore", 0) < 6:
+            continue
 
         rows.append(row)
 
     rows.sort(
         key=lambda x: (
             flag_priority(x.get("flag")),
+            -to_float(x.get("gateScore")),
+            oracle_priority(x.get("oracleRisk")),
             -to_float(x.get("candidateScore")),
             -to_float(x.get("liquidity")),
             -to_float(x.get("volume24hr")),
@@ -390,6 +510,9 @@ def markets():
             "min_volume": min_volume,
             "hide_pass": hide_pass,
             "category": category_filter,
+            "trade_type": trade_type_filter,
+            "max_oracle_risk": max_oracle_risk,
+            "gate_only": gate_only,
         }
     })
 
@@ -406,7 +529,7 @@ def dashboard():
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Polymarket Candidate Dashboard v2</title>
+  <title>Polymarket Candidate Dashboard v3</title>
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -492,7 +615,7 @@ def dashboard():
       background: #e6f4ea;
       color: #137333;
     }
-    .maybe {
+    .review {
       background: #fff4e5;
       color: #b06000;
     }
@@ -509,6 +632,18 @@ def dashboard():
       color: #3949ab;
       font-weight: 600;
     }
+    .risk-low {
+      color: #137333;
+      font-weight: 700;
+    }
+    .risk-medium {
+      color: #b06000;
+      font-weight: 700;
+    }
+    .risk-high {
+      color: #c5221f;
+      font-weight: 700;
+    }
     a {
       color: #1558d6;
       text-decoration: none;
@@ -519,7 +654,7 @@ def dashboard():
     .summary {
       font-size: 12px;
       color: #666;
-      max-width: 260px;
+      max-width: 280px;
       white-space: normal;
     }
     .table-wrap {
@@ -543,7 +678,7 @@ def dashboard():
 </head>
 <body>
   <h1>Polymarket Candidate Dashboard</h1>
-  <p class="small">v2: category, hide PASS, horné filtre, sprísnený WATCH scoring podľa v5 heuristiky.</p>
+  <p class="small">v3 podľa v6: trade type, oracle risk, gate score, REVIEW vrstva, užší WATCH filter.</p>
 
   <div class="section">
     <h2>Top candidates</h2>
@@ -559,6 +694,28 @@ def dashboard():
           <option value="Geopolitics">Geopolitics</option>
           <option value="Narrative">Narrative</option>
           <option value="Other">Other</option>
+        </select>
+      </div>
+
+      <div class="control">
+        <label for="tradeType">Trade type</label>
+        <select id="tradeType">
+          <option value="">All</option>
+          <option value="Momentum">Momentum</option>
+          <option value="Time Decay">Time Decay</option>
+          <option value="Resolution">Resolution</option>
+          <option value="Centovka">Centovka</option>
+          <option value="Other">Other</option>
+        </select>
+      </div>
+
+      <div class="control">
+        <label for="maxOracleRisk">Max oracle risk</label>
+        <select id="maxOracleRisk">
+          <option value="">All</option>
+          <option value="Low" selected>Low</option>
+          <option value="Medium">Medium</option>
+          <option value="High">High</option>
         </select>
       </div>
 
@@ -594,6 +751,11 @@ def dashboard():
         <label for="watchOnly">WATCH only</label>
       </div>
 
+      <div class="checkbox-wrap">
+        <input type="checkbox" id="gateOnly" />
+        <label for="gateOnly">6/6 gate only</label>
+      </div>
+
       <div class="control">
         <button onclick="loadMarkets()">Refresh</button>
       </div>
@@ -607,14 +769,17 @@ def dashboard():
         <thead>
           <tr>
             <th>Flag</th>
+            <th>Gate</th>
             <th>Score</th>
+            <th>Type</th>
             <th>Category</th>
+            <th>Oracle</th>
             <th>Question</th>
             <th>Yes</th>
             <th>No</th>
             <th>24h volume</th>
             <th>Liquidity</th>
-            <th>End</th>
+            <th>Days</th>
             <th>Summary</th>
             <th>Link</th>
           </tr>
@@ -637,14 +802,26 @@ def dashboard():
       return n.toFixed(3);
     }
 
+    function fmtDays(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return '';
+      return Math.round(n).toString();
+    }
+
     function flagBadge(flag) {
       if (flag === 'WATCH') return '<span class="badge watch">WATCH</span>';
-      if (flag === 'MAYBE') return '<span class="badge maybe">MAYBE</span>';
+      if (flag === 'REVIEW') return '<span class="badge review">REVIEW</span>';
       return '<span class="badge pass">PASS</span>';
     }
 
     function catBadge(cat) {
       return '<span class="cat">' + (cat || 'Other') + '</span>';
+    }
+
+    function oracleBadge(level) {
+      if (level === 'Low') return '<span class="risk-low">Low</span>';
+      if (level === 'Medium') return '<span class="risk-medium">Medium</span>';
+      return '<span class="risk-high">High</span>';
     }
 
     async function loadMarkets() {
@@ -653,18 +830,24 @@ def dashboard():
       const countBox = document.getElementById('countBox');
 
       const category = document.getElementById('category').value;
+      const tradeType = document.getElementById('tradeType').value;
+      const maxOracleRisk = document.getElementById('maxOracleRisk').value;
       const minLiquidity = document.getElementById('minLiquidity').value;
       const minVolume = document.getElementById('minVolume').value;
       const hidePass = document.getElementById('hidePass').checked;
       const watchOnly = document.getElementById('watchOnly').checked;
+      const gateOnly = document.getElementById('gateOnly').checked;
 
       try {
         const params = new URLSearchParams({
-          limit: '80',
+          limit: '100',
           min_liquidity: minLiquidity,
           min_volume: minVolume,
           hide_pass: hidePass ? 'true' : 'false',
-          category: category
+          category: category,
+          trade_type: tradeType,
+          max_oracle_risk: maxOracleRisk,
+          gate_only: gateOnly ? 'true' : 'false'
         });
 
         const res = await fetch('/markets?' + params.toString());
@@ -687,14 +870,17 @@ def dashboard():
 
           tr.innerHTML = `
             <td>${flagBadge(m.flag)}</td>
+            <td>${m.gateScore ?? ''}/6</td>
             <td>${m.candidateScore ?? ''}</td>
+            <td>${m.tradeType || ''}</td>
             <td>${catBadge(m.category)}</td>
+            <td>${oracleBadge(m.oracleRisk)}</td>
             <td>${m.question || ''}</td>
             <td>${fmtPrice(m.yesPrice)}</td>
             <td>${fmtPrice(m.noPrice)}</td>
             <td>${fmtInt(m.volume24hr)}</td>
             <td>${fmtInt(m.liquidity)}</td>
-            <td>${m.endDate ? new Date(m.endDate).toLocaleString('sk-SK') : ''}</td>
+            <td>${fmtDays(m.daysToEnd)}</td>
             <td class="summary">${m.summary || ''}</td>
             <td>${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Open</a>' : ''}</td>
           `;
@@ -710,10 +896,13 @@ def dashboard():
     }
 
     document.getElementById('category').addEventListener('change', loadMarkets);
+    document.getElementById('tradeType').addEventListener('change', loadMarkets);
+    document.getElementById('maxOracleRisk').addEventListener('change', loadMarkets);
     document.getElementById('minLiquidity').addEventListener('change', loadMarkets);
     document.getElementById('minVolume').addEventListener('change', loadMarkets);
     document.getElementById('hidePass').addEventListener('change', loadMarkets);
     document.getElementById('watchOnly').addEventListener('change', loadMarkets);
+    document.getElementById('gateOnly').addEventListener('change', loadMarkets);
 
     loadMarkets();
   </script>
