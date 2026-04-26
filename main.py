@@ -690,6 +690,7 @@ def markets():
     trade_type_filter = request.args.get("trade_type", "").strip()
     max_oracle_risk = request.args.get("max_oracle_risk", "").strip()
     gate_only = request.args.get("gate_only", "false").lower() == "true"
+    catalyst_conf_filter = request.args.get("catalyst_confidence", "").strip()
 
     params = {
         "limit": 200,
@@ -720,6 +721,8 @@ def markets():
         if category_filter and row.get("category") != category_filter:
             continue
         if trade_type_filter and row.get("tradeType") != trade_type_filter:
+            continue
+        if catalyst_conf_filter and row.get("catalystConfidence") != catalyst_conf_filter:
             continue
         if max_oracle_risk:
             allowed = {"Low": 0, "Medium": 1, "High": 2}
@@ -754,6 +757,7 @@ def markets():
             "trade_type": trade_type_filter,
             "max_oracle_risk": max_oracle_risk,
             "gate_only": gate_only,
+            "catalyst_confidence": catalyst_conf_filter,
         }
     })
 
@@ -770,7 +774,7 @@ def dashboard():
 <html lang="sk">
 <head>
   <meta charset="utf-8">
-  <title>Polymarket Kandidátny Dashboard</title>
+  <title>Polymarket Kandidátny Dashboard v5</title>
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -790,7 +794,7 @@ def dashboard():
     }
     .layout {
       display: grid;
-      grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr);
+      grid-template-columns: minmax(0, 2fr) minmax(360px, 1fr);
       gap: 16px;
       align-items: start;
     }
@@ -812,12 +816,17 @@ def dashboard():
       color: #555;
       font-weight: 600;
     }
-    input, select {
+    input, select, textarea {
       padding: 8px 10px;
       border: 1px solid #ddd;
       border-radius: 6px;
       font: inherit;
       background: #fff;
+    }
+    textarea {
+      width: 100%;
+      min-height: 74px;
+      resize: vertical;
     }
     .checkbox-wrap {
       display: flex;
@@ -913,7 +922,7 @@ def dashboard():
     }
     .kv {
       display: grid;
-      grid-template-columns: 120px 1fr;
+      grid-template-columns: 130px 1fr;
       gap: 8px;
       font-size: 13px;
       margin-bottom: 10px;
@@ -938,6 +947,11 @@ def dashboard():
       border-radius: 6px;
       background: #fff;
       cursor: pointer;
+    }
+    .btn-primary {
+      background: #1558d6;
+      border-color: #1558d6;
+      color: white;
     }
     .check {
       display: flex;
@@ -969,7 +983,7 @@ def dashboard():
       background: #f3f4f6;
       color: #333;
     }
-    .link-row {
+    .link-row, .action-row {
       display: flex;
       gap: 10px;
       flex-wrap: wrap;
@@ -988,7 +1002,17 @@ def dashboard():
       color: #444;
       font-size: 13px;
     }
-    @media (max-width: 1100px) {
+    .journal-box {
+      margin-top: 16px;
+      padding-top: 12px;
+      border-top: 1px solid #eee;
+    }
+    .saved-note {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #137333;
+    }
+    @media (max-width: 1200px) {
       .layout {
         grid-template-columns: 1fr;
       }
@@ -1000,7 +1024,7 @@ def dashboard():
 </head>
 <body>
   <h1>Polymarket kandidátny dashboard</h1>
-  <p class="small">v4 podľa v6: detail panel, mini 6/6 checklist, frikcia, exit score.</p>
+  <p class="small">v5 podľa v6: detail panel, mini 6/6 checklist, journaling, filter katalyzátora, export trade-log šablóny.</p>
 
   <div class="layout">
     <div class="section">
@@ -1029,6 +1053,16 @@ def dashboard():
             <option value="Resolution">Resolution / spor</option>
             <option value="Centovka">Centovka</option>
             <option value="Other">Ostatné</option>
+          </select>
+        </div>
+
+        <div class="control">
+          <label for="catalystConfidence">Sila katalyzátora</label>
+          <select id="catalystConfidence">
+            <option value="">Všetko</option>
+            <option value="High">Silný</option>
+            <option value="Medium">Stredný</option>
+            <option value="Low">Slabý</option>
           </select>
         </div>
 
@@ -1099,6 +1133,7 @@ def dashboard():
               <th>Typ</th>
               <th>Kategória</th>
               <th>Oracle</th>
+              <th>Katalyzátor</th>
               <th>Otázka</th>
               <th>Yes</th>
               <th>No</th>
@@ -1123,6 +1158,11 @@ def dashboard():
 
   <script>
     let cachedMarkets = [];
+    let selectedMarket = null;
+
+    function journalKey(slug) {
+      return 'poly_journal_' + (slug || 'unknown');
+    }
 
     function fmtInt(value) {
       const n = Number(value);
@@ -1183,9 +1223,128 @@ def dashboard():
       }).join('');
     }
 
+    function loadJournal(slug) {
+      try {
+        const raw = localStorage.getItem(journalKey(slug));
+        return raw ? JSON.parse(raw) : {
+          thesis: '',
+          mispricing: '',
+          catalyst: '',
+          invalidation: '',
+          confidence: '',
+        };
+      } catch (e) {
+        return {
+          thesis: '',
+          mispricing: '',
+          catalyst: '',
+          invalidation: '',
+          confidence: '',
+        };
+      }
+    }
+
+    function saveJournal() {
+      if (!selectedMarket || !selectedMarket.slug) return;
+      const payload = {
+        thesis: document.getElementById('journalThesis')?.value || '',
+        mispricing: document.getElementById('journalMispricing')?.value || '',
+        catalyst: document.getElementById('journalCatalyst')?.value || '',
+        invalidation: document.getElementById('journalInvalidation')?.value || '',
+        confidence: document.getElementById('journalConfidence')?.value || '',
+      };
+      localStorage.setItem(journalKey(selectedMarket.slug), JSON.stringify(payload));
+      const msg = document.getElementById('savedNote');
+      if (msg) {
+        msg.textContent = 'Poznámky uložené lokálne v prehliadači.';
+      }
+    }
+
+    function buildTradeLogText(m) {
+      const journal = loadJournal(m.slug);
+      return `KATEGORIZÁCIA TRHU: ${m.tradeTypeLabel || ''}
+
+PRE-TRADE CHECKLIST:
+1. Resolutability: ${(m.checklist?.resolutability?.ok ? 'ÁNO' : 'NIE')} - ${m.checklist?.resolutability?.note || ''}
+2. Base Rate: ${(m.checklist?.baseRate?.ok ? 'ÁNO' : 'NIE')} - ${m.checklist?.baseRate?.note || ''}
+3. Frikcia: ${(m.checklist?.friction?.ok ? 'ÁNO' : 'NIE')} - ${m.checklist?.friction?.note || ''}
+4. Exit: ${(m.checklist?.exit?.ok ? 'ÁNO' : 'NIE')} - ${m.checklist?.exit?.note || ''}
+5. Catalyst: ${(m.checklist?.catalyst?.ok ? 'ÁNO' : 'NIE')} - ${m.checklist?.catalyst?.note || ''}
+6. Oracle Trap: ${(m.checklist?.oracle?.ok ? 'ÁNO' : 'NIE')} - ${m.checklist?.oracle?.note || ''}
+
+ANALÝZA EDGE-U:
+${journal.thesis || ''}
+
+KDE JE MISPRICING:
+${journal.mispricing || ''}
+
+RESOLUTION ANALÝZA:
+Oracle riziko: ${m.oracleRiskLabel || ''}
+Katalyzátor: ${m.catalystTypeLabel || ''} / ${m.catalystConfidenceLabel || ''}
+Zhrnutie: ${m.summary || ''}
+
+PARAMETRE VSTUPU:
+Market: ${m.question || ''}
+YES cena: ${fmtPrice(m.yesPrice)}
+NO cena: ${fmtPrice(m.noPrice)}
+Likvidita: ${fmtInt(m.liquidity)}
+24h objem: ${fmtInt(m.volume24hr)}
+Dni do expirácie: ${fmtDays(m.daysToEnd)}
+Plánovaný sizing: 
+Limit order cena:
+Tranches: 40 / 35 / 25
+
+PLÁN VÝSTUPU:
+Fáza 1:
+Fáza 2:
+Runner:
+Time-stop limit:
+
+INVALIDÁCIA (FULL EXIT TRIGGER):
+${journal.invalidation || ''}
+
+KATALYZÁTOR:
+${journal.catalyst || ''}
+
+CONFIDENCE:
+${journal.confidence || ''}
+
+FINÁLNE ROZHODNUTIE:
+BUY YES / BUY NO / PASS
+`;
+    }
+
+    async function copyTradeLog() {
+      if (!selectedMarket) return;
+      const text = buildTradeLogText(selectedMarket);
+      await navigator.clipboard.writeText(text);
+      const msg = document.getElementById('savedNote');
+      if (msg) {
+        msg.textContent = 'Trade-log šablóna skopírovaná do schránky.';
+      }
+    }
+
+    function downloadTradeLog() {
+      if (!selectedMarket) return;
+      const text = buildTradeLogText(selectedMarket);
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      const safeSlug = (selectedMarket.slug || 'trade-log').replace(/[^a-z0-9-]/gi, '-');
+      a.download = safeSlug + '-trade-log.txt';
+      a.click();
+      URL.revokeObjectURL(a.href);
+      const msg = document.getElementById('savedNote');
+      if (msg) {
+        msg.textContent = 'Trade-log šablóna stiahnutá.';
+      }
+    }
+
     function showDetail(m) {
+      selectedMarket = m;
       const panel = document.getElementById('detailPanel');
       const link = m.slug ? 'https://polymarket.com/market/' + m.slug : '';
+      const journal = loadJournal(m.slug);
 
       const commentary = (m.detailCommentary || [])
         .map(x => '<li>' + x + '</li>')
@@ -1220,6 +1379,33 @@ def dashboard():
           ${link ? '<a href="' + link + '" target="_blank" rel="noopener noreferrer">Otvoriť na Polymarkete</a>' : ''}
           ${m.slug ? '<a href="/analyze-market?slug=' + encodeURIComponent(m.slug) + '" target="_blank" rel="noopener noreferrer">Zobraziť JSON analýzu</a>' : ''}
         </div>
+
+        <div class="journal-box">
+          <h3>Moje poznámky k setupu</h3>
+
+          <label for="journalThesis">Moja téza</label>
+          <textarea id="journalThesis" placeholder="Prečo tento market vôbec stojí za ďalší review?">${journal.thesis || ''}</textarea>
+
+          <label for="journalMispricing" style="margin-top:10px; display:block;">Kde je mispricing</label>
+          <textarea id="journalMispricing" placeholder="Čo trh podľa mňa nevidí alebo ignoruje?">${journal.mispricing || ''}</textarea>
+
+          <label for="journalCatalyst" style="margin-top:10px; display:block;">Môj katalyzátor</label>
+          <textarea id="journalCatalyst" placeholder="Aký konkrétny trigger má repricing spôsobiť?">${journal.catalyst || ''}</textarea>
+
+          <label for="journalInvalidation" style="margin-top:10px; display:block;">Invalidácia</label>
+          <textarea id="journalInvalidation" placeholder="Čo presne ruší tézu a spustí exit?">${journal.invalidation || ''}</textarea>
+
+          <label for="journalConfidence" style="margin-top:10px; display:block;">Confidence (1-10)</label>
+          <input id="journalConfidence" type="text" value="${journal.confidence || ''}" placeholder="napr. 6/10" />
+
+          <div class="action-row">
+            <button onclick="saveJournal()">Uložiť poznámky</button>
+            <button class="btn-primary" onclick="copyTradeLog()">Kopírovať trade-log šablónu</button>
+            <button onclick="downloadTradeLog()">Stiahnuť trade-log</button>
+          </div>
+
+          <div class="saved-note" id="savedNote"></div>
+        </div>
       `;
     }
 
@@ -1230,6 +1416,7 @@ def dashboard():
 
       const category = document.getElementById('category').value;
       const tradeType = document.getElementById('tradeType').value;
+      const catalystConfidence = document.getElementById('catalystConfidence').value;
       const maxOracleRisk = document.getElementById('maxOracleRisk').value;
       const minLiquidity = document.getElementById('minLiquidity').value;
       const minVolume = document.getElementById('minVolume').value;
@@ -1246,7 +1433,8 @@ def dashboard():
           category: category,
           trade_type: tradeType,
           max_oracle_risk: maxOracleRisk,
-          gate_only: gateOnly ? 'true' : 'false'
+          gate_only: gateOnly ? 'true' : 'false',
+          catalyst_confidence: catalystConfidence
         });
 
         const res = await fetch('/markets?' + params.toString());
@@ -1278,6 +1466,7 @@ def dashboard():
             <td>${m.tradeTypeLabel || ''}</td>
             <td>${catBadge(m.categoryLabel)}</td>
             <td>${oracleBadge(m.oracleRiskLabel)}</td>
+            <td>${m.catalystConfidenceLabel || ''}</td>
             <td>${m.question || ''}</td>
             <td>${fmtPrice(m.yesPrice)}</td>
             <td>${fmtPrice(m.noPrice)}</td>
@@ -1300,6 +1489,8 @@ def dashboard():
 
         if (markets.length > 0) {
           showDetail(markets[0]);
+        } else {
+          document.getElementById('detailPanel').innerHTML = '<h3>Detail marketu</h3><p class="panel-muted">Žiadny market nevyhovuje aktuálnym filtrom.</p>';
         }
       } catch (err) {
         errorEl.textContent = 'Chyba pri načítaní marketov: ' + err.message;
@@ -1309,6 +1500,7 @@ def dashboard():
 
     document.getElementById('category').addEventListener('change', loadMarkets);
     document.getElementById('tradeType').addEventListener('change', loadMarkets);
+    document.getElementById('catalystConfidence').addEventListener('change', loadMarkets);
     document.getElementById('maxOracleRisk').addEventListener('change', loadMarkets);
     document.getElementById('minLiquidity').addEventListener('change', loadMarkets);
     document.getElementById('minVolume').addEventListener('change', loadMarkets);
