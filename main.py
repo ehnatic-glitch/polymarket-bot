@@ -1203,73 +1203,6 @@ def build_watchlist(rows, limit=12):
     return watch[:limit]
 
 
-def build_portfolio_summary(rows):
-    selected = []
-    narrative_buckets = defaultdict(float)
-
-    for row in rows:
-        decision = row.get("autoDraft", {}).get("finalDecision")
-        if decision not in ["BUY YES", "BUY NO"]:
-            continue
-        selected.append(row)
-
-    selected.sort(
-        key=lambda x: (
-            decision_priority(x.get("autoDraft", {}).get("finalDecision")),
-            -to_float(x.get("gateScore")),
-            -to_float(x.get("candidateScore")),
-        )
-    )
-
-    selected = selected[:APP_CONFIG["max_active_positions"]]
-
-    total_exposure = 0.0
-    positions = []
-
-    for row in selected:
-        stake = to_float(row.get("executionPlan", {}).get("stakeUSDC"), 0.0)
-        cluster = row.get("cluster") or "misc"
-        narrative_buckets[cluster] += stake
-        total_exposure += stake
-        positions.append({
-            "question": row.get("question"),
-            "cluster": cluster,
-            "decision": row.get("autoDraft", {}).get("finalDecision"),
-            "stakeUSDC": stake,
-            "limitPrice": row.get("executionPlan", {}).get("limitPrice"),
-            "entryZone": row.get("entryZone", {}).get("label"),
-        })
-
-    reserve = APP_CONFIG["cash_reserve"]
-    bankroll_total = APP_CONFIG["bankroll_total"]
-    max_total = APP_CONFIG["max_total_exposure"]
-    free_risk = max(0.0, max_total - total_exposure)
-
-    warnings = []
-    if total_exposure > max_total:
-        warnings.append("Prekročený max celkový risk 200 USDC.")
-    if len(positions) > APP_CONFIG["max_active_positions"]:
-        warnings.append("Prekročený max počet aktívnych pozícií.")
-    for cluster, amount in narrative_buckets.items():
-        if amount > APP_CONFIG["max_narrative_exposure"]:
-            warnings.append(f"Prekročený max narrative cap 75 USDC pre {cluster}.")
-
-    return {
-        "bankrollTotal": bankroll_total,
-        "cashReserve": reserve,
-        "maxTotalExposure": max_total,
-        "activeExposure": round(total_exposure, 2),
-        "freeRiskBudget": round(free_risk, 2),
-        "activePositions": len(positions),
-        "positions": positions,
-        "narrativeExposure": [
-            {"cluster": k, "exposure": round(v, 2)}
-            for k, v in sorted(narrative_buckets.items(), key=lambda x: -x[1])
-        ],
-        "warnings": warnings,
-    }
-
-
 @app.route("/markets")
 def markets():
     limit = int(request.args.get("limit", "80"))
@@ -1338,14 +1271,12 @@ def markets():
     diversified_rows = diversified_rows[:limit]
     alt_non_sports = top_non_sports(rows, limit=3)
     watchlist = build_watchlist(rows, limit=12)
-    portfolio = build_portfolio_summary(watchlist)
 
     return jsonify({
         "count": len(diversified_rows),
         "markets": diversified_rows,
         "topNonSports": alt_non_sports,
         "watchlist": watchlist,
-        "portfolio": portfolio,
         "filters": {
             "min_liquidity": min_liquidity,
             "hide_pass": hide_pass,
@@ -1398,12 +1329,6 @@ def dashboard():
       margin-bottom: 16px;
       box-shadow: 0 1px 3px rgba(0,0,0,0.08);
     }
-    .layout {
-      display: grid;
-      grid-template-columns: minmax(0, 2.2fr) minmax(420px, 1fr);
-      gap: 14px;
-      align-items: start;
-    }
     .header-strip {
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(340px, 460px);
@@ -1431,6 +1356,21 @@ def dashboard():
       padding: 10px 12px;
       line-height: 1.45;
       box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    .top-strip {
+      display: grid;
+      grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr);
+      gap: 12px;
+      margin-bottom: 14px;
+      align-items: start;
+    }
+    .compact-section {
+      padding: 12px;
+    }
+    .compact-box {
+      padding: 8px 10px;
+      font-size: 12px;
+      line-height: 1.4;
     }
     .controls {
       display: flex;
@@ -1571,16 +1511,6 @@ def dashboard():
       color: #888;
       font-weight: 700;
     }
-    .panel {
-      position: sticky;
-      top: 16px;
-    }
-    .panel-box {
-      background: #fff;
-      border-radius: 8px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-      padding: 14px;
-    }
     .panel-muted {
       color: #444;
       font-size: 13px;
@@ -1599,16 +1529,6 @@ def dashboard():
       margin-bottom: 10px;
       font-size: 13px;
       color: #444;
-    }
-    .status-line {
-      margin-bottom: 10px;
-      font-size: 12px;
-      color: #666;
-      background: #fafafa;
-      border: 1px solid #eee;
-      border-radius: 6px;
-      padding: 8px 10px;
-      line-height: 1.5;
     }
     button {
       padding: 8px 12px;
@@ -1698,7 +1618,7 @@ def dashboard():
     .trade-link:hover {
       text-decoration: underline;
     }
-    .journal-box, .non-sports-box, .watchlist-box, .alerts-box {
+    .journal-box {
       margin-top: 16px;
       padding-top: 12px;
       border-top: 1px solid #eee;
@@ -1710,7 +1630,7 @@ def dashboard():
     }
     .draft-grid {
       display: grid;
-      grid-template-columns: 120px 1fr;
+      grid-template-columns: 140px 1fr;
       gap: 8px;
       font-size: 13px;
       margin-bottom: 10px;
@@ -1738,44 +1658,9 @@ def dashboard():
       max-height: 2.7em;
       word-break: break-word;
     }
-    .mini-list {
-      display: grid;
-      gap: 8px;
-      margin-top: 10px;
-    }
-    .mini-card {
-      border: 1px solid #eee;
-      border-radius: 6px;
-      padding: 8px;
-      background: #fafafa;
-      font-size: 12px;
-      line-height: 1.4;
-    }
-    .mini-card strong {
-      display: block;
-      margin-bottom: 4px;
-    }
-    .top-strip {
-      display: grid;
-      grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
-      gap: 12px;
-      margin-bottom: 14px;
-      align-items: start;
-    }
-    .compact-section {
-      padding: 12px;
-    }
-    .compact-box {
-      padding: 8px 10px;
-      font-size: 12px;
-      line-height: 1.4;
-    }
-    .alerts-section .compact-box {
-      min-height: 44px;
-    }
     .watchlist-compact {
       display: grid;
-      gap: 6px;
+      gap: 4px;
     }
     .watchlist-row {
       display: grid;
@@ -1804,21 +1689,49 @@ def dashboard():
     .alert-line:last-child {
       border-bottom: none;
     }
+    .detail-shell {
+      display: grid;
+      gap: 14px;
+    }
+    .detail-top {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.35fr) minmax(300px, 1fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .detail-card {
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+      padding: 14px;
+      min-height: 100%;
+    }
     @media (max-width: 1200px) {
-      .layout {
-        grid-template-columns: 1fr;
-      }
-      .panel {
-        position: static;
-      }
-      .top-strip {
-        grid-template-columns: 1fr;
-      }
       .header-strip {
         grid-template-columns: 1fr;
       }
       .header-right {
         justify-content: stretch;
+      }
+      .top-strip {
+        grid-template-columns: 1fr;
+      }
+      .detail-top {
+        grid-template-columns: 1fr;
+      }
+      .detail-grid {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+    @media (max-width: 900px) {
+      .detail-grid {
+        grid-template-columns: 1fr;
       }
     }
   </style>
@@ -1839,107 +1752,104 @@ def dashboard():
       <h2>Na sledovanie</h2>
       <div id="watchlistBox" class="panel-muted compact-box">Načítavam watchlist...</div>
     </div>
-    <div class="section compact-section alerts-section">
+    <div class="section compact-section">
       <h2>Alerty</h2>
       <div id="alertsBox" class="panel-muted compact-box">Zatiaľ bez alertov.</div>
     </div>
   </div>
 
-  <div class="layout">
-    <div class="section">
-      <h2>Top kandidáti</h2>
+  <div class="section">
+    <h2>Top kandidáti</h2>
 
-      <div class="controls">
-        <div class="control">
-          <label for="category">Kategória</label>
-          <select id="category">
-            <option value="">Všetko</option>
-            <option value="Sports">Šport</option>
-            <option value="Politics">Politika</option>
-            <option value="Crypto">Krypto</option>
-            <option value="Geopolitics">Geopolitika</option>
-            <option value="Narrative">Naratív</option>
-            <option value="Other">Ostatné</option>
-          </select>
-        </div>
-
-        <div class="control">
-          <label for="minLiquidity">Min likvidita</label>
-          <select id="minLiquidity">
-            <option value="50000">50 000</option>
-            <option value="100000" __MIN_LIQ_SELECTED__>100 000</option>
-            <option value="150000">150 000</option>
-            <option value="250000">250 000</option>
-          </select>
-        </div>
-
-        <div class="checkbox-wrap">
-          <input type="checkbox" id="hidePass" checked />
-          <label for="hidePass">Skryť PASS</label>
-        </div>
-
-        <div class="checkbox-wrap">
-          <input type="checkbox" id="diversify" checked />
-          <label for="diversify">Diverzifikovať feed</label>
-        </div>
-
-        <div class="checkbox-wrap">
-          <input type="checkbox" id="watchlistOnly" />
-          <label for="watchlistOnly">Len watchlist</label>
-        </div>
-
-        <div class="checkbox-wrap">
-          <input type="checkbox" id="strictMode" />
-          <label for="strictMode">Strict v6 mode</label>
-        </div>
-
-        <div class="control">
-          <button id="refreshBtn">Obnoviť</button>
-        </div>
+    <div class="controls">
+      <div class="control">
+        <label for="category">Kategória</label>
+        <select id="category">
+          <option value="">Všetko</option>
+          <option value="Sports">Šport</option>
+          <option value="Politics">Politika</option>
+          <option value="Crypto">Krypto</option>
+          <option value="Geopolitics">Geopolitika</option>
+          <option value="Narrative">Naratív</option>
+          <option value="Other">Ostatné</option>
+        </select>
       </div>
 
-      <div class="count" id="countBox"></div>
-      <div id="markets-error" class="error" style="display:none;"></div>
+      <div class="control">
+        <label for="minLiquidity">Min likvidita</label>
+        <select id="minLiquidity">
+          <option value="50000">50 000</option>
+          <option value="100000" __MIN_LIQ_SELECTED__>100 000</option>
+          <option value="150000">150 000</option>
+          <option value="250000">250 000</option>
+        </select>
+      </div>
 
-      <div class="table-wrap">
-        <table id="markets-table">
-          <thead>
-            <tr>
-              <th>Kandidát</th>
-              <th>Rozhod.</th>
-              <th>Entry zóna</th>
-              <th>Gate</th>
-              <th>Skóre</th>
-              <th>Frikcia</th>
-              <th>Exit</th>
-              <th>Typ</th>
-              <th>Kat.</th>
-              <th>Oracle</th>
-              <th>Otázka</th>
-              <th>Yes</th>
-              <th>No</th>
-              <th>24h</th>
-              <th>Likv.</th>
-              <th>Dni</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
+      <div class="checkbox-wrap">
+        <input type="checkbox" id="hidePass" checked />
+        <label for="hidePass">Skryť PASS</label>
+      </div>
+
+      <div class="checkbox-wrap">
+        <input type="checkbox" id="diversify" checked />
+        <label for="diversify">Diverzifikovať feed</label>
+      </div>
+
+      <div class="checkbox-wrap">
+        <input type="checkbox" id="watchlistOnly" />
+        <label for="watchlistOnly">Len watchlist</label>
+      </div>
+
+      <div class="checkbox-wrap">
+        <input type="checkbox" id="strictMode" />
+        <label for="strictMode">Strict v6 mode</label>
+      </div>
+
+      <div class="control">
+        <button id="refreshBtn">Obnoviť</button>
       </div>
     </div>
 
-    <div class="panel">
-      <div class="panel-box" id="detailPanel">
-        <h3>Detail marketu</h3>
-        <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa checklist, delta tracking, systémový draft a entry/exit plán.</p>
-      </div>
+    <div class="count" id="countBox"></div>
+    <div id="markets-error" class="error" style="display:none;"></div>
+
+    <div class="table-wrap">
+      <table id="markets-table">
+        <thead>
+          <tr>
+            <th>Kandidát</th>
+            <th>Rozhod.</th>
+            <th>Entry zóna</th>
+            <th>Gate</th>
+            <th>Skóre</th>
+            <th>Frikcia</th>
+            <th>Exit</th>
+            <th>Typ</th>
+            <th>Kat.</th>
+            <th>Oracle</th>
+            <th>Otázka</th>
+            <th>Yes</th>
+            <th>No</th>
+            <th>24h</th>
+            <th>Likv.</th>
+            <th>Dni</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="detailPanel">
+    <div class="section">
+      <h3>Detail marketu</h3>
+      <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa detail trhu, checklist, systémový draft a entry/exit plán.</p>
     </div>
   </div>
 
   <script>
     let cachedMarkets = [];
     let selectedMarket = null;
-    let cachedNonSports = [];
     let cachedWatchlist = [];
     let previousSnapshot = new Map();
     let currentDeltaMap = new Map();
@@ -2177,7 +2087,7 @@ def dashboard():
             delta.liquidityDeltaPct = Number(pct.toFixed(1));
           }
 
-          if (snap.flag === 'WATCH' && prev.flag !== 'WATCH') {
+          if (snap.flag === 'WATCH' && prev.flag != 'WATCH') {
             alerts.push('Nový WATCH: ' + (m.question || ''));
           }
           if (prev.decision === 'PASS' && (snap.decision === 'BUY YES' || snap.decision === 'BUY NO')) {
@@ -2202,7 +2112,7 @@ def dashboard():
 
       previousSnapshot = nextMap;
       currentDeltaMap = deltaMap;
-      rareAlerts = alerts.slice(0, 10);
+      rareAlerts = alerts.slice(0, 8);
     }
 
     function renderWatchlist() {
@@ -2214,7 +2124,7 @@ def dashboard():
         return;
       }
 
-      const shortList = cachedWatchlist.slice(0, 6);
+      const shortList = cachedWatchlist.slice(0, 4);
 
       box.innerHTML = '<div class="watchlist-compact">' + shortList.map(function(m) {
         const safeSlug = String(m.slug || '').replace(/'/g, "\\\\'");
@@ -2250,7 +2160,7 @@ def dashboard():
         return;
       }
 
-      box.innerHTML = rareAlerts.slice(0, 5).map(function(a) {
+      box.innerHTML = rareAlerts.slice(0, 4).map(function(a) {
         return '<div class="alert-line">' + a + '</div>';
       }).join('');
     }
@@ -2342,94 +2252,103 @@ def dashboard():
       const tradeUrl = m.slug ? ('https://polymarket.com/event/' + m.slug) : 'https://polymarket.com';
 
       panel.innerHTML = ''
-        + '<div class="title-row">'
-        +   '<div class="title-main">'
-        +     '<h3>' + (m.question || '') + '</h3>'
-        +     flagBadge(m.flagLabel)
-        +     ' '
-        +     decisionBadge(m.autoDraft?.finalDecision || 'PASS')
-        +     ' '
-        +     catBadge(m.categoryLabel || '')
-        +     ' '
-        +     '<span class="small">Typ: ' + (m.tradeTypeLabel || '') + '</span>'
-        +     ' '
-        +     '<span class="small">Gate: ' + (m.gateScore ?? '') + '/6</span>'
-        +   '</div>'
-        +   '<a class="trade-link" href="' + tradeUrl + '" target="_blank" rel="noopener noreferrer">Otvoriť trade</a>'
-        + '</div>'
+        + '<div class="detail-shell">'
+        +   '<div class="section">'
+        +     '<div class="title-row">'
+        +       '<div class="title-main">'
+        +         '<h3>' + (m.question || '') + '</h3>'
+        +         + flagBadge(m.flagLabel)
+        +         ' '
+        +         + decisionBadge(m.autoDraft?.finalDecision || 'PASS')
+        +         ' '
+        +         + catBadge(m.categoryLabel || '')
+        +         ' '
+        +         + '<span class="small">Typ: ' + (m.tradeTypeLabel || '') + '</span>'
+        +         ' '
+        +         + '<span class="small">Gate: ' + (m.gateScore ?? '') + '/6</span>'
+        +       '</div>'
+        +       '<a class="trade-link" href="' + tradeUrl + '" target="_blank" rel="noopener noreferrer">Otvoriť trade</a>'
+        +     '</div>'
 
-        + '<div class="draft-grid">'
-        +   '<div>Entry zóna</div><div>' + zoneBadge(m.entryZone) + '</div>'
-        +   '<div>Cluster</div><div>' + (m.cluster || '') + '</div>'
-        +   '<div>Fail point</div><div>' + (m.failPoint || '') + '</div>'
-        +   '<div>Sizing cap</div><div>' + (m.sizingCap || '') + '</div>'
-        +   '<div>Why now</div><div>' + (m.whyNow || '') + '</div>'
-        + '</div>'
-
-        + '<div class="journal-box">'
-        +   '<h3>Delta tracking</h3>'
-        +   renderDeltaTracking(m)
-        + '</div>'
-
-        + '<div class="journal-box">'
-        +   '<h3>Mini 6/6 checklist</h3>'
-        +   renderChecklist(m.checklist || {})
-        + '</div>'
-
-        + '<div class="journal-box">'
-        +   '<h3>Systémový draft podľa v6</h3>'
-        +   '<div class="draft-grid">'
-        +     '<div>Bias</div><div>' + (m.autoDraft?.bias || '') + '</div>'
-        +     '<div>Rozhodnutie</div><div><strong>' + (m.autoDraft?.finalDecision || '') + '</strong></div>'
-        +     '<div>Confidence</div><div>' + (m.autoDraft?.confidence || '') + '/10</div>'
-        +     '<div>Sizing hint</div><div>' + (m.autoDraft?.sizingHint || '') + '</div>'
+        +     '<div class="detail-top">'
+        +       '<div class="panel-muted">'
+        +         '<div class="draft-grid">'
+        +           '<div>Entry zóna</div><div>' + zoneBadge(m.entryZone) + '</div>'
+        +           '<div>Cluster</div><div>' + (m.cluster || '') + '</div>'
+        +           '<div>Fail point</div><div>' + (m.failPoint || '') + '</div>'
+        +           '<div>Sizing cap</div><div>' + (m.sizingCap || '') + '</div>'
+        +           '<div>Why now</div><div>' + (m.whyNow || '') + '</div>'
+        +         '</div>'
+        +       '</div>'
+        +       '<div>'
+        +         '<h3>Delta tracking</h3>'
+        +         renderDeltaTracking(m)
+        +       '</div>'
+        +     '</div>'
         +   '</div>'
 
-        +   '<label class="block-label">Navrhovaná téza</label>'
-        +   '<div class="panel-muted">' + (m.autoDraft?.thesis || '') + '</div>'
+        +   '<div class="detail-grid">'
+        +     '<div class="detail-card">'
+        +       '<h3>Mini 6/6 checklist</h3>'
+        +       renderChecklist(m.checklist || {})
+        +     '</div>'
 
-        +   '<label class="block-label">Kde je mispricing</label>'
-        +   '<div class="panel-muted">' + (m.autoDraft?.mispricing || '') + '</div>'
+        +     '<div class="detail-card">'
+        +       '<h3>Systémový draft podľa v6</h3>'
+        +       '<div class="draft-grid">'
+        +         '<div>Bias</div><div>' + (m.autoDraft?.bias || '') + '</div>'
+        +         '<div>Rozhodnutie</div><div><strong>' + (m.autoDraft?.finalDecision || '') + '</strong></div>'
+        +         '<div>Confidence</div><div>' + (m.autoDraft?.confidence || '') + '/10</div>'
+        +         '<div>Sizing hint</div><div>' + (m.autoDraft?.sizingHint || '') + '</div>'
+        +       '</div>'
 
-        +   '<label class="block-label">Typ edge</label>'
-        +   '<div class="panel-muted">' + (m.autoDraft?.edge || '') + '</div>'
+        +       '<label class="block-label">Navrhovaná téza</label>'
+        +       '<div class="panel-muted">' + (m.autoDraft?.thesis || '') + '</div>'
 
-        +   '<label class="block-label">Katalyzátor</label>'
-        +   '<div class="panel-muted">' + (m.autoDraft?.catalyst || '') + '</div>'
+        +       '<label class="block-label">Kde je mispricing</label>'
+        +       '<div class="panel-muted">' + (m.autoDraft?.mispricing || '') + '</div>'
 
-        +   '<label class="block-label">Resolution analýza</label>'
-        +   '<div class="panel-muted">' + (m.autoDraft?.resolution || '') + '</div>'
+        +       '<label class="block-label">Typ edge</label>'
+        +       '<div class="panel-muted">' + (m.autoDraft?.edge || '') + '</div>'
 
-        +   '<label class="block-label">Invalidácia</label>'
-        +   '<div class="panel-muted">' + (m.autoDraft?.invalidation || '') + '</div>'
+        +       '<label class="block-label">Katalyzátor</label>'
+        +       '<div class="panel-muted">' + (m.autoDraft?.catalyst || '') + '</div>'
 
-        +   '<div class="action-row">'
-        +     '<button class="btn-primary" onclick="copyTradeLog()">Kopírovať trade-log šablónu</button>'
-        +     '<button onclick="downloadTradeLog()">Stiahnuť trade-log</button>'
+        +       '<label class="block-label">Resolution analýza</label>'
+        +       '<div class="panel-muted">' + (m.autoDraft?.resolution || '') + '</div>'
+
+        +       '<label class="block-label">Invalidácia</label>'
+        +       '<div class="panel-muted">' + (m.autoDraft?.invalidation || '') + '</div>'
+
+        +       '<div class="action-row">'
+        +         '<button class="btn-primary" onclick="copyTradeLog()">Kopírovať trade-log šablónu</button>'
+        +         '<button onclick="downloadTradeLog()">Stiahnuť trade-log</button>'
+        +       '</div>'
+
+        +       '<div class="saved-note" id="savedNote"></div>'
+        +     '</div>'
+
+        +     '<div class="detail-card">'
+        +       '<h3>Entry / Exit plán</h3>'
+        +       '<div class="draft-grid">'
+        +         '<div>Entry side</div><div>' + (m.executionPlan?.entrySide || '') + '</div>'
+        +         '<div>Limit</div><div>' + (m.executionPlan?.limitPrice ?? '') + '</div>'
+        +         '<div>Stake</div><div>' + (m.executionPlan?.stakeUSDC ?? 0) + ' USDC (' + (m.executionPlan?.stakePct || '0%') + ')</div>'
+        +         '<div>Tranche</div><div>' + (m.executionPlan?.tranche1USDC ?? 0) + ' / ' + (m.executionPlan?.tranche2USDC ?? 0) + ' / ' + (m.executionPlan?.tranche3USDC ?? 0) + ' USDC</div>'
+        +         '<div>TP1</div><div>' + (m.executionPlan?.takeProfit1 || '') + '</div>'
+        +         '<div>TP2</div><div>' + (m.executionPlan?.takeProfit2 || '') + '</div>'
+        +       '</div>'
+        +       '<div class="panel-muted">' + (m.executionPlan?.tp1Action || '') + '</div>'
+        +       '<div style="height:8px;"></div>'
+        +       '<div class="panel-muted">' + (m.executionPlan?.tp2Action || '') + '</div>'
+        +       '<label class="block-label">Runner rule</label>'
+        +       '<div class="panel-muted">' + (m.executionPlan?.runnerRule || '') + '</div>'
+        +       '<label class="block-label">Time-stop</label>'
+        +       '<div class="panel-muted">' + (m.executionPlan?.timeStop || '') + '</div>'
+        +       '<label class="block-label">Full exit trigger</label>'
+        +       '<div class="panel-muted">' + (m.executionPlan?.fullExitTrigger || '') + '</div>'
+        +     '</div>'
         +   '</div>'
-
-        +   '<div class="saved-note" id="savedNote"></div>'
-        + '</div>'
-
-        + '<div class="journal-box">'
-        +   '<h3>Entry / Exit plán</h3>'
-        +   '<div class="draft-grid">'
-        +     '<div>Entry side</div><div>' + (m.executionPlan?.entrySide || '') + '</div>'
-        +     '<div>Limit</div><div>' + (m.executionPlan?.limitPrice ?? '') + '</div>'
-        +     '<div>Stake</div><div>' + (m.executionPlan?.stakeUSDC ?? 0) + ' USDC (' + (m.executionPlan?.stakePct || '0%') + ')</div>'
-        +     '<div>Tranche</div><div>' + (m.executionPlan?.tranche1USDC ?? 0) + ' / ' + (m.executionPlan?.tranche2USDC ?? 0) + ' / ' + (m.executionPlan?.tranche3USDC ?? 0) + ' USDC</div>'
-        +     '<div>TP1</div><div>' + (m.executionPlan?.takeProfit1 || '') + '</div>'
-        +     '<div>TP2</div><div>' + (m.executionPlan?.takeProfit2 || '') + '</div>'
-        +   '</div>'
-        +   '<div class="panel-muted">' + (m.executionPlan?.tp1Action || '') + '</div>'
-        +   '<div style="height:8px;"></div>'
-        +   '<div class="panel-muted">' + (m.executionPlan?.tp2Action || '') + '</div>'
-        +   '<label class="block-label">Runner rule</label>'
-        +   '<div class="panel-muted">' + (m.executionPlan?.runnerRule || '') + '</div>'
-        +   '<label class="block-label">Time-stop</label>'
-        +   '<div class="panel-muted">' + (m.executionPlan?.timeStop || '') + '</div>'
-        +   '<label class="block-label">Full exit trigger</label>'
-        +   '<div class="panel-muted">' + (m.executionPlan?.fullExitTrigger || '') + '</div>'
         + '</div>';
     }
 
@@ -2509,7 +2428,6 @@ def dashboard():
         const data = await res.json();
 
         cachedMarkets = data.markets || [];
-        cachedNonSports = data.topNonSports || [];
         cachedWatchlist = data.watchlist || [];
 
         computeDeltaMap(cachedMarkets);
