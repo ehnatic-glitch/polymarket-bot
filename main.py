@@ -1630,6 +1630,37 @@ def wallet_history():
     })
 
 
+@app.route("/whale-flow")
+def whale_flow():
+    """Top whale obchody naprieč vsetkými Polymarket trhmi (independent na dashboard scoringu)."""
+    limit = safe_int(request.args.get("limit", "15"), 15)
+    min_amount = to_float(request.args.get("min_amount", str(APP_CONFIG["whale_trade_min_notional"])))
+    fetch_count = max(limit * 4, 60)
+
+    url = f"{DATA_API_BASE}/trades"
+    params = {
+        "limit": fetch_count,
+        "filterType": "CASH",
+        "filterAmount": min_amount,
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        rows = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
+        normalized = [normalize_trade_item(x) for x in rows]
+        normalized = [x for x in normalized if to_float(x.get("notional"), 0) >= min_amount]
+        normalized.sort(key=lambda x: to_float(x.get("notional"), 0), reverse=True)
+        return jsonify({
+            "count": len(normalized[:limit]),
+            "whaleMinNotional": min_amount,
+            "trades": normalized[:limit],
+        })
+    except Exception:
+        return jsonify({"count": 0, "trades": [], "whaleMinNotional": min_amount})
+
+
 @app.route("/markets")
 def markets():
     limit = safe_int(request.args.get("limit", "80"), 80)
@@ -1879,9 +1910,14 @@ def dashboard():
       </div>
     </div>
     <div class="section compact-section">
-      <h2>Whale / Flow signal</h2>
+      <h2>Whale / Flow signal <span class="small" style="font-weight:400;">— vybraný market</span></h2>
       <div id="whaleSignalBox" class="panel-muted compact-box">Vyber market v tabuľke pre zobrazenie whale obchodov.</div>
     </div>
+  </div>
+
+  <div class="section">
+    <h2>Globálny whale flow <span class="small" style="font-weight:400;">— top obchody naprieč Polymarket (independent na v6 filtri)</span></h2>
+    <div id="globalWhaleBox" class="panel-muted compact-box">Načítavam globálny whale flow...</div>
   </div>
 
   <div class="section">
@@ -2671,8 +2707,86 @@ def dashboard():
       }}
     }}
 
+    function renderGlobalWhaleFlow(payload) {{
+      const trades = (payload && payload.trades) || [];
+      if (trades.length === 0) {{
+        return '<div class="small">Zatiaľ žiadne whale obchody nad ' + Number((payload && payload.whaleMinNotional) || 0).toLocaleString('sk-SK') + ' USDC.</div>';
+      }}
+      let buyUSD = 0, sellUSD = 0, yesUSD = 0, noUSD = 0;
+      const marketTotals = new Map();
+      trades.forEach(function(t) {{
+        const usd = Number(t.notional || 0);
+        const side = String(t.side || '').toUpperCase();
+        const oc = String(t.outcome || '').toLowerCase();
+        if (side === 'BUY') buyUSD += usd; else if (side === 'SELL') sellUSD += usd;
+        if (oc.indexOf('yes') >= 0) yesUSD += usd;
+        else if (oc.indexOf('no') >= 0) noUSD += usd;
+        const key = t.title || t.slug || '—';
+        marketTotals.set(key, (marketTotals.get(key) || 0) + usd);
+      }});
+      const totalUSD = buyUSD + sellUSD;
+      const fmt = function(v) {{ return Number(v || 0).toLocaleString('sk-SK', {{maximumFractionDigits: 0}}); }};
+      const dominant = (buyUSD >= sellUSD)
+        ? ('BUY ' + Math.round(buyUSD / Math.max(totalUSD, 1) * 100) + '%')
+        : ('SELL ' + Math.round(sellUSD / Math.max(totalUSD, 1) * 100) + '%');
+      let topMarket = '—', topMarketUSD = 0;
+      marketTotals.forEach(function(v, k) {{ if (v > topMarketUSD) {{ topMarketUSD = v; topMarket = k; }} }});
+      const topMarketShort = topMarket.length > 60 ? topMarket.slice(0, 57) + '...' : topMarket;
+      const stats = ''
+        + '<div class="whale-stats">'
+        +   '<div><div class="stat-label">Počet whale obchodov</div><div class="stat-value">' + trades.length + '</div></div>'
+        +   '<div><div class="stat-label">Spolu USDC</div><div class="stat-value">' + fmt(totalUSD) + '</div></div>'
+        +   '<div><div class="stat-label">Dominantná strana</div><div class="stat-value">' + dominant + '</div></div>'
+        +   '<div><div class="stat-label">Top market (USDC)</div><div class="stat-value" style="font-size:12px;" title="' + topMarket.replace(/"/g, '&quot;') + '">' + topMarketShort + ' · ' + fmt(topMarketUSD) + '</div></div>'
+        + '</div>';
+      const header = ''
+        + '<div class="trade-line" style="font-weight:700; color:#555; border-bottom:2px solid #ddd;">'
+        +   '<div>Side</div>'
+        +   '<div>Trh / Otvoriť</div>'
+        +   '<div>Cena</div>'
+        +   '<div>Objem (akcie)</div>'
+        +   '<div>USDC spolu</div>'
+        +   '<div>Čas</div>'
+        + '</div>';
+      const rows = trades.map(function(t) {{
+        const side = String(t.side || '').toUpperCase();
+        const sideHtml = sideBadge(side);
+        const outcome = t.outcome || '';
+        const ts = t.timestamp ? new Date(Number(t.timestamp) * 1000) : null;
+        const tsText = ts ? fmtDateTime(ts) : (t.timestampIso || '');
+        const usd = Number(t.notional || 0);
+        const price = Number(t.price || 0);
+        const sizeShares = Number(t.size || 0);
+        const title = String(t.title || '').replace(/"/g, '&quot;');
+        const slug = t.slug || '';
+        const tradeUrl = slug ? ('https://polymarket.com/event/' + slug) : 'https://polymarket.com';
+        return ''
+          + '<div class="trade-line">'
+          +   '<div>' + sideHtml + ' <span class="trade-outcome">' + outcome + '</span></div>'
+          +   '<div class="trade-market" title="' + title + '"><a href="' + tradeUrl + '" target="_blank" rel="noopener">' + (title || slug || '—') + '</a></div>'
+          +   '<div>' + (Number.isFinite(price) ? price.toFixed(3) : '') + '</div>'
+          +   '<div>' + (Number.isFinite(sizeShares) ? sizeShares.toLocaleString('sk-SK', {{maximumFractionDigits: 0}}) : '') + '</div>'
+          +   '<div><strong>' + (Number.isFinite(usd) ? usd.toLocaleString('sk-SK', {{maximumFractionDigits: 0}}) : '0') + '</strong></div>'
+          +   '<div class="small">' + tsText + '</div>'
+          + '</div>';
+      }}).join('');
+      return stats + '<div class="trade-tape">' + header + rows + '</div>';
+    }}
+
+    async function loadGlobalWhaleFlow() {{
+      const box = document.getElementById('globalWhaleBox');
+      if (!box) return;
+      try {{
+        const res = await fetch('/whale-flow?limit=15');
+        const data = await res.json();
+        box.innerHTML = renderGlobalWhaleFlow(data);
+      }} catch (err) {{
+        box.innerHTML = '<div class="small">Nepodarilo sa načítať globálny whale flow: ' + err.message + '</div>';
+      }}
+    }}
+
     async function loadAll() {{
-      await loadMarkets();
+      await Promise.all([loadMarkets(), loadGlobalWhaleFlow()]);
     }}
 
     document.getElementById('refreshBtn')?.addEventListener('click', loadAll);
