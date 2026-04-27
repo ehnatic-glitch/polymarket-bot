@@ -2357,4 +2357,275 @@ def dashboard():
       }}
     }}
 
-    async function load
+    async function loadMarketTrades(slug) {{
+      if (!slug) {{
+        currentMarketTrades = [];
+        return;
+      }}
+      try {{
+        const res = await fetch('/market-trades?slug=' + encodeURIComponent(slug) + '&limit=20&min_amount=100');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        currentMarketTrades = data.trades || [];
+      }} catch (err) {{
+        currentMarketTrades = [];
+      }}
+    }}
+
+    async function loadWalletHistory(wallet) {{
+      if (!wallet) {{
+        selectedWalletHistory = null;
+        selectedWallet = null;
+        return;
+      }}
+      selectedWallet = wallet;
+      try {{
+        const res = await fetch('/wallet-history?wallet=' + encodeURIComponent(wallet) + '&limit=25&min_amount=100');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        selectedWalletHistory = data;
+      }} catch (err) {{
+        selectedWalletHistory = {{ wallet: wallet, trades: [], activity: [], positions: [] }};
+      }}
+      if (selectedMarket) {{
+        showDetail(selectedMarket);
+      }}
+    }}
+
+    function renderWhaleSignal(m) {{
+      const trades = currentMarketTrades || [];
+      if (trades.length === 0) {{
+        return '<div class="small">Zatiaľ žiadne whale obchody nad ' + getWhaleMin().toLocaleString('sk-SK') + '.</div>';
+      }}
+      const rows = trades.slice(0, 8).map(function(t) {{
+        const side = String(t.side || '').toUpperCase();
+        const sideHtml = sideBadge(side);
+        const ts = t.timestamp ? new Date(t.timestamp * 1000) : null;
+        const tsText = ts ? fmtDateTime(ts) : '';
+        const wallet = t.proxyWallet || t.wallet || '';
+        const walletShort = wallet ? (wallet.slice(0, 6) + '…' + wallet.slice(-4)) : '';
+        const usd = Number(t.usdcSize || t.amount || 0);
+        const price = Number(t.price || 0);
+        const sizeShares = Number(t.size || 0);
+        return ''
+          + '<div class="trade-line">'
+          +   '<div>' + sideHtml + ' ' + (t.outcome || '') + '</div>'
+          +   '<div>' + (Number.isFinite(price) ? price.toFixed(3) : '') + ' × ' + (Number.isFinite(sizeShares) ? sizeShares.toFixed(0) : '') + '</div>'
+          +   '<div><strong>' + (Number.isFinite(usd) ? usd.toLocaleString('sk-SK', {{maximumFractionDigits: 0}}) : '') + ' USDC</strong></div>'
+          +   '<div class="small mono leader-click" onclick="loadWalletHistory(\\'' + wallet + '\\')">' + walletShort + '</div>'
+          +   '<div class="small">' + tsText + '</div>'
+          + '</div>';
+      }}).join('');
+      return rows;
+    }}
+
+    function renderDeltaTracking(m) {{
+      const key = m.slug || m.question;
+      const delta = currentDeltaMap.get(key);
+      if (!delta || delta.summary.length === 0) return '<div class="small">Bez zmien oproti predošlému refreshu.</div>';
+      return '<div class="small">' + delta.summary.join(' &middot; ') + '</div>';
+    }}
+
+    function fmtPrice(v) {{
+      const n = Number(v);
+      if (!Number.isFinite(n)) return '';
+      return n.toFixed(3);
+    }}
+
+    function copyTradeLog() {{
+      const note = document.getElementById('savedNote');
+      if (!selectedMarket) return;
+      const text = (selectedMarket.question || '') + '\\n' + (selectedMarket.autoDraft?.finalDecision || '') + '\\nThesis: ' + (selectedMarket.autoDraft?.thesis || '');
+      navigator.clipboard.writeText(text).then(function() {{
+        if (note) {{ note.textContent = 'Trade-log skopírovaný.'; setTimeout(function(){{ note.textContent=''; }}, 2500); }}
+      }});
+    }}
+
+    function downloadTradeLog() {{
+      if (!selectedMarket) return;
+      const blob = new Blob([JSON.stringify(selectedMarket, null, 2)], {{type: 'application/json'}});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = (selectedMarket.slug || 'market') + '.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    }}
+
+    function showDetail(m) {{
+      selectedMarket = m;
+      const panel = document.getElementById('detailPanel');
+      if (!panel) return;
+      const tradeUrl = m.slug ? ('https://polymarket.com/event/' + m.slug) : 'https://polymarket.com';
+      panel.innerHTML = ''
+        + '<div class="detail-shell">'
+        +   '<div class="section">'
+        +     '<div class="title-row">'
+        +       '<div class="title-main">'
+        +         '<h3>' + (m.question || '') + '</h3>'
+        +         flagBadge(m.flagLabel)
+        +         ' ' + decisionBadge((m.autoDraft && m.autoDraft.finalDecision) || 'PASS')
+        +         ' ' + catBadge(m.categoryLabel || '')
+        +         ' <span class="small">Typ: ' + (m.tradeTypeLabel || '') + '</span>'
+        +         ' <span class="small">Gate: ' + (Number.isFinite(Number(m.gateScore)) ? m.gateScore : '') + '/6</span>'
+        +       '</div>'
+        +       '<a class="trade-link" href="' + tradeUrl + '" target="_blank" rel="noopener noreferrer">Otvoriť trade</a>'
+        +     '</div>'
+        +     '<div class="detail-top">'
+        +       '<div class="panel-muted">'
+        +         '<div class="draft-grid">'
+        +           '<div>Entry zóna</div><div>' + zoneBadge(m.entryZone) + '</div>'
+        +           '<div>Cluster</div><div>' + (m.cluster || '') + '</div>'
+        +           '<div>Fail point</div><div>' + (m.failPoint || '') + '</div>'
+        +           '<div>Sizing cap</div><div>' + (m.sizingCap || '') + '</div>'
+        +           '<div>Why now</div><div>' + (m.whyNow || '') + '</div>'
+        +         '</div>'
+        +       '</div>'
+        +       '<div><h3>Delta tracking</h3>' + renderDeltaTracking(m) + '</div>'
+        +     '</div>'
+        +   '</div>'
+        +   '<div class="detail-grid">'
+        +     '<div class="detail-card"><h3>Mini 6/6 checklist</h3>' + renderChecklist(m.checklist || {{}}) + '</div>'
+        +     '<div class="detail-card">'
+        +       '<h3>Systémový draft</h3>'
+        +       '<div class="draft-grid">'
+        +         '<div>Bias</div><div>' + ((m.autoDraft && m.autoDraft.bias) || '') + '</div>'
+        +         '<div>Rozhodnutie</div><div><strong>' + ((m.autoDraft && m.autoDraft.finalDecision) || '') + '</strong></div>'
+        +         '<div>Confidence</div><div>' + ((m.autoDraft && m.autoDraft.confidence) || '') + '/10</div>'
+        +         '<div>Sizing hint</div><div>' + ((m.autoDraft && m.autoDraft.sizingHint) || '') + '</div>'
+        +       '</div>'
+        +       '<label class="block-label">Téza</label><div class="panel-muted">' + ((m.autoDraft && m.autoDraft.thesis) || '') + '</div>'
+        +       '<label class="block-label">Mispricing</label><div class="panel-muted">' + ((m.autoDraft && m.autoDraft.mispricing) || '') + '</div>'
+        +       '<label class="block-label">Edge</label><div class="panel-muted">' + ((m.autoDraft && m.autoDraft.edge) || '') + '</div>'
+        +       '<label class="block-label">Catalyst</label><div class="panel-muted">' + ((m.autoDraft && m.autoDraft.catalyst) || '') + '</div>'
+        +       '<label class="block-label">Resolution</label><div class="panel-muted">' + ((m.autoDraft && m.autoDraft.resolution) || '') + '</div>'
+        +       '<label class="block-label">Invalidácia</label><div class="panel-muted">' + ((m.autoDraft && m.autoDraft.invalidation) || '') + '</div>'
+        +       '<div class="action-row"><button class="btn-primary" onclick="copyTradeLog()">Kopírovať trade-log</button> <button onclick="downloadTradeLog()">Stiahnuť</button></div>'
+        +       '<div class="saved-note" id="savedNote"></div>'
+        +     '</div>'
+        +     '<div class="detail-card">'
+        +       '<h3>Entry / Exit plán</h3>'
+        +       '<div class="draft-grid">'
+        +         '<div>Entry side</div><div>' + ((m.executionPlan && m.executionPlan.entrySide) || '') + '</div>'
+        +         '<div>Limit</div><div>' + fmtPrice(m.executionPlan && m.executionPlan.limitPrice) + '</div>'
+        +         '<div>Stake</div><div>' + ((m.executionPlan && m.executionPlan.stakeUSDC) || 0) + ' USDC (' + ((m.executionPlan && m.executionPlan.stakePct) || '0%') + ')</div>'
+        +         '<div>Tranche</div><div>' + ((m.executionPlan && m.executionPlan.tranche1USDC) || 0) + ' / ' + ((m.executionPlan && m.executionPlan.tranche2USDC) || 0) + ' / ' + ((m.executionPlan && m.executionPlan.tranche3USDC) || 0) + '</div>'
+        +         '<div>TP1</div><div>' + ((m.executionPlan && m.executionPlan.takeProfit1) || '') + '</div>'
+        +         '<div>TP2</div><div>' + ((m.executionPlan && m.executionPlan.takeProfit2) || '') + '</div>'
+        +       '</div>'
+        +       '<div class="panel-muted">' + ((m.executionPlan && m.executionPlan.tp1Action) || '') + '</div>'
+        +       '<div class="panel-muted">' + ((m.executionPlan && m.executionPlan.tp2Action) || '') + '</div>'
+        +       '<label class="block-label">Runner rule</label><div class="panel-muted">' + ((m.executionPlan && m.executionPlan.runnerRule) || '') + '</div>'
+        +       '<label class="block-label">Time-stop</label><div class="panel-muted">' + ((m.executionPlan && m.executionPlan.timeStop) || '') + '</div>'
+        +       '<label class="block-label">Full exit trigger</label><div class="panel-muted">' + ((m.executionPlan && m.executionPlan.fullExitTrigger) || '') + '</div>'
+        +     '</div>'
+        +     '<div class="detail-card"><h3>Whale / Flow signal</h3>' + renderWhaleSignal(m) + '</div>'
+        +   '</div>'
+        + '</div>';
+    }}
+
+    function renderTable(markets) {{
+      const tbody = document.querySelector('#markets-table tbody');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+      markets.forEach(function(m) {{
+        const tr = document.createElement('tr');
+        tr.className = 'clickable';
+        tr.innerHTML = ''
+          + '<td>' + flagBadge(m.flagLabel) + '</td>'
+          + '<td>' + decisionBadge((m.autoDraft && m.autoDraft.finalDecision) || 'PASS') + '</td>'
+          + '<td>' + zoneBadge(m.entryZone) + '</td>'
+          + '<td>' + (Number.isFinite(Number(m.gateScore)) ? m.gateScore : '') + '/6</td>'
+          + '<td>' + (Number.isFinite(Number(m.candidateScore)) ? m.candidateScore : '') + '</td>'
+          + '<td>' + (m.frictionLabelSk || '') + '</td>'
+          + '<td>' + (m.exitLabelSk || '') + '</td>'
+          + '<td>' + (m.tradeTypeLabel || '') + '</td>'
+          + '<td>' + catBadge(m.categoryLabel || '') + '</td>'
+          + '<td>' + oracleBadge(m.oracleRiskLabel || '') + '</td>'
+          + '<td class="question-cell"><div class="question-truncate">' + (m.question || '') + '</div></td>'
+          + '<td>' + fmtPrice(m.yesPrice) + '</td>'
+          + '<td>' + fmtPrice(m.noPrice) + '</td>'
+          + '<td>' + fmtInt(m.volume24hr) + '</td>'
+          + '<td>' + fmtInt(m.liquidity) + '</td>'
+          + '<td>' + fmtDays(m.daysToEnd) + '</td>';
+        tr.addEventListener('click', function() {{
+          loadMarketTrades(m.slug).then(function() {{ showDetail(m); }});
+        }});
+        tbody.appendChild(tr);
+      }});
+      if (markets.length > 0 && !selectedMarket) {{
+        loadMarketTrades(markets[0].slug).then(function() {{ showDetail(markets[0]); }});
+      }} else if (markets.length > 0 && selectedMarket) {{
+        const found = markets.find(function(x) {{ return x.slug === selectedMarket.slug; }});
+        if (found) showDetail(found);
+      }}
+    }}
+
+    async function loadLeaderboard() {{
+      try {{
+        const res = await fetch('/leaderboard?limit=8');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        cachedLeaders = data.leaders || [];
+      }} catch (err) {{
+        cachedLeaders = [];
+      }}
+      renderLeaderboard();
+    }}
+
+    async function loadMarkets() {{
+      const errorBox = document.getElementById('markets-error');
+      if (errorBox) {{ errorBox.style.display = 'none'; errorBox.textContent = ''; }}
+      const category = document.getElementById('category')?.value || '';
+      const minLiquidity = document.getElementById('minLiquidity')?.value || '';
+      const hidePass = document.getElementById('hidePass')?.checked || false;
+      const diversify = document.getElementById('diversify')?.checked || false;
+      const watchlistOnly = document.getElementById('watchlistOnly')?.checked || false;
+      const strictMode = document.getElementById('strictMode')?.checked || false;
+      updateStatusLine();
+      const params = new URLSearchParams({{
+        limit: '80',
+        min_liquidity: minLiquidity,
+        hide_pass: hidePass ? 'true' : 'false',
+        diversify: diversify ? 'true' : 'false',
+        watchlist_only: watchlistOnly ? 'true' : 'false',
+        strict_mode: strictMode ? 'true' : 'false'
+      }});
+      if (category) params.set('category', category);
+      try {{
+        const res = await fetch('/markets?' + params.toString());
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        cachedMarkets = data.markets || [];
+        cachedWatchlist = data.watchlist || [];
+        computeDeltaMap(cachedMarkets);
+        renderWatchlist();
+        renderAlerts();
+        renderTable(cachedMarkets);
+        const countBox = document.getElementById('countBox');
+        if (countBox) countBox.textContent = 'Zobrazené markety: ' + (data.count || 0);
+        lastRefreshAt = new Date();
+        updateStatusLine();
+      }} catch (err) {{
+        if (errorBox) {{ errorBox.style.display = 'block'; errorBox.textContent = 'Nepodarilo sa načítať markety: ' + err.message; }}
+      }}
+    }}
+
+    async function loadAll() {{
+      await Promise.all([loadLeaderboard(), loadMarkets()]);
+    }}
+
+    document.getElementById('refreshBtn')?.addEventListener('click', loadAll);
+    document.getElementById('strictMode')?.addEventListener('change', function() {{ updateStatusLine(); }});
+
+    loadAll();
+    scheduleNextRefresh();
+  </script>
+</body>
+</html>
+"""
+    return html
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
