@@ -2408,8 +2408,16 @@ def dashboard():
 
     function renderWhaleSignal(m) {{
       const trades = currentMarketTrades || [];
+      const marketTitle = (m && m.question) || '';
+      const slug = (m && m.slug) || '';
+      const tradeUrl = slug ? ('https://polymarket.com/event/' + slug) : 'https://polymarket.com';
+      const titleBar = ''
+        + '<div style="display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin-bottom:8px; padding-bottom:6px; border-bottom:1px solid #eee;">'
+        +   '<div><strong>Trh:</strong> ' + (marketTitle || '—') + '</div>'
+        +   (slug ? ('<a href="' + tradeUrl + '" target="_blank" rel="noopener" class="small">Otvoriť na Polymarket ↗</a>') : '')
+        + '</div>';
       if (trades.length === 0) {{
-        return '<div class="small">Zatiaľ žiadne whale obchody nad ' + getWhaleMin().toLocaleString('sk-SK') + '.</div>';
+        return titleBar + '<div class="small">Zatiaľ žiadne whale obchody nad ' + getWhaleMin().toLocaleString('sk-SK') + '.</div>';
       }}
       const header = ''
         + '<div class="trade-line" style="font-weight:700; color:#555; border-bottom:2px solid #ddd;">'
@@ -2440,7 +2448,7 @@ def dashboard():
           +   '<div class="small">' + tsText + '</div>'
           + '</div>';
       }}).join('');
-      return '<div class="trade-tape">' + header + rows + '</div>';
+      return titleBar + '<div class="trade-tape">' + header + rows + '</div>';
     }}
 
     function renderDeltaTracking(m) {{
