@@ -1750,7 +1750,7 @@ def dashboard():
     .header-left .small {{ margin: 0; }}
     .header-right {{ display: flex; justify-content: flex-end; }}
     .status-card {{ width: 100%; font-size: 12px; color: #555; background: #ffffff; border: 1px solid #e8e8e8; border-radius: 8px; padding: 10px 12px; line-height: 1.45; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
-    .top-strip {{ display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(250px, 0.7fr) minmax(280px, 0.8fr); gap: 12px; margin-bottom: 14px; align-items: start; }}
+    .top-strip {{ display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(180px, 0.45fr) minmax(340px, 1.1fr); gap: 12px; margin-bottom: 14px; align-items: start; }}
     .compact-section {{ padding: 12px; }}
     .compact-box {{ padding: 8px 10px; font-size: 12px; line-height: 1.4; }}
     .controls {{ display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; align-items: end; }}
@@ -1821,7 +1821,10 @@ def dashboard():
     .detail-grid {{ display: grid; grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.35fr) minmax(300px, 1fr) minmax(260px, 0.9fr); gap: 14px; align-items: start; }}
     .detail-card {{ background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); padding: 14px; min-height: 100%; }}
     .trade-tape {{ display: grid; gap: 6px; }}
-    .trade-line {{ display: grid; grid-template-columns: 86px 100px 80px 90px 1fr; gap: 8px; align-items: center; padding: 7px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; }}
+    .trade-line {{ display: grid; grid-template-columns: 90px 1fr 110px 110px 90px 90px; gap: 8px; align-items: center; padding: 7px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; }}
+    .trade-line .trade-market {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .leader-line {{ grid-template-columns: 20px 1fr 90px auto !important; }}
+    .leader-line .leader-meta {{ font-size: 11px; color: #777; }}
     .trade-line:last-child {{ border-bottom: none; }}
     .trade-side-buy {{ color: #137333; font-weight: 700; }}
     .trade-side-sell {{ color: #c5221f; font-weight: 700; }}
@@ -2335,15 +2338,24 @@ def dashboard():
         return;
       }}
 
-      box.innerHTML = cachedLeaders.slice(0, 5).map(function(row, idx) {{
+      box.innerHTML = cachedLeaders.slice(0, 10).map(function(row, idx) {{
         const wallet = row.wallet || '';
+        const profit = Number(row.profit || 0);
+        const volume = Number(row.volume || 0);
+        const polyUrl = wallet ? ('https://polymarket.com/profile/' + wallet) : '#';
+        const volText = volume > 0 ? ('Vol: ' + volume.toLocaleString('sk-SK', {{maximumFractionDigits: 0}})) : '';
         return ''
-          + '<div class="leader-line leader-click" onclick="loadWalletHistory(\\'' + escapeHtml(wallet) + '\\')">'
+          + '<div class="leader-line">'
           +   '<div><strong>' + (idx + 1) + '.</strong></div>'
-          +   '<div><strong>' + escapeHtml(row.name || 'unknown') + '</strong><br><span class="small mono">' + escapeHtml(row.walletShort || '') + '</span></div>'
-          +   '<div><span class="' + ((Number(row.profit) >= 0) ? 'delta-up' : 'delta-down') + '">' + fmtPnL(row.profit) + '</span></div>'
+          +   '<div class="leader-click" onclick="loadWalletHistory(\\'' + escapeHtml(wallet) + '\\')">'
+          +     '<strong>' + escapeHtml(row.name || 'unknown') + '</strong>'
+          +     '<br><span class="small mono">' + escapeHtml(row.walletShort || '') + '</span>'
+          +     (volText ? ' <span class="leader-meta">· ' + volText + '</span>' : '')
+          +   '</div>'
+          +   '<div><span class="' + ((profit >= 0) ? 'delta-up' : 'delta-down') + '">' + fmtPnL(profit) + '</span></div>'
+          +   '<div><a href="' + polyUrl + '" target="_blank" rel="noopener" class="small" title="Profil na Polymarket">profil</a></div>'
           + '</div>';
-      }}).join('') + '<div class="small" style="margin-top:6px;">Klik na wallet otvorí whale history. Dashboard filtruje len veľké pohyby nad ' + getWhaleMin().toLocaleString('sk-SK') + '.</div>';
+      }}).join('') + '<div class="small" style="margin-top:6px;">Klik na meno otvorí whale history. „profil“ → Polymarket. Whale filter: ' + getWhaleMin().toLocaleString('sk-SK') + '+.</div>';
     }}
 
     function selectWatchlistItem(slug) {{
@@ -2397,26 +2409,40 @@ def dashboard():
       if (trades.length === 0) {{
         return '<div class="small">Zatiaľ žiadne whale obchody nad ' + getWhaleMin().toLocaleString('sk-SK') + '.</div>';
       }}
-      const rows = trades.slice(0, 8).map(function(t) {{
+      const header = ''
+        + '<div class="trade-line" style="font-weight:700; color:#555; border-bottom:2px solid #ddd;">'
+        +   '<div>Side</div>'
+        +   '<div>Trh / Otvoriť</div>'
+        +   '<div>Cena × Size</div>'
+        +   '<div>USDC</div>'
+        +   '<div>Wallet</div>'
+        +   '<div>Čas</div>'
+        + '</div>';
+      const rows = trades.slice(0, 10).map(function(t) {{
         const side = String(t.side || '').toUpperCase();
         const sideHtml = sideBadge(side);
-        const ts = t.timestamp ? new Date(t.timestamp * 1000) : null;
-        const tsText = ts ? fmtDateTime(ts) : '';
-        const wallet = t.proxyWallet || t.wallet || '';
-        const walletShort = wallet ? (wallet.slice(0, 6) + '…' + wallet.slice(-4)) : '';
-        const usd = Number(t.usdcSize || t.amount || 0);
+        const outcome = t.outcome || '';
+        const ts = t.timestamp ? new Date(Number(t.timestamp) * 1000) : null;
+        const tsText = ts ? fmtDateTime(ts) : (t.timestampIso || '');
+        const wallet = t.wallet || '';
+        const walletShort = t.walletShort || (wallet ? (wallet.slice(0, 6) + '…' + wallet.slice(-4)) : '');
+        const usd = Number(t.notional || 0);
         const price = Number(t.price || 0);
         const sizeShares = Number(t.size || 0);
+        const title = String(t.title || m.question || '').replace(/"/g, '&quot;');
+        const slug = t.slug || m.slug || '';
+        const tradeUrl = slug ? ('https://polymarket.com/event/' + slug) : 'https://polymarket.com';
         return ''
           + '<div class="trade-line">'
-          +   '<div>' + sideHtml + ' ' + (t.outcome || '') + '</div>'
-          +   '<div>' + (Number.isFinite(price) ? price.toFixed(3) : '') + ' × ' + (Number.isFinite(sizeShares) ? sizeShares.toFixed(0) : '') + '</div>'
-          +   '<div><strong>' + (Number.isFinite(usd) ? usd.toLocaleString('sk-SK', {{maximumFractionDigits: 0}}) : '') + ' USDC</strong></div>'
+          +   '<div>' + sideHtml + ' <span class="trade-outcome">' + outcome + '</span></div>'
+          +   '<div class="trade-market" title="' + title + '"><a href="' + tradeUrl + '" target="_blank" rel="noopener">' + (title || slug || '—') + '</a></div>'
+          +   '<div>' + (Number.isFinite(price) ? price.toFixed(3) : '') + ' × ' + (Number.isFinite(sizeShares) ? sizeShares.toLocaleString('sk-SK', {{maximumFractionDigits: 0}}) : '') + '</div>'
+          +   '<div><strong>' + (Number.isFinite(usd) ? usd.toLocaleString('sk-SK', {{maximumFractionDigits: 0}}) : '0') + '</strong></div>'
           +   '<div class="small mono leader-click" onclick="loadWalletHistory(\\'' + wallet + '\\')">' + walletShort + '</div>'
           +   '<div class="small">' + tsText + '</div>'
           + '</div>';
       }}).join('');
-      return rows;
+      return '<div class="trade-tape">' + header + rows + '</div>';
     }}
 
     function renderDeltaTracking(m) {{
@@ -2563,7 +2589,7 @@ def dashboard():
 
     async function loadLeaderboard() {{
       try {{
-        const res = await fetch('/leaderboard?limit=8');
+        const res = await fetch('/leaderboard?limit=12');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         cachedLeaders = data.leaders || [];
