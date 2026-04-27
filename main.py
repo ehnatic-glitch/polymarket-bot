@@ -1,11 +1,89 @@
 from flask import Flask, jsonify, request
 import requests
 import json
+import os
 import re
+import time
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 
 app = Flask(__name__)
+
+# ---- jednoduchá in-memory cache (per-process, stačí pre Render single dyno) ----
+_CACHE = {}
+_CACHE_LOCK = threading.Lock()
+
+def cache_get(namespace, key):
+    full_key = (namespace, key)
+    now = time.time()
+    with _CACHE_LOCK:
+        entry = _CACHE.get(full_key)
+        if entry and entry["expires"] > now:
+            return entry["value"]
+        if entry:
+            _CACHE.pop(full_key, None)
+    return None
+
+def cache_set(namespace, key, value, ttl=60):
+    full_key = (namespace, key)
+    with _CACHE_LOCK:
+        _CACHE[full_key] = {"value": value, "expires": time.time() + ttl}
+
+def cache_invalidate(namespace=None):
+    with _CACHE_LOCK:
+        if namespace is None:
+            _CACHE.clear()
+        else:
+            for k in list(_CACHE.keys()):
+                if k[0] == namespace:
+                    _CACHE.pop(k, None)
+
+# ---- JSON persistence (alerts, watchlist snapshot, pnl log) ----
+STATE_DIR = os.environ.get("STATE_DIR", "/tmp/polymarket_state")
+os.makedirs(STATE_DIR, exist_ok=True)
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+PNL_LOG_FILE = os.path.join(STATE_DIR, "pnl_log.jsonl")
+_STATE_LOCK = threading.Lock()
+
+def load_state():
+    with _STATE_LOCK:
+        if not os.path.exists(STATE_FILE):
+            return {"alerts": [], "watchlistSnapshot": [], "updatedAt": None}
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {"alerts": [], "watchlistSnapshot": [], "updatedAt": None}
+
+def save_state(state):
+    state["updatedAt"] = datetime.now(timezone.utc).isoformat()
+    with _STATE_LOCK:
+        try:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+def append_pnl_log(entry):
+    entry["loggedAt"] = datetime.now(timezone.utc).isoformat()
+    with _STATE_LOCK:
+        try:
+            with open(PNL_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+def read_pnl_log(limit=100):
+    with _STATE_LOCK:
+        if not os.path.exists(PNL_LOG_FILE):
+            return []
+        try:
+            with open(PNL_LOG_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()[-limit:]
+            return [json.loads(line) for line in lines if line.strip()]
+        except Exception:
+            return []
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 DATA_API_BASE = "https://data-api.polymarket.com"
@@ -275,20 +353,35 @@ def detect_trade_type(question, yes_price, days_to_end):
     return "Other"
 
 
-def oracle_risk_level(question):
+def oracle_risk_level(question, resolution_source=None, description=None):
+    """Oracle riziko z otazky + resolutionSource + description.
+
+    Penalizuje subjektívne resolution sources (e.g. discretion, judges, twitter feed),
+    bonusuje dôveryhodné (oficialne UMA, named auth., chain data).
+    """
     q = (question or "").lower()
+    src = (resolution_source or "").lower()
+    desc = (description or "").lower()
+    combined = f"{q} || {src} || {desc}"
+
     high_risk_keywords = [
         "good faith", "sole discretion", "official sources only",
-        "materially", "substantially", "at any time"
+        "materially", "substantially", "at any time",
+        "subjective", "judges discretion", "poly admin",
     ]
     medium_risk_keywords = [
         "called by", "out by", "military clash", "any country leave",
-        "official sources"
+        "official sources", "twitter", "social media", "news report",
+    ]
+    low_risk_signals = [
+        "uma optimistic oracle", "on-chain", "smart contract",
+        "official api", "federal reserve", "fomc",
+        "bls", "sec filing", "fifa", "nba.com", "espn",
     ]
 
-    if any(k in q for k in high_risk_keywords):
+    if any(k in combined for k in high_risk_keywords):
         return "High"
-    if any(k in q for k in medium_risk_keywords):
+    if any(k in combined for k in medium_risk_keywords) and not any(k in combined for k in low_risk_signals):
         return "Medium"
     return "Low"
 
@@ -443,7 +536,7 @@ def exit_score(liquidity, volume24hr, yes_price, days_to_end):
     return score, label, notes
 
 
-def decision_bias(flag, yes_price, oracle_risk, trade_type, gate_score, fr_score, ex_score):
+def decision_bias(flag, yes_price, oracle_risk, trade_type, gate_score, fr_score, ex_score, category=None):
     if flag == "PASS":
         return "No trade", "PASS"
 
@@ -453,20 +546,30 @@ def decision_bias(flag, yes_price, oracle_risk, trade_type, gate_score, fr_score
     if oracle_risk == "High":
         return "No trade", "PASS"
 
+    # v6 fix: pri sportoch a narrative nikdy negenerujeme BUY signál — max WATCH/lean,
+    # lebo kategória je už penalizovaná a centovky tu väčšinou nie sú edge, len lottery ticket.
+    sport_or_narrative = category in ("Sports", "Narrative")
+
     if yes_price < 0.15:
         if gate_score >= 5 and fr_score >= 3 and ex_score >= 2 and trade_type == "Centovka":
+            if sport_or_narrative:
+                return "Lean YES (watch)", "PASS"
             return "Lean YES", "BUY YES"
+        if sport_or_narrative:
+            return "Lean NO (watch)", "PASS"
         return "Lean NO", "BUY NO"
 
     if yes_price > 0.85:
+        if sport_or_narrative:
+            return "Lean NO (watch)", "PASS"
         return "Lean NO", "BUY NO"
 
     if 0.15 <= yes_price <= 0.45:
-        if flag == "WATCH" and gate_score >= 5:
+        if flag == "WATCH" and gate_score >= 5 and not sport_or_narrative:
             return "Lean YES", "BUY YES"
 
     if 0.55 <= yes_price <= 0.85:
-        if flag == "WATCH" and gate_score >= 5:
+        if flag == "WATCH" and gate_score >= 5 and not sport_or_narrative:
             return "Lean NO", "BUY NO"
 
     return "No trade", "PASS"
@@ -705,6 +808,7 @@ def build_auto_draft(question, category, trade_type, yes_price, no_price, days_t
         gate_score=gate_score,
         fr_score=fr_score,
         ex_score=ex_score,
+        category=category,
     )
 
     if flag == "PASS":
@@ -882,7 +986,11 @@ def score_market(m, strict_mode=False):
     question = raw_question.lower()
     category = categorize_market(raw_question)
     end_date = parse_date(m.get("endDate"))
-    oracle_risk = oracle_risk_level(raw_question)
+    oracle_risk = oracle_risk_level(
+        raw_question,
+        resolution_source=m.get("resolutionSource") or m.get("resolution_source"),
+        description=m.get("description"),
+    )
 
     now = datetime.now(timezone.utc)
     days_to_end = None
@@ -1127,7 +1235,8 @@ def score_market(m, strict_mode=False):
     is_watchlist = (
         auto_draft["finalDecision"] in ["BUY YES", "BUY NO"] or
         flag == "WATCH" or
-        entry_zone["code"] in ["entry", "near"]
+        entry_zone["code"] in ["entry", "near"] or
+        (gate_score >= 5 and flag in ["WATCH", "REVIEW"])
     )
 
     whale_signal = build_whale_signal(
@@ -1305,7 +1414,11 @@ def top_non_sports(rows, limit=3):
     return non_sports[:limit]
 
 
-def build_watchlist(rows, limit=12):
+def build_watchlist(rows, limit=12, max_per_category=None):
+    """Watchlist s per-kategória stropom — default max 3 sport, 2 narrative,
+    aby zoznam neovládla jedna kategória (v praxi WC tituly)."""
+    if max_per_category is None:
+        max_per_category = {"Sports": 3, "Narrative": 2}
     watch = [r for r in rows if r.get("isWatchlist")]
     watch.sort(
         key=lambda x: (
@@ -1316,7 +1429,27 @@ def build_watchlist(rows, limit=12):
             -to_float(x.get("candidateScore")),
         )
     )
-    return watch[:limit]
+    out = []
+    cat_counts = defaultdict(int)
+    for r in watch:
+        cat = r.get("category") or ""
+        cap = max_per_category.get(cat)
+        if cap is not None and cat_counts[cat] >= cap:
+            continue
+        out.append(r)
+        cat_counts[cat] += 1
+        if len(out) >= limit:
+            break
+    # Ak po kategorizácii bolo málo výsledkov, doplni zvyškom (iž nad cap), aby UI nebolo prázdne
+    if len(out) < limit:
+        seen = {id(r) for r in out}
+        for r in watch:
+            if id(r) in seen:
+                continue
+            out.append(r)
+            if len(out) >= limit:
+                break
+    return out
 
 
 def extract_market_condition_ids(market):
@@ -1630,12 +1763,58 @@ def wallet_history():
     })
 
 
+@app.route("/state", methods=["GET"])
+def state_get():
+    return jsonify(load_state())
+
+
+@app.route("/state", methods=["POST"])
+def state_post():
+    """Uloží alerts/watchlistSnapshot — jednoduchá perzistencia, prepisom celého payloadu."""
+    payload = request.get_json(force=True, silent=True) or {}
+    state = load_state()
+    if "alerts" in payload and isinstance(payload["alerts"], list):
+        state["alerts"] = payload["alerts"][:200]
+    if "watchlistSnapshot" in payload and isinstance(payload["watchlistSnapshot"], list):
+        state["watchlistSnapshot"] = payload["watchlistSnapshot"][:50]
+    save_state(state)
+    return jsonify(state)
+
+
+@app.route("/pnl-log", methods=["GET"])
+def pnl_log_get():
+    limit = safe_int(request.args.get("limit", "100"), 100)
+    return jsonify({"entries": read_pnl_log(limit=limit)})
+
+
+@app.route("/pnl-log", methods=["POST"])
+def pnl_log_post():
+    """Append-only záznam pri kliknutí Otvoriť trade alebo manuálne logovanie pnł entry/exit.
+    payload: {kind: 'open'|'close'|'note', slug, question, side, price, size, usdc, pnl, note}
+    """
+    payload = request.get_json(force=True, silent=True) or {}
+    if not isinstance(payload, dict) or not payload.get("slug") and not payload.get("question"):
+        return jsonify({"ok": False, "error": "missing slug/question"}), 400
+    append_pnl_log(payload)
+    return jsonify({"ok": True})
+
+
 @app.route("/whale-flow")
 def whale_flow():
-    """Top whale obchody naprieč vsetkými Polymarket trhmi (independent na dashboard scoringu)."""
+    """Top whale obchody naprieč vsetkými Polymarket trhmi (independent na dashboard scoringu).
+
+    Defaultne filtruje "settle" obchody (cena <0.05 alebo >0.95) — tých je väčšina všetky
+    sú zatváranie pozicií pred resolútion, nie predictive signál. Pomocou ?include_settles=true
+    sa dajú pridat spät.
+    """
     limit = safe_int(request.args.get("limit", "15"), 15)
     min_amount = to_float(request.args.get("min_amount", str(APP_CONFIG["whale_trade_min_notional"])))
-    fetch_count = max(limit * 4, 60)
+    include_settles = request.args.get("include_settles", "false").lower() == "true"
+    fetch_count = max(limit * 6, 80)
+
+    cached = cache_get("whale_flow", (limit, min_amount, include_settles))
+    if cached is not None:
+        return jsonify(cached)
 
     url = f"{DATA_API_BASE}/trades"
     params = {
@@ -1651,14 +1830,19 @@ def whale_flow():
         rows = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
         normalized = [normalize_trade_item(x) for x in rows]
         normalized = [x for x in normalized if to_float(x.get("notional"), 0) >= min_amount]
+        if not include_settles:
+            normalized = [x for x in normalized if 0.05 <= to_float(x.get("price"), 0) <= 0.95]
         normalized.sort(key=lambda x: to_float(x.get("notional"), 0), reverse=True)
-        return jsonify({
+        result = {
             "count": len(normalized[:limit]),
             "whaleMinNotional": min_amount,
+            "includeSettles": include_settles,
             "trades": normalized[:limit],
-        })
+        }
+        cache_set("whale_flow", (limit, min_amount, include_settles), result, ttl=30)
+        return jsonify(result)
     except Exception:
-        return jsonify({"count": 0, "trades": [], "whaleMinNotional": min_amount})
+        return jsonify({"count": 0, "trades": [], "whaleMinNotional": min_amount, "includeSettles": include_settles})
 
 
 @app.route("/markets")
@@ -1681,11 +1865,16 @@ def markets():
         "closed": closed,
     }
 
-    url = f"{GAMMA_BASE}/markets"
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    cache_key_gamma = ("gamma_markets", strict_mode)
+    data = cache_get("gamma", cache_key_gamma)
+    if data is None:
+        url = f"{GAMMA_BASE}/markets"
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        cache_set("gamma", cache_key_gamma, data, ttl=60)
 
+    all_rows = []  # bez hide_pass / category filtra — používame na watchlist
     rows = []
     for m in data:
         if m.get("active") is not True:
@@ -1697,6 +1886,9 @@ def markets():
 
         if to_float(row.get("liquidity")) < min_liquidity:
             continue
+
+        all_rows.append(row)
+
         if hide_pass and row.get("autoDraft", {}).get("finalDecision") == "PASS":
             continue
         if category_filter and row.get("category") != category_filter:
@@ -1727,8 +1919,8 @@ def markets():
     )
 
     diversified_rows = diversified_rows[:limit]
-    alt_non_sports = top_non_sports(rows, limit=3)
-    watchlist = build_watchlist(rows, limit=12)
+    alt_non_sports = top_non_sports(all_rows, limit=3)
+    watchlist = build_watchlist(all_rows, limit=12)
 
     return jsonify({
         "count": len(diversified_rows),
@@ -1917,6 +2109,21 @@ def dashboard():
 
   <div class="section">
     <h2>Globálny whale flow <span class="small" style="font-weight:400;">— top obchody naprieč Polymarket (independent na v6 filtri)</span></h2>
+    <div class="controls" style="margin-bottom:8px;">
+      <div class="control">
+        <label for="whaleMinAmount">Min USDC</label>
+        <select id="whaleMinAmount">
+          <option value="100000">100 000</option>
+          <option value="200000" selected>200 000</option>
+          <option value="500000">500 000</option>
+          <option value="1000000">1 000 000</option>
+        </select>
+      </div>
+      <div class="control" style="display:flex;align-items:center;gap:6px;">
+        <input type="checkbox" id="includeSettles" />
+        <label for="includeSettles">Vrátane settle obchodov (cena &lt;0.05 alebo &gt;0.95)</label>
+      </div>
+    </div>
     <div id="globalWhaleBox" class="panel-muted compact-box">Načítavam globálny whale flow...</div>
   </div>
 
@@ -2527,6 +2734,47 @@ def dashboard():
       return n.toFixed(3);
     }}
 
+    async function logTrade(kind) {{
+      if (!selectedMarket) return;
+      const note = document.getElementById('savedNote');
+      const ad = selectedMarket.autoDraft || {{}};
+      const ep = selectedMarket.executionPlan || {{}};
+      const payload = {{
+        kind: kind,
+        slug: selectedMarket.slug,
+        question: selectedMarket.question,
+        category: selectedMarket.categoryLabel,
+        side: ad.finalDecision,
+        limitPrice: ep.limitPrice,
+        stakeUSDC: ep.stakeUSDC,
+        gateScore: selectedMarket.gateScore,
+        candidateScore: selectedMarket.candidateScore,
+      }};
+      if (kind === 'close') {{
+        const exitPriceStr = prompt('Zadaj exit price (napr. 0.62):', '');
+        const pnlStr = prompt('Zadaj realizovaný PnL v USDC (napr. 12.5 alebo -8):', '');
+        payload.exitPrice = exitPriceStr ? Number(exitPriceStr) : null;
+        payload.pnl = pnlStr ? Number(pnlStr) : null;
+      }}
+      try {{
+        const res = await fetch('/pnl-log', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify(payload),
+        }});
+        const data = await res.json();
+        if (note) {{
+          note.textContent = data.ok ? ('PnL log uź ' + kind + ' zapísaný.') : ('Chyba: ' + (data.error || 'unknown'));
+          setTimeout(function(){{ note.textContent=''; }}, 3000);
+        }}
+      }} catch (err) {{
+        if (note) {{ note.textContent = 'Chyba pri zápise PnL: ' + err.message; }}
+      }}
+    }}
+
+    function logTradeOpen() {{ return logTrade('open'); }}
+    function logTradeClose() {{ return logTrade('close'); }}
+
     function copyTradeLog() {{
       const note = document.getElementById('savedNote');
       if (!selectedMarket) return;
@@ -2595,7 +2843,7 @@ def dashboard():
         +       '<label class="block-label">Catalyst</label><div class="panel-muted">' + ((m.autoDraft && m.autoDraft.catalyst) || '') + '</div>'
         +       '<label class="block-label">Resolution</label><div class="panel-muted">' + ((m.autoDraft && m.autoDraft.resolution) || '') + '</div>'
         +       '<label class="block-label">Invalidácia</label><div class="panel-muted">' + ((m.autoDraft && m.autoDraft.invalidation) || '') + '</div>'
-        +       '<div class="action-row"><button class="btn-primary" onclick="copyTradeLog()">Kopírovať trade-log</button> <button onclick="downloadTradeLog()">Stiahnuť</button></div>'
+        +       '<div class="action-row"><button class="btn-primary" onclick="copyTradeLog()">Kopírovať trade-log</button> <button onclick="downloadTradeLog()">Stiahnuť</button> <button onclick="logTradeOpen()">Log open</button> <button onclick="logTradeClose()">Log close</button></div>'
         +       '<div class="saved-note" id="savedNote"></div>'
         +     '</div>'
         +     '<div class="detail-card">'
@@ -2776,8 +3024,12 @@ def dashboard():
     async function loadGlobalWhaleFlow() {{
       const box = document.getElementById('globalWhaleBox');
       if (!box) return;
+      const minSel = document.getElementById('whaleMinAmount');
+      const settlesEl = document.getElementById('includeSettles');
+      const minAmount = (minSel && minSel.value) ? minSel.value : '200000';
+      const includeSettles = settlesEl && settlesEl.checked ? 'true' : 'false';
       try {{
-        const res = await fetch('/whale-flow?limit=15');
+        const res = await fetch('/whale-flow?limit=15&min_amount=' + encodeURIComponent(minAmount) + '&include_settles=' + includeSettles);
         const data = await res.json();
         box.innerHTML = renderGlobalWhaleFlow(data);
       }} catch (err) {{
@@ -2791,6 +3043,8 @@ def dashboard():
 
     document.getElementById('refreshBtn')?.addEventListener('click', loadAll);
     document.getElementById('strictMode')?.addEventListener('change', function() {{ updateStatusLine(); }});
+    document.getElementById('whaleMinAmount')?.addEventListener('change', loadGlobalWhaleFlow);
+    document.getElementById('includeSettles')?.addEventListener('change', loadGlobalWhaleFlow);
 
     loadAll();
     scheduleNextRefresh();
