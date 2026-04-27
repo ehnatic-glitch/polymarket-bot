@@ -1822,7 +1822,8 @@ def dashboard():
     .detail-grid {{ display: grid; grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.35fr) minmax(300px, 1fr); gap: 14px; align-items: start; }}
     .detail-card {{ background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); padding: 14px; min-height: 100%; }}
     .trade-tape {{ display: grid; gap: 6px; }}
-    .trade-line {{ display: grid; grid-template-columns: 100px 90px 130px 110px 100px; gap: 12px; align-items: center; padding: 7px 0; border-bottom: 1px solid #f0f0f0; font-size: 12.5px; }}
+    .trade-line {{ display: grid; grid-template-columns: 90px 90px 80px 120px 100px 100px; gap: 10px; align-items: center; padding: 7px 0; border-bottom: 1px solid #f0f0f0; font-size: 12.5px; }}
+    .trade-line .trade-market {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
     .leader-line {{ grid-template-columns: 20px 1fr 90px auto !important; }}
     .leader-line .leader-meta {{ font-size: 11px; color: #777; }}
     .trade-line:last-child {{ border-bottom: none; }}
@@ -2408,20 +2409,13 @@ def dashboard():
 
     function renderWhaleSignal(m) {{
       const trades = currentMarketTrades || [];
-      const marketTitle = (m && m.question) || '';
-      const slug = (m && m.slug) || '';
-      const tradeUrl = slug ? ('https://polymarket.com/event/' + slug) : 'https://polymarket.com';
-      const titleBar = ''
-        + '<div style="display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin-bottom:8px; padding-bottom:6px; border-bottom:1px solid #eee;">'
-        +   '<div><strong>Trh:</strong> ' + (marketTitle || '—') + '</div>'
-        +   (slug ? ('<a href="' + tradeUrl + '" target="_blank" rel="noopener" class="small">Otvoriť na Polymarket ↗</a>') : '')
-        + '</div>';
       if (trades.length === 0) {{
-        return titleBar + '<div class="small">Zatiaľ žiadne whale obchody nad ' + getWhaleMin().toLocaleString('sk-SK') + '.</div>';
+        return '<div class="small">Zatiaľ žiadne whale obchody nad ' + getWhaleMin().toLocaleString('sk-SK') + '.</div>';
       }}
       const header = ''
         + '<div class="trade-line" style="font-weight:700; color:#555; border-bottom:2px solid #ddd;">'
         +   '<div>Side</div>'
+        +   '<div>Trh / Otvoriť</div>'
         +   '<div>Cena</div>'
         +   '<div>Objem (akcie)</div>'
         +   '<div>USDC spolu</div>'
@@ -2439,16 +2433,20 @@ def dashboard():
         const usd = Number(t.notional || 0);
         const price = Number(t.price || 0);
         const sizeShares = Number(t.size || 0);
+        const title = String(t.title || (m && m.question) || '').replace(/"/g, '&quot;');
+        const slug = t.slug || (m && m.slug) || '';
+        const tradeUrl = slug ? ('https://polymarket.com/event/' + slug) : 'https://polymarket.com';
         return ''
           + '<div class="trade-line">'
           +   '<div>' + sideHtml + ' <span class="trade-outcome">' + outcome + '</span></div>'
+          +   '<div class="trade-market" title="' + title + '"><a href="' + tradeUrl + '" target="_blank" rel="noopener">' + (title || slug || '—') + '</a></div>'
           +   '<div>' + (Number.isFinite(price) ? price.toFixed(3) : '') + '</div>'
           +   '<div>' + (Number.isFinite(sizeShares) ? sizeShares.toLocaleString('sk-SK', {{maximumFractionDigits: 0}}) : '') + '</div>'
           +   '<div><strong>' + (Number.isFinite(usd) ? usd.toLocaleString('sk-SK', {{maximumFractionDigits: 0}}) : '0') + '</strong></div>'
           +   '<div class="small">' + tsText + '</div>'
           + '</div>';
       }}).join('');
-      return titleBar + '<div class="trade-tape">' + header + rows + '</div>';
+      return '<div class="trade-tape">' + header + rows + '</div>';
     }}
 
     function renderDeltaTracking(m) {{
