@@ -18,6 +18,8 @@ APP_CONFIG = {
     "max_total_exposure": 200.0,
     "max_narrative_exposure": 75.0,
     "max_active_positions": 3,
+    "whale_trade_min_notional": 200000.0,
+    "whale_wallet_recent_sum": 500000.0,
 }
 
 
@@ -32,6 +34,8 @@ def home():
             "/dashboard",
             "/analyze-market",
             "/leaderboard",
+            "/market-trades",
+            "/wallet-history",
         ],
         "config": APP_CONFIG,
     })
@@ -55,7 +59,7 @@ def safe_int(value, default=0):
     try:
         if value is None or value == "":
             return default
-        return int(value)
+        return int(float(value))
     except Exception:
         return default
 
@@ -90,6 +94,22 @@ def safe_num_or_none(value):
         if n != n:
             return None
         return n
+    except Exception:
+        return None
+
+
+def short_wallet(addr):
+    if not addr or not isinstance(addr, str):
+        return ""
+    if len(addr) < 12:
+        return addr
+    return f"{addr[:6]}...{addr[-4:]}"
+
+
+def format_ts(ts):
+    try:
+        ts = int(float(ts))
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
     except Exception:
         return None
 
@@ -1299,6 +1319,214 @@ def build_watchlist(rows, limit=12):
     return watch[:limit]
 
 
+def extract_market_condition_ids(market):
+    ids = []
+
+    for key in ["conditionId", "condition_id"]:
+        value = market.get(key)
+        if isinstance(value, str) and value.startswith("0x") and len(value) == 66:
+            ids.append(value)
+
+    clob = market.get("clobTokenIds")
+    if isinstance(clob, str):
+        try:
+            parsed = json.loads(clob)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, str) and item.startswith("0x") and len(item) == 66:
+                        ids.append(item)
+        except Exception:
+            pass
+
+    seen = []
+    for x in ids:
+        if x not in seen:
+            seen.append(x)
+    return seen
+
+
+def normalize_trade_item(item):
+    wallet = item.get("proxyWallet") or item.get("wallet") or item.get("maker_address") or ""
+    name = item.get("name") or item.get("pseudonym") or short_wallet(wallet) or "unknown"
+
+    price = safe_num_or_none(item.get("price"))
+    size = safe_num_or_none(item.get("size"))
+    timestamp = item.get("timestamp") or item.get("match_time") or item.get("last_update")
+
+    title = item.get("title") or item.get("marketTitle") or item.get("question") or ""
+    slug = item.get("slug") or item.get("eventSlug") or ""
+    outcome = item.get("outcome") or ""
+    side = item.get("side") or ""
+    tx = item.get("transactionHash") or item.get("transaction_hash") or ""
+
+    notional = None
+    if isinstance(price, (int, float)) and isinstance(size, (int, float)):
+        notional = round(price * size, 2)
+
+    return {
+        "wallet": wallet,
+        "walletShort": short_wallet(wallet),
+        "name": name,
+        "side": side,
+        "price": price,
+        "size": size,
+        "notional": notional,
+        "timestamp": timestamp,
+        "timestampIso": format_ts(timestamp),
+        "title": title,
+        "slug": slug,
+        "outcome": outcome,
+        "txHash": tx,
+        "profileImage": item.get("profileImageOptimized") or item.get("profileImage") or "",
+    }
+
+
+def summarize_whale_wallet(trades):
+    whale_trade_min = APP_CONFIG["whale_trade_min_notional"]
+    whale_sum_min = APP_CONFIG["whale_wallet_recent_sum"]
+
+    notionals = [to_float(x.get("notional"), 0) for x in trades if to_float(x.get("notional"), 0) > 0]
+    recent_sum = round(sum(notionals), 2)
+    max_trade = max(notionals) if notionals else 0.0
+    whale_trade_count = sum(1 for x in notionals if x >= whale_trade_min)
+
+    is_whale = (max_trade >= whale_trade_min) or (recent_sum >= whale_sum_min)
+
+    return {
+        "isWhale": is_whale,
+        "whaleTradeMin": whale_trade_min,
+        "recentSumThreshold": whale_sum_min,
+        "recentSum": recent_sum,
+        "maxTrade": round(max_trade, 2),
+        "whaleTradeCount": whale_trade_count,
+        "label": "Whale" if is_whale else "Large trader",
+    }
+
+
+def fetch_recent_trades_for_market(condition_ids=None, limit=20, min_amount=None):
+    if not condition_ids:
+        return []
+
+    if min_amount is None:
+        min_amount = APP_CONFIG["whale_trade_min_notional"]
+
+    url = f"{DATA_API_BASE}/trades"
+    params = {
+        "limit": limit,
+        "market": ",".join(condition_ids),
+        "filterType": "CASH",
+        "filterAmount": min_amount,
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        rows = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
+        normalized = [normalize_trade_item(x) for x in rows]
+        normalized = [x for x in normalized if to_float(x.get("notional"), 0) >= min_amount]
+        normalized.sort(key=lambda x: safe_int(x.get("timestamp"), 0), reverse=True)
+        return normalized[:limit]
+    except Exception:
+        return []
+
+
+def fetch_wallet_trades(wallet, limit=25, min_amount=None):
+    if not wallet:
+        return []
+
+    if min_amount is None:
+        min_amount = APP_CONFIG["whale_trade_min_notional"]
+
+    url = f"{DATA_API_BASE}/trades"
+    params = {
+        "limit": limit,
+        "user": wallet,
+        "filterType": "CASH",
+        "filterAmount": min_amount,
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        rows = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
+        normalized = [normalize_trade_item(x) for x in rows]
+        normalized = [x for x in normalized if to_float(x.get("notional"), 0) >= min_amount]
+        normalized.sort(key=lambda x: safe_int(x.get("timestamp"), 0), reverse=True)
+        return normalized[:limit]
+    except Exception:
+        return []
+
+
+def fetch_wallet_activity(wallet, limit=25):
+    if not wallet:
+        return []
+
+    url = f"{DATA_API_BASE}/activity"
+    params = {
+        "user": wallet,
+        "limit": limit,
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        rows = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
+        out = []
+
+        for item in rows[:limit]:
+            out.append({
+                "type": item.get("type") or item.get("activityType") or "",
+                "timestamp": item.get("timestamp") or item.get("createdAt") or item.get("time"),
+                "timestampIso": format_ts(item.get("timestamp") or item.get("createdAt") or item.get("time")),
+                "title": item.get("title") or item.get("marketTitle") or "",
+                "side": item.get("side") or "",
+                "outcome": item.get("outcome") or "",
+                "price": safe_num_or_none(item.get("price")),
+                "size": safe_num_or_none(item.get("size")),
+                "txHash": item.get("transactionHash") or item.get("transaction_hash") or "",
+            })
+
+        out.sort(key=lambda x: safe_int(x.get("timestamp"), 0), reverse=True)
+        return out
+    except Exception:
+        return []
+
+
+def fetch_wallet_positions(wallet, limit=15):
+    if not wallet:
+        return []
+
+    url = f"{DATA_API_BASE}/positions"
+    params = {
+        "user": wallet,
+        "limit": limit,
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        rows = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
+        out = []
+
+        for item in rows[:limit]:
+            out.append({
+                "title": item.get("title") or "",
+                "outcome": item.get("outcome") or "",
+                "size": safe_num_or_none(item.get("size") or item.get("shares")),
+                "avgPrice": safe_num_or_none(item.get("avgPrice") or item.get("averagePrice") or item.get("price")),
+                "value": safe_num_or_none(item.get("value") or item.get("currentValue")),
+                "cashPnl": safe_num_or_none(item.get("cashPnl") or item.get("realizedPnl") or item.get("pnl")),
+            })
+
+        return out
+    except Exception:
+        return []
+
+
 def fetch_leaderboard(limit=8):
     url = f"{DATA_API_BASE}/v1/leaderboard"
     params = {"limit": limit}
@@ -1315,11 +1543,13 @@ def fetch_leaderboard(limit=8):
 
         output = []
         for item in rows[:limit]:
+            wallet = item.get("wallet") or item.get("address") or item.get("proxyWallet") or ""
             output.append({
-                "name": item.get("name") or item.get("username") or item.get("user") or "unknown",
+                "name": item.get("name") or item.get("username") or item.get("user") or short_wallet(wallet) or "unknown",
                 "profit": item.get("profit") or item.get("pnl") or item.get("realized_pnl") or 0,
                 "volume": item.get("volume") or item.get("trade_volume") or 0,
-                "wallet": item.get("wallet") or item.get("address") or "",
+                "wallet": wallet,
+                "walletShort": short_wallet(wallet),
             })
         return output
     except Exception:
@@ -1331,6 +1561,73 @@ def leaderboard():
     limit = safe_int(request.args.get("limit", "8"), 8)
     data = fetch_leaderboard(limit=limit)
     return jsonify({"count": len(data), "leaders": data})
+
+
+@app.route("/market-trades")
+def market_trades():
+    slug = request.args.get("slug", "").strip()
+    limit = safe_int(request.args.get("limit", "20"), 20)
+    min_amount = to_float(request.args.get("min_amount", str(APP_CONFIG["whale_trade_min_notional"])))
+
+    if not slug:
+        return jsonify({"count": 0, "trades": []})
+
+    params = {"limit": 250, "active": "true", "closed": "false"}
+    url = f"{GAMMA_BASE}/markets"
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    markets = r.json()
+
+    market = None
+    for m in markets:
+        if m.get("slug") == slug:
+            market = m
+            break
+
+    if not market:
+        return jsonify({"count": 0, "trades": []})
+
+    condition_ids = extract_market_condition_ids(market)
+    trades = fetch_recent_trades_for_market(condition_ids=condition_ids, limit=limit, min_amount=min_amount)
+
+    return jsonify({
+        "count": len(trades),
+        "slug": slug,
+        "conditionIds": condition_ids,
+        "whaleMinNotional": min_amount,
+        "trades": trades,
+    })
+
+
+@app.route("/wallet-history")
+def wallet_history():
+    wallet = request.args.get("wallet", "").strip()
+    limit = safe_int(request.args.get("limit", "25"), 25)
+    min_amount = to_float(request.args.get("min_amount", str(APP_CONFIG["whale_trade_min_notional"])))
+
+    if not wallet:
+        return jsonify({
+            "wallet": "",
+            "trades": [],
+            "activity": [],
+            "positions": [],
+            "walletSummary": {},
+        })
+
+    trades = fetch_wallet_trades(wallet=wallet, limit=limit, min_amount=min_amount)
+    activity = fetch_wallet_activity(wallet=wallet, limit=limit)
+    positions = fetch_wallet_positions(wallet=wallet, limit=15)
+    wallet_summary = summarize_whale_wallet(trades)
+
+    return jsonify({
+        "wallet": wallet,
+        "walletShort": short_wallet(wallet),
+        "minAmount": min_amount,
+        "trades": trades,
+        "activity": activity,
+        "positions": positions,
+        "walletSummary": wallet_summary,
+    })
 
 
 @app.route("/markets")
@@ -1435,110 +1732,127 @@ def analyze_market():
 def dashboard():
     title = APP_CONFIG["dashboard_title"]
     default_min_liquidity = int(APP_CONFIG["default_min_liquidity"])
+    whale_min = int(APP_CONFIG["whale_trade_min_notional"])
+    whale_sum = int(APP_CONFIG["whale_wallet_recent_sum"])
 
-    html = """
+    html = f"""
 <!doctype html>
 <html lang="sk">
 <head>
   <meta charset="utf-8">
-  <title>__TITLE__ v6.1</title>
+  <title>{title} v6.2</title>
   <style>
-    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 16px; background: #f5f5f5; color: #222; }
-    h1, h2, h3 { margin-bottom: 0.3rem; }
-    .section { background: #ffffff; padding: 14px; border-radius: 8px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
-    .header-strip { display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 460px); gap: 16px; align-items: start; margin-bottom: 14px; }
-    .header-left h1 { margin: 0 0 4px 0; }
-    .header-left .small { margin: 0; }
-    .header-right { display: flex; justify-content: flex-end; }
-    .status-card { width: 100%; font-size: 12px; color: #555; background: #ffffff; border: 1px solid #e8e8e8; border-radius: 8px; padding: 10px 12px; line-height: 1.45; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
-    .top-strip { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(250px, 0.7fr) minmax(280px, 0.8fr); gap: 12px; margin-bottom: 14px; align-items: start; }
-    .compact-section { padding: 12px; }
-    .compact-box { padding: 8px 10px; font-size: 12px; line-height: 1.4; }
-    .controls { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; align-items: end; }
-    .control { display: flex; flex-direction: column; gap: 4px; min-width: 150px; }
-    label { font-size: 12px; color: #555; font-weight: 600; }
-    input, select { padding: 7px 9px; border: 1px solid #ddd; border-radius: 6px; font: inherit; background: #fff; }
-    .checkbox-wrap { display: flex; align-items: center; gap: 7px; padding-top: 20px; }
-    table { width: 100%; border-collapse: collapse; font-size: 12.5px; table-layout: fixed; }
-    th, td { padding: 5px 6px; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }
-    th { background: #fafafa; font-weight: 700; position: sticky; top: 0; z-index: 1; }
-    tr.clickable { cursor: pointer; }
-    tr.clickable:hover { background: #fafcff; }
-    .small { font-size: 12px; color: #555; }
-    .error { color: #c5221f; margin-bottom: 8px; font-size: 13px; }
-    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; }
-    .watch { background: #e6f4ea; color: #137333; }
-    .review { background: #fff4e5; color: #b06000; }
-    .pass { background: #fce8e6; color: #c5221f; }
-    .decision-buy-yes { background: #e8f5e9; color: #137333; }
-    .decision-buy-no { background: #e8f0fe; color: #1558d6; }
-    .decision-pass { background: #f3f4f6; color: #555; }
-    .cat { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #eef2ff; color: #3949ab; font-weight: 600; white-space: nowrap; }
-    .risk-low { color: #137333; font-weight: 700; }
-    .risk-medium { color: #b06000; font-weight: 700; }
-    .risk-high { color: #c5221f; font-weight: 700; }
-    .zone-entry { color: #137333; font-weight: 700; }
-    .zone-near { color: #b06000; font-weight: 700; }
-    .zone-far { color: #666; font-weight: 700; }
-    .zone-chase { color: #c5221f; font-weight: 700; }
-    .zone-none { color: #888; font-weight: 700; }
-    .panel-muted { color: #444; font-size: 13px; line-height: 1.5; background: #fafafa; border: 1px solid #eee; border-radius: 6px; padding: 10px; }
-    .table-wrap { overflow: auto; max-height: 62vh; border-radius: 8px; }
-    .count { margin-bottom: 10px; font-size: 13px; color: #444; }
-    button { padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; background: #fff; cursor: pointer; }
-    .btn-primary { background: #1558d6; border-color: #1558d6; color: white; }
-    .check { display: flex; align-items: flex-start; gap: 8px; padding: 8px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
-    .check:last-child { border-bottom: none; }
-    .ok { color: #137333; font-weight: 700; min-width: 28px; }
-    .no { color: #c5221f; font-weight: 700; min-width: 28px; }
-    .metric-pill { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; margin-right: 6px; margin-bottom: 6px; background: #f3f4f6; color: #333; }
-    .delta-up { color: #137333; font-weight: 700; }
-    .delta-down { color: #c5221f; font-weight: 700; }
-    .delta-flat { color: #666; font-weight: 700; }
-    .action-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
-    .title-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 8px; }
-    .title-main { min-width: 0; flex: 1; }
-    .title-main h3 { margin: 0 0 8px 0; line-height: 1.25; }
-    .trade-link { white-space: nowrap; font-size: 13px; text-decoration: none; color: #1558d6; font-weight: 600; margin-top: 2px; }
-    .trade-link:hover { text-decoration: underline; }
-    .saved-note { margin-top: 8px; font-size: 12px; color: #137333; }
-    .draft-grid { display: grid; grid-template-columns: 140px 1fr; gap: 8px; font-size: 13px; margin-bottom: 10px; }
-    .draft-grid div:first-child { color: #666; font-weight: 600; }
-    .block-label { margin-top: 10px; display: block; font-size: 12px; color: #555; font-weight: 600; }
-    .question-cell { max-width: 320px; }
-    .question-truncate { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.35; max-height: 2.7em; word-break: break-word; }
-    .watchlist-compact { display: grid; gap: 4px; }
-    .watchlist-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; }
-    .watchlist-row:last-child { border-bottom: none; }
-    .watchlist-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 3px; }
-    .alert-line { padding: 4px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; line-height: 1.35; }
-    .alert-line:last-child { border-bottom: none; }
-    .leader-line { display: grid; grid-template-columns: 20px 1fr auto; gap: 8px; align-items: center; padding: 5px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; }
-    .leader-line:last-child { border-bottom: none; }
-    .detail-shell { display: grid; gap: 14px; }
-    .detail-top { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr); gap: 14px; align-items: start; }
-    .detail-grid { display: grid; grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.35fr) minmax(300px, 1fr) minmax(260px, 0.9fr); gap: 14px; align-items: start; }
-    .detail-card { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); padding: 14px; min-height: 100%; }
-    @media (max-width: 1350px) {
-      .top-strip { grid-template-columns: 1fr 1fr; }
-      .detail-grid { grid-template-columns: 1fr 1fr; }
-    }
-    @media (max-width: 1200px) {
-      .header-strip { grid-template-columns: 1fr; }
-      .header-right { justify-content: stretch; }
-      .top-strip { grid-template-columns: 1fr; }
-      .detail-top { grid-template-columns: 1fr; }
-    }
-    @media (max-width: 900px) {
-      .detail-grid { grid-template-columns: 1fr; }
-    }
+    body {{ font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 16px; background: #f5f5f5; color: #222; }}
+    h1, h2, h3 {{ margin-bottom: 0.3rem; }}
+    .section {{ background: #ffffff; padding: 14px; border-radius: 8px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }}
+    .header-strip {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 500px); gap: 16px; align-items: start; margin-bottom: 14px; }}
+    .header-left h1 {{ margin: 0 0 4px 0; }}
+    .header-left .small {{ margin: 0; }}
+    .header-right {{ display: flex; justify-content: flex-end; }}
+    .status-card {{ width: 100%; font-size: 12px; color: #555; background: #ffffff; border: 1px solid #e8e8e8; border-radius: 8px; padding: 10px 12px; line-height: 1.45; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
+    .top-strip {{ display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(250px, 0.7fr) minmax(280px, 0.8fr); gap: 12px; margin-bottom: 14px; align-items: start; }}
+    .compact-section {{ padding: 12px; }}
+    .compact-box {{ padding: 8px 10px; font-size: 12px; line-height: 1.4; }}
+    .controls {{ display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; align-items: end; }}
+    .control {{ display: flex; flex-direction: column; gap: 4px; min-width: 150px; }}
+    label {{ font-size: 12px; color: #555; font-weight: 600; }}
+    input, select {{ padding: 7px 9px; border: 1px solid #ddd; border-radius: 6px; font: inherit; background: #fff; }}
+    .checkbox-wrap {{ display: flex; align-items: center; gap: 7px; padding-top: 20px; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 12.5px; table-layout: fixed; }}
+    th, td {{ padding: 5px 6px; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }}
+    th {{ background: #fafafa; font-weight: 700; position: sticky; top: 0; z-index: 1; }}
+    tr.clickable {{ cursor: pointer; }}
+    tr.clickable:hover {{ background: #fafcff; }}
+    .small {{ font-size: 12px; color: #555; }}
+    .error {{ color: #c5221f; margin-bottom: 8px; font-size: 13px; }}
+    .badge {{ display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; }}
+    .watch {{ background: #e6f4ea; color: #137333; }}
+    .review {{ background: #fff4e5; color: #b06000; }}
+    .pass {{ background: #fce8e6; color: #c5221f; }}
+    .decision-buy-yes {{ background: #e8f5e9; color: #137333; }}
+    .decision-buy-no {{ background: #e8f0fe; color: #1558d6; }}
+    .decision-pass {{ background: #f3f4f6; color: #555; }}
+    .cat {{ display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #eef2ff; color: #3949ab; font-weight: 600; white-space: nowrap; }}
+    .risk-low {{ color: #137333; font-weight: 700; }}
+    .risk-medium {{ color: #b06000; font-weight: 700; }}
+    .risk-high {{ color: #c5221f; font-weight: 700; }}
+    .zone-entry {{ color: #137333; font-weight: 700; }}
+    .zone-near {{ color: #b06000; font-weight: 700; }}
+    .zone-far {{ color: #666; font-weight: 700; }}
+    .zone-chase {{ color: #c5221f; font-weight: 700; }}
+    .zone-none {{ color: #888; font-weight: 700; }}
+    .panel-muted {{ color: #444; font-size: 13px; line-height: 1.5; background: #fafafa; border: 1px solid #eee; border-radius: 6px; padding: 10px; }}
+    .table-wrap {{ overflow: auto; max-height: 62vh; border-radius: 8px; }}
+    .count {{ margin-bottom: 10px; font-size: 13px; color: #444; }}
+    button {{ padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; background: #fff; cursor: pointer; }}
+    .btn-primary {{ background: #1558d6; border-color: #1558d6; color: white; }}
+    .check {{ display: flex; align-items: flex-start; gap: 8px; padding: 8px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px; }}
+    .check:last-child {{ border-bottom: none; }}
+    .ok {{ color: #137333; font-weight: 700; min-width: 28px; }}
+    .no {{ color: #c5221f; font-weight: 700; min-width: 28px; }}
+    .metric-pill {{ display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; margin-right: 6px; margin-bottom: 6px; background: #f3f4f6; color: #333; }}
+    .delta-up {{ color: #137333; font-weight: 700; }}
+    .delta-down {{ color: #c5221f; font-weight: 700; }}
+    .delta-flat {{ color: #666; font-weight: 700; }}
+    .action-row {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }}
+    .title-row {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 8px; }}
+    .title-main {{ min-width: 0; flex: 1; }}
+    .title-main h3 {{ margin: 0 0 8px 0; line-height: 1.25; }}
+    .trade-link {{ white-space: nowrap; font-size: 13px; text-decoration: none; color: #1558d6; font-weight: 600; margin-top: 2px; }}
+    .trade-link:hover {{ text-decoration: underline; }}
+    .saved-note {{ margin-top: 8px; font-size: 12px; color: #137333; }}
+    .draft-grid {{ display: grid; grid-template-columns: 140px 1fr; gap: 8px; font-size: 13px; margin-bottom: 10px; }}
+    .draft-grid div:first-child {{ color: #666; font-weight: 600; }}
+    .block-label {{ margin-top: 10px; display: block; font-size: 12px; color: #555; font-weight: 600; }}
+    .question-cell {{ max-width: 320px; }}
+    .question-truncate {{ display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.35; max-height: 2.7em; word-break: break-word; }}
+    .watchlist-compact {{ display: grid; gap: 4px; }}
+    .watchlist-row {{ display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; }}
+    .watchlist-row:last-child {{ border-bottom: none; }}
+    .watchlist-meta {{ display: flex; gap: 6px; flex-wrap: wrap; margin-top: 3px; }}
+    .alert-line {{ padding: 4px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; line-height: 1.35; }}
+    .alert-line:last-child {{ border-bottom: none; }}
+    .leader-line {{ display: grid; grid-template-columns: 20px 1fr auto; gap: 8px; align-items: center; padding: 5px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; }}
+    .leader-line:last-child {{ border-bottom: none; }}
+    .leader-click {{ cursor: pointer; }}
+    .leader-click:hover {{ background: #fafcff; }}
+    .detail-shell {{ display: grid; gap: 14px; }}
+    .detail-top {{ display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr); gap: 14px; align-items: start; }}
+    .detail-grid {{ display: grid; grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.35fr) minmax(300px, 1fr) minmax(260px, 0.9fr); gap: 14px; align-items: start; }}
+    .detail-card {{ background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); padding: 14px; min-height: 100%; }}
+    .trade-tape {{ display: grid; gap: 6px; }}
+    .trade-line {{ display: grid; grid-template-columns: 86px 100px 80px 90px 1fr; gap: 8px; align-items: center; padding: 7px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; }}
+    .trade-line:last-child {{ border-bottom: none; }}
+    .trade-side-buy {{ color: #137333; font-weight: 700; }}
+    .trade-side-sell {{ color: #c5221f; font-weight: 700; }}
+    .trade-outcome {{ font-weight: 700; color: #1558d6; }}
+    .wallet-btn {{ border: 1px solid #ddd; background: #fff; border-radius: 6px; padding: 6px 8px; font-size: 12px; }}
+    .wallet-btn:hover {{ background: #f7f9fc; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }}
+    .whale-badge {{ display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; background: #eef8f1; color: #137333; }}
+    .large-badge {{ display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; background: #eef2ff; color: #3949ab; }}
+    .subnote {{ font-size: 11px; color: #666; margin-top: 6px; }}
+    @media (max-width: 1350px) {{
+      .top-strip {{ grid-template-columns: 1fr 1fr; }}
+      .detail-grid {{ grid-template-columns: 1fr 1fr; }}
+    }}
+    @media (max-width: 1200px) {{
+      .header-strip {{ grid-template-columns: 1fr; }}
+      .header-right {{ justify-content: stretch; }}
+      .top-strip {{ grid-template-columns: 1fr; }}
+      .detail-top {{ grid-template-columns: 1fr; }}
+    }}
+    @media (max-width: 900px) {{
+      .detail-grid {{ grid-template-columns: 1fr; }}
+      .trade-line {{ grid-template-columns: 1fr; gap: 4px; }}
+    }}
   </style>
 </head>
 <body>
   <div class="header-strip">
     <div class="header-left">
-      <h1>__TITLE__</h1>
-      <p class="small">v6.1: leaderboard + whale signal ako sekundárny filter, nie auto-copy trading.</p>
+      <h1>{title}</h1>
+      <p class="small">v6.2: whale tape iba pre veľké pohyby, default filter {whale_min:,.0f} cash notional.</p>
     </div>
     <div class="header-right">
       <div class="status-card" id="statusLine">Dashboard sa inicializuje...</div>
@@ -1581,9 +1895,19 @@ def dashboard():
         <label for="minLiquidity">Min likvidita</label>
         <select id="minLiquidity">
           <option value="50000">50 000</option>
-          <option value="100000" __MIN_LIQ_SELECTED__>100 000</option>
+          <option value="100000" {"selected" if default_min_liquidity == 100000 else ""}>100 000</option>
           <option value="150000">150 000</option>
           <option value="250000">250 000</option>
+        </select>
+      </div>
+
+      <div class="control">
+        <label for="whaleMin">Whale min cash</label>
+        <select id="whaleMin">
+          <option value="100000">100 000</option>
+          <option value="200000" selected>200 000</option>
+          <option value="300000">300 000</option>
+          <option value="500000">500 000</option>
         </select>
       </div>
 
@@ -1645,7 +1969,7 @@ def dashboard():
   <div id="detailPanel">
     <div class="section">
       <h3>Detail marketu</h3>
-      <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa detail trhu, checklist, systémový draft, entry/exit plán a whale signal.</p>
+      <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa detail trhu, checklist, systémový draft, entry/exit plán, recent whale trades a história whale aktivít.</p>
     </div>
   </div>
 
@@ -1659,71 +1983,114 @@ def dashboard():
     let rareAlerts = [];
     let autoRefreshTimer = null;
     let lastRefreshAt = null;
+    let currentMarketTrades = [];
+    let selectedWalletHistory = null;
+    let selectedWallet = null;
 
+    const DEFAULT_WHALE_MIN = {whale_min};
+    const DEFAULT_WHALE_SUM = {whale_sum};
     const REFRESH_HOURS = [7, 9, 11, 13, 15, 17, 19, 21];
 
-    function fmtInt(value) {
+    function fmtInt(value) {{
       const n = Number(value);
       if (!Number.isFinite(n)) return '';
       return Math.round(n).toLocaleString('sk-SK');
-    }
+    }}
 
-    function fmtPrice(value) {
+    function fmtPrice(value) {{
       const n = Number(value);
       if (!Number.isFinite(n)) return '';
       return n.toFixed(3);
-    }
+    }}
 
-    function fmtDays(value) {
+    function fmtDays(value) {{
       const n = Number(value);
       if (!Number.isFinite(n)) return '';
       return Math.round(n).toString();
-    }
+    }}
 
-    function fmtPnL(value) {
+    function fmtPnL(value) {{
       const n = Number(value);
       if (!Number.isFinite(n)) return '';
       const sign = n > 0 ? '+' : '';
       return sign + Math.round(n).toLocaleString('sk-SK');
-    }
+    }}
 
-    function fmtDateTime(dateObj) {
+    function fmtDateTime(dateObj) {{
       if (!(dateObj instanceof Date)) return '';
-      return dateObj.toLocaleString('sk-SK', {
+      return dateObj.toLocaleString('sk-SK', {{
         year: 'numeric',
         month: '2-digit',
         day: '2-digit',
         hour: '2-digit',
         minute: '2-digit',
         second: '2-digit'
-      });
-    }
+      }});
+    }}
 
-    function getScheduleInfo(now = new Date()) {
+    function fmtSize(v) {{
+      const n = Number(v);
+      if (!Number.isFinite(n)) return '';
+      return n.toLocaleString('sk-SK', {{ maximumFractionDigits: 0 }});
+    }}
+
+    function fmtCash(v) {{
+      const n = Number(v);
+      if (!Number.isFinite(n)) return '';
+      return n.toLocaleString('sk-SK', {{ maximumFractionDigits: 2 }});
+    }}
+
+    function fmtTime(tsIso) {{
+      if (!tsIso) return '';
+      const d = new Date(tsIso);
+      if (Number.isNaN(d.getTime())) return '';
+      return d.toLocaleString('sk-SK', {{
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit'
+      }});
+    }}
+
+    function escapeHtml(value) {{
+      return String(value || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }}
+
+    function getWhaleMin() {{
+      const el = document.getElementById('whaleMin');
+      return el ? Number(el.value || DEFAULT_WHALE_MIN) : DEFAULT_WHALE_MIN;
+    }}
+
+    function getScheduleInfo(now = new Date()) {{
       const currentHour = now.getHours();
       const today = new Date(now);
       const next = new Date(now);
 
-      for (const hour of REFRESH_HOURS) {
-        if (currentHour < hour || (currentHour === hour && now.getMinutes() === 0 && now.getSeconds() === 0)) {
+      for (const hour of REFRESH_HOURS) {{
+        if (currentHour < hour || (currentHour === hour && now.getMinutes() === 0 && now.getSeconds() === 0)) {{
           next.setHours(hour, 0, 0, 0);
-          return { inWindow: currentHour >= 7 && currentHour <= 21, nextRefresh: next };
-        }
-      }
+          return {{ inWindow: currentHour >= 7 && currentHour <= 21, nextRefresh: next }};
+        }}
+      }}
 
       const tomorrow = new Date(today);
       tomorrow.setDate(tomorrow.getDate() + 1);
       tomorrow.setHours(7, 0, 0, 0);
 
-      return { inWindow: false, nextRefresh: tomorrow };
-    }
+      return {{ inWindow: false, nextRefresh: tomorrow }};
+    }}
 
-    function msUntilNextRefresh(now = new Date()) {
+    function msUntilNextRefresh(now = new Date()) {{
       const info = getScheduleInfo(now);
       return Math.max(1000, info.nextRefresh.getTime() - now.getTime());
-    }
+    }}
 
-    function updateStatusLine() {
+    function updateStatusLine() {{
       const el = document.getElementById('statusLine');
       if (!el) return;
 
@@ -1732,6 +2099,7 @@ def dashboard():
       const lastText = lastRefreshAt ? fmtDateTime(lastRefreshAt) : 'ešte neprebehla';
       const nextText = fmtDateTime(info.nextRefresh);
       const strictValue = document.getElementById('strictMode')?.checked ? 'ON' : 'OFF';
+      const whaleMin = getWhaleMin().toLocaleString('sk-SK');
       const windowText = info.inWindow
         ? 'Sme v aktívnom okne 07:00–21:00.'
         : 'Sme mimo aktívneho okna 07:00–21:00.';
@@ -1741,41 +2109,42 @@ def dashboard():
         '<strong>Aktuálny dátum a čas:</strong> ' + fmtDateTime(now) + '<br>' +
         '<strong>Plán refreshu:</strong> 07:00, 09:00, 11:00, 13:00, 15:00, 17:00, 19:00, 21:00<br>' +
         '<strong>Strict v6 mode:</strong> ' + strictValue + '<br>' +
+        '<strong>Whale filter:</strong> iba cash pohyby nad ' + whaleMin + '<br>' +
         windowText + ' <strong>Ďalší plánovaný refresh:</strong> ' + nextText;
-    }
+    }}
 
-    function scheduleNextRefresh() {
+    function scheduleNextRefresh() {{
       if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
       const waitMs = msUntilNextRefresh();
-      autoRefreshTimer = setTimeout(async () => {
+      autoRefreshTimer = setTimeout(async () => {{
         await loadAll();
         scheduleNextRefresh();
-      }, waitMs);
-    }
+      }}, waitMs);
+    }}
 
-    function flagBadge(label) {
+    function flagBadge(label) {{
       if (label === 'WATCH') return '<span class="badge watch">WATCH</span>';
       if (label === 'POTENCIÁL') return '<span class="badge review">POTENCIÁL</span>';
       return '<span class="badge pass">PASS</span>';
-    }
+    }}
 
-    function decisionBadge(value) {
+    function decisionBadge(value) {{
       if (value === 'BUY YES') return '<span class="badge decision-buy-yes">BUY YES</span>';
       if (value === 'BUY NO') return '<span class="badge decision-buy-no">BUY NO</span>';
       return '<span class="badge decision-pass">PASS</span>';
-    }
+    }}
 
-    function catBadge(cat) {
+    function catBadge(cat) {{
       return '<span class="cat">' + (cat || 'Ostatné') + '</span>';
-    }
+    }}
 
-    function oracleBadge(level) {
+    function oracleBadge(level) {{
       if (level === 'Nízke') return '<span class="risk-low">Nízke</span>';
       if (level === 'Stredné') return '<span class="risk-medium">Stredné</span>';
       return '<span class="risk-high">Vysoké</span>';
-    }
+    }}
 
-    function zoneBadge(zone) {
+    function zoneBadge(zone) {{
       const code = zone?.code || 'none';
       const label = zone?.label || 'Mimo plánu';
       if (code === 'entry') return '<span class="zone-entry">' + label + '</span>';
@@ -1783,13 +2152,26 @@ def dashboard():
       if (code === 'far') return '<span class="zone-far">' + label + '</span>';
       if (code === 'chase') return '<span class="zone-chase">' + label + '</span>';
       return '<span class="zone-none">' + label + '</span>';
-    }
+    }}
 
-    function pill(text) {
+    function pill(text) {{
       return '<span class="metric-pill">' + text + '</span>';
-    }
+    }}
 
-    function renderChecklist(checklist) {
+    function sideBadge(side) {{
+      const s = String(side || '').toUpperCase();
+      if (s === 'BUY') return '<span class="trade-side-buy">BUY</span>';
+      if (s === 'SELL') return '<span class="trade-side-sell">SELL</span>';
+      return '<span>' + escapeHtml(s) + '</span>';
+    }}
+
+    function whaleBadge(summary) {{
+      if (!summary) return '';
+      if (summary.isWhale) return '<span class="whale-badge">Whale</span>';
+      return '<span class="large-badge">Large trader</span>';
+    }}
+
+    function renderChecklist(checklist) {{
       const order = [
         ['resolutability', 'Resolutability'],
         ['baseRate', 'Base Rate'],
@@ -1799,7 +2181,7 @@ def dashboard():
         ['oracle', 'Oracle Trap']
       ];
 
-      return order.map(function(pair) {
+      return order.map(function(pair) {{
         const key = pair[0];
         const label = pair[1];
         const item = checklist[key];
@@ -1808,32 +2190,32 @@ def dashboard():
           +   '<div class="' + (item.ok ? 'ok' : 'no') + '">' + (item.ok ? 'ÁNO' : 'NIE') + '</div>'
           +   '<div><strong>' + label + '</strong><br>' + (item.note || '') + '</div>'
           + '</div>';
-      }).join('');
-    }
+      }}).join('');
+    }}
 
-    function deltaClass(value) {
+    function deltaClass(value) {{
       if (value > 0) return 'delta-up';
       if (value < 0) return 'delta-down';
       return 'delta-flat';
-    }
+    }}
 
-    function fmtDelta(value) {
+    function fmtDelta(value) {{
       const n = Number(value);
       if (!Number.isFinite(n)) return '0.000';
       const sign = n > 0 ? '+' : '';
       return sign + n.toFixed(3);
-    }
+    }}
 
-    function computeDeltaMap(markets) {
+    function computeDeltaMap(markets) {{
       const nextMap = new Map();
       const deltaMap = new Map();
       const alerts = [];
 
-      markets.forEach(function(m) {
+      markets.forEach(function(m) {{
         const key = m.slug || m.question;
         const prev = previousSnapshot.get(key);
 
-        const snap = {
+        const snap = {{
           yesPrice: m.yesPrice,
           noPrice: m.noPrice,
           flag: m.flag,
@@ -1843,10 +2225,10 @@ def dashboard():
           liquidity: m.liquidity,
           entryZone: (m.entryZone && m.entryZone.code) || 'none',
           oracleRisk: m.oracleRiskLabel
-        };
+        }};
         nextMap.set(key, snap);
 
-        const delta = {
+        const delta = {{
           yesDelta: null,
           noDelta: null,
           gateDelta: null,
@@ -1854,37 +2236,37 @@ def dashboard():
           decisionChanged: false,
           liquidityDeltaPct: null,
           summary: []
-        };
+        }};
 
-        if (prev) {
-          if (Number.isFinite(Number(snap.yesPrice)) && Number.isFinite(Number(prev.yesPrice))) {
+        if (prev) {{
+          if (Number.isFinite(Number(snap.yesPrice)) && Number.isFinite(Number(prev.yesPrice))) {{
             delta.yesDelta = Number((snap.yesPrice - prev.yesPrice).toFixed(3));
             if (Math.abs(delta.yesDelta) >= 0.02) delta.summary.push('YES ' + fmtDelta(delta.yesDelta));
-          }
+          }}
 
-          if (Number.isFinite(Number(snap.noPrice)) && Number.isFinite(Number(prev.noPrice))) {
+          if (Number.isFinite(Number(snap.noPrice)) && Number.isFinite(Number(prev.noPrice))) {{
             delta.noDelta = Number((snap.noPrice - prev.noPrice).toFixed(3));
-          }
+          }}
 
-          if (Number.isFinite(Number(snap.gateScore)) && Number.isFinite(Number(prev.gateScore))) {
+          if (Number.isFinite(Number(snap.gateScore)) && Number.isFinite(Number(prev.gateScore))) {{
             delta.gateDelta = Number(snap.gateScore) - Number(prev.gateScore);
             if (delta.gateDelta !== 0) delta.summary.push('Gate ' + (delta.gateDelta > 0 ? '+' : '') + delta.gateDelta);
-          }
+          }}
 
-          if (snap.flag !== prev.flag) {
+          if (snap.flag !== prev.flag) {{
             delta.flagChanged = true;
             delta.summary.push('Flag: ' + prev.flagLabel + ' -> ' + snap.flagLabel);
-          }
+          }}
 
-          if (snap.decision !== prev.decision) {
+          if (snap.decision !== prev.decision) {{
             delta.decisionChanged = true;
             delta.summary.push('Decision: ' + prev.decision + ' -> ' + snap.decision);
-          }
+          }}
 
-          if (Number.isFinite(Number(snap.liquidity)) && Number.isFinite(Number(prev.liquidity)) && Number(prev.liquidity) > 0) {
+          if (Number.isFinite(Number(snap.liquidity)) && Number.isFinite(Number(prev.liquidity)) && Number(prev.liquidity) > 0) {{
             const pct = ((Number(snap.liquidity) - Number(prev.liquidity)) / Number(prev.liquidity)) * 100;
             delta.liquidityDeltaPct = Number(pct.toFixed(1));
-          }
+          }}
 
           if (snap.flag === 'WATCH' && prev.flag !== 'WATCH') alerts.push('Nový WATCH: ' + (m.question || ''));
           if (prev.decision === 'PASS' && (snap.decision === 'BUY YES' || snap.decision === 'BUY NO')) alerts.push('PASS -> ' + snap.decision + ': ' + (m.question || ''));
@@ -1892,28 +2274,28 @@ def dashboard():
           if (snap.oracleRisk === 'Vysoké' && prev.oracleRisk !== 'Vysoké') alerts.push('Oracle risk vyskočil na vysoké: ' + (m.question || ''));
           if (Number.isFinite(delta.liquidityDeltaPct) && delta.liquidityDeltaPct <= -30) alerts.push('Likvidita prudko padla: ' + (m.question || ''));
           if (m.daysToEnd !== null && Number(m.daysToEnd) <= 3 && (snap.decision === 'BUY YES' || snap.decision === 'BUY NO')) alerts.push('Blíži sa time-stop / expiry risk: ' + (m.question || ''));
-        }
+        }}
 
         deltaMap.set(key, delta);
-      });
+      }});
 
       previousSnapshot = nextMap;
       currentDeltaMap = deltaMap;
       rareAlerts = alerts.slice(0, 8);
-    }
+    }}
 
-    function renderWatchlist() {
+    function renderWatchlist() {{
       const box = document.getElementById('watchlistBox');
       if (!box) return;
 
-      if (!cachedWatchlist || cachedWatchlist.length === 0) {
+      if (!cachedWatchlist || cachedWatchlist.length === 0) {{
         box.innerHTML = 'Žiadne watchlist kandidáty podľa aktuálnych filtrov.';
         return;
-      }
+      }}
 
       const shortList = cachedWatchlist.slice(0, 4);
 
-      box.innerHTML = '<div class="watchlist-compact">' + shortList.map(function(m) {
+      box.innerHTML = '<div class="watchlist-compact">' + shortList.map(function(m) {{
         const safeSlug = String(m.slug || '').replace(/'/g, "\\\\'");
         return ''
           + '<div class="watchlist-row">'
@@ -1927,390 +2309,52 @@ def dashboard():
           +   '</div>'
           +   '<div><button onclick="selectWatchlistItem(\\'' + safeSlug + '\\')">Otvoriť</button></div>'
           + '</div>';
-      }).join('') + '</div>';
-    }
+      }}).join('') + '</div>';
+    }}
 
-    function renderAlerts() {
+    function renderAlerts() {{
       const box = document.getElementById('alertsBox');
       if (!box) return;
 
-      if (!rareAlerts || rareAlerts.length === 0) {
+      if (!rareAlerts || rareAlerts.length === 0) {{
         box.innerHTML = 'Zatiaľ bez rare alertov.';
         return;
-      }
+      }}
 
-      box.innerHTML = rareAlerts.slice(0, 4).map(function(a) {
+      box.innerHTML = rareAlerts.slice(0, 4).map(function(a) {{
         return '<div class="alert-line">' + a + '</div>';
-      }).join('');
-    }
+      }}).join('');
+    }}
 
-    function renderLeaderboard() {
+    function renderLeaderboard() {{
       const box = document.getElementById('leaderboardBox');
       if (!box) return;
 
-      if (!cachedLeaders || cachedLeaders.length === 0) {
+      if (!cachedLeaders || cachedLeaders.length === 0) {{
         box.innerHTML = 'Leaderboard sa nepodarilo načítať.';
         return;
-      }
+      }}
 
-      box.innerHTML = cachedLeaders.slice(0, 5).map(function(row, idx) {
+      box.innerHTML = cachedLeaders.slice(0, 5).map(function(row, idx) {{
+        const wallet = row.wallet || '';
         return ''
-          + '<div class="leader-line">'
+          + '<div class="leader-line leader-click" onclick="loadWalletHistory(\\'' + escapeHtml(wallet) + '\\')">'
           +   '<div><strong>' + (idx + 1) + '.</strong></div>'
-          +   '<div><strong>' + (row.name || 'unknown') + '</strong><br><span class="small">Vol: ' + fmtInt(row.volume) + '</span></div>'
+          +   '<div><strong>' + escapeHtml(row.name || 'unknown') + '</strong><br><span class="small mono">' + escapeHtml(row.walletShort || '') + '</span></div>'
           +   '<div><span class="' + ((Number(row.profit) >= 0) ? 'delta-up' : 'delta-down') + '">' + fmtPnL(row.profit) + '</span></div>'
           + '</div>';
-      }).join('') + '<div class="small" style="margin-top:6px;">Leaderboard je len kontext; nie copy trading engine.</div>';
-    }
+      }}).join('') + '<div class="small" style="margin-top:6px;">Klik na wallet otvorí whale history. Dashboard filtruje len veľké pohyby nad ' + getWhaleMin().toLocaleString('sk-SK') + '.</div>';
+    }}
 
-    function selectWatchlistItem(slug) {
+    function selectWatchlistItem(slug) {{
       if (!slug) return;
-      const found = cachedMarkets.find(function(m) { return m.slug === slug; })
-        || cachedWatchlist.find(function(m) { return m.slug === slug; });
-      if (found) showDetail(found);
-    }
+      const found = cachedMarkets.find(function(m) {{ return m.slug === slug; }})
+        || cachedWatchlist.find(function(m) {{ return m.slug === slug; }});
+      if (found) {{
+        loadMarketTrades(found.slug).then(function() {{
+          showDetail(found);
+        }});
+      }}
+    }}
 
-    function buildTradeLogText(m) {
-      return ''
-        + 'KATEGORIZÁCIA TRHU: ' + (m.tradeTypeLabel || '') + '\\n\\n'
-        + 'PRE-TRADE CHECKLIST:\\n'
-        + '1. Resolutability: ' + ((m.checklist?.resolutability?.ok ? 'ÁNO' : 'NIE')) + ' - ' + (m.checklist?.resolutability?.note || '') + '\\n'
-        + '2. Base Rate: ' + ((m.checklist?.baseRate?.ok ? 'ÁNO' : 'NIE')) + ' - ' + (m.checklist?.baseRate?.note || '') + '\\n'
-        + '3. Frikcia: ' + ((m.checklist?.friction?.ok ? 'ÁNO' : 'NIE')) + ' - ' + (m.checklist?.friction?.note || '') + '\\n'
-        + '4. Exit: ' + ((m.checklist?.exit?.ok ? 'ÁNO' : 'NIE')) + ' - ' + (m.checklist?.exit?.note || '') + '\\n'
-        + '5. Catalyst: ' + ((m.checklist?.catalyst?.ok ? 'ÁNO' : 'NIE')) + ' - ' + (m.checklist?.catalyst?.note || '') + '\\n'
-        + '6. Oracle Trap: ' + ((m.checklist?.oracle?.ok ? 'ÁNO' : 'NIE')) + ' - ' + (m.checklist?.oracle?.note || '') + '\\n\\n'
-        + 'ANALÝZA EDGE-U:\\n'
-        + (m.autoDraft?.thesis || '') + '\\n\\n'
-        + 'KDE JE MISPRICING:\\n'
-        + (m.autoDraft?.mispricing || '') + '\\n\\n'
-        + 'TYP EDGE:\\n'
-        + (m.autoDraft?.edge || '') + '\\n\\n'
-        + 'RESOLUTION ANALÝZA:\\n'
-        + (m.autoDraft?.resolution || '') + '\\n\\n'
-        + 'PARAMETRE VSTUPU:\\n'
-        + 'Market: ' + (m.question || '') + '\\n'
-        + 'YES cena: ' + fmtPrice(m.yesPrice) + '\\n'
-        + 'NO cena: ' + fmtPrice(m.noPrice) + '\\n'
-        + 'Likvidita: ' + fmtInt(m.liquidity) + '\\n'
-        + '24h objem: ' + fmtInt(m.volume24hr) + '\\n'
-        + 'Dni do expirácie: ' + fmtDays(m.daysToEnd) + '\\n'
-        + 'Sizing hint: ' + (m.autoDraft?.sizingHint || '') + '\\n\\n'
-        + 'PLÁN VÝSTUPU:\\n'
-        + 'Fáza 1: podľa typu setupu a liquidity conditions\\n'
-        + 'Fáza 2: partial de-risk pri repricingu\\n'
-        + 'Runner: len ak edge ostáva platný\\n'
-        + 'Time-stop limit: 24–72h po očakávanom katalyzátore bez pohybu\\n\\n'
-        + 'INVALIDÁCIA (FULL EXIT TRIGGER):\\n'
-        + (m.autoDraft?.invalidation || '') + '\\n\\n'
-        + 'KATALYZÁTOR:\\n'
-        + (m.autoDraft?.catalyst || '') + '\\n\\n'
-        + 'WHALE SIGNAL:\\n'
-        + (m.whaleSignal?.label || '') + ' | ' + (m.whaleSignal?.copyNote || '') + '\\n\\n'
-        + 'CONFIDENCE:\\n'
-        + (m.autoDraft?.confidence || '') + '/10\\n\\n'
-        + 'BIAS:\\n'
-        + (m.autoDraft?.bias || '') + '\\n\\n'
-        + 'FINÁLNE ROZHODNUTIE:\\n'
-        + (m.autoDraft?.finalDecision || 'PASS') + '\\n';
-    }
-
-    async function copyTradeLog() {
-      if (!selectedMarket) return;
-      const text = buildTradeLogText(selectedMarket);
-      await navigator.clipboard.writeText(text);
-      const note = document.getElementById('savedNote');
-      if (note) note.textContent = 'Trade-log skopírovaný do clipboardu.';
-    }
-
-    function downloadTradeLog() {
-      if (!selectedMarket) return;
-      const text = buildTradeLogText(selectedMarket);
-      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = 'trade-log.txt';
-      a.click();
-      URL.revokeObjectURL(a.href);
-      const note = document.getElementById('savedNote');
-      if (note) note.textContent = 'Trade-log stiahnutý.';
-    }
-
-    function renderDeltaTracking(m) {
-      const key = m.slug || m.question;
-      const delta = currentDeltaMap.get(key);
-
-      if (!delta) {
-        return '<div class="panel-muted">Bez delta dát.</div>';
-      }
-
-      return ''
-        + '<div class="panel-muted">'
-        +   'YES delta: <span class="' + deltaClass(delta.yesDelta || 0) + '">' + fmtDelta(delta.yesDelta || 0) + '</span><br>'
-        +   'Gate delta: <span class="' + deltaClass(delta.gateDelta || 0) + '">' + (delta.gateDelta > 0 ? '+' : '') + (delta.gateDelta || 0) + '</span><br>'
-        +   'Likvidita delta: <span class="' + deltaClass(delta.liquidityDeltaPct || 0) + '">' + ((delta.liquidityDeltaPct || 0).toFixed(1)) + '%</span><br>'
-        +   'Zhrnutie: ' + (delta.summary.length ? delta.summary.join(' | ') : 'Bez významnej zmeny od posledného refreshu.')
-        + '</div>';
-    }
-
-    function renderWhaleSignal(m) {
-      const ws = m.whaleSignal || {};
-      const reasons = Array.isArray(ws.reasons) && ws.reasons.length
-        ? ws.reasons.map(function(r) { return '<div class="alert-line">' + r + '</div>'; }).join('')
-        : '<div class="alert-line">Bez výrazného flow kontextu.</div>';
-
-      return ''
-        + '<div class="draft-grid">'
-        +   '<div>Whale signal</div><div>' + (ws.label || '') + '</div>'
-        +   '<div>Late certainty</div><div>' + ((ws.lateCertainty) ? 'Áno' : 'Nie') + '</div>'
-        +   '<div>Copy režim</div><div>' + ((ws.copyOk) ? 'Povolený' : 'Zakázaný') + '</div>'
-        + '</div>'
-        + '<div class="panel-muted">' + (ws.copyNote || '') + '</div>'
-        + '<label class="block-label">Dôvody</label>'
-        + '<div class="panel-muted">' + reasons + '</div>'
-        + '<label class="block-label">Pravidlo v6</label>'
-        + '<div class="panel-muted">Whale alebo leaderboard signál nikdy nesmie zmeniť PASS na BUY. Môže len zvýšiť prioritu review alebo doplniť why now.</div>';
-    }
-
-    function showDetail(m) {
-      selectedMarket = m;
-      const panel = document.getElementById('detailPanel');
-      const tradeUrl = m.slug ? ('https://polymarket.com/event/' + m.slug) : 'https://polymarket.com';
-
-      panel.innerHTML = ''
-        + '<div class="detail-shell">'
-        +   '<div class="section">'
-        +     '<div class="title-row">'
-        +       '<div class="title-main">'
-        +         '<h3>' + (m.question || '') + '</h3>'
-        +         flagBadge(m.flagLabel)
-        +         ' '
-        +         decisionBadge(m.autoDraft?.finalDecision || 'PASS')
-        +         ' '
-        +         catBadge(m.categoryLabel || '')
-        +         ' '
-        +         '<span class="small">Typ: ' + (m.tradeTypeLabel || '') + '</span>'
-        +         ' '
-        +         '<span class="small">Gate: ' + (Number.isFinite(Number(m.gateScore)) ? m.gateScore : '') + '/6</span>'
-        +       '</div>'
-        +       '<a class="trade-link" href="' + tradeUrl + '" target="_blank" rel="noopener noreferrer">Otvoriť trade</a>'
-        +     '</div>'
-
-        +     '<div class="detail-top">'
-        +       '<div class="panel-muted">'
-        +         '<div class="draft-grid">'
-        +           '<div>Entry zóna</div><div>' + zoneBadge(m.entryZone) + '</div>'
-        +           '<div>Cluster</div><div>' + (m.cluster || '') + '</div>'
-        +           '<div>Fail point</div><div>' + (m.failPoint || '') + '</div>'
-        +           '<div>Sizing cap</div><div>' + (m.sizingCap || '') + '</div>'
-        +           '<div>Why now</div><div>' + (m.whyNow || '') + '</div>'
-        +         '</div>'
-        +       '</div>'
-        +       '<div>'
-        +         '<h3>Delta tracking</h3>'
-        +         renderDeltaTracking(m)
-        +       '</div>'
-        +     '</div>'
-        +   '</div>'
-
-        +   '<div class="detail-grid">'
-        +     '<div class="detail-card">'
-        +       '<h3>Mini 6/6 checklist</h3>'
-        +       renderChecklist(m.checklist || {})
-        +     '</div>'
-
-        +     '<div class="detail-card">'
-        +       '<h3>Systémový draft podľa v6</h3>'
-        +       '<div class="draft-grid">'
-        +         '<div>Bias</div><div>' + (m.autoDraft?.bias || '') + '</div>'
-        +         '<div>Rozhodnutie</div><div><strong>' + (m.autoDraft?.finalDecision || '') + '</strong></div>'
-        +         '<div>Confidence</div><div>' + (m.autoDraft?.confidence || '') + '/10</div>'
-        +         '<div>Sizing hint</div><div>' + (m.autoDraft?.sizingHint || '') + '</div>'
-        +       '</div>'
-
-        +       '<label class="block-label">Navrhovaná téza</label>'
-        +       '<div class="panel-muted">' + (m.autoDraft?.thesis || '') + '</div>'
-
-        +       '<label class="block-label">Kde je mispricing</label>'
-        +       '<div class="panel-muted">' + (m.autoDraft?.mispricing || '') + '</div>'
-
-        +       '<label class="block-label">Typ edge</label>'
-        +       '<div class="panel-muted">' + (m.autoDraft?.edge || '') + '</div>'
-
-        +       '<label class="block-label">Katalyzátor</label>'
-        +       '<div class="panel-muted">' + (m.autoDraft?.catalyst || '') + '</div>'
-
-        +       '<label class="block-label">Resolution analýza</label>'
-        +       '<div class="panel-muted">' + (m.autoDraft?.resolution || '') + '</div>'
-
-        +       '<label class="block-label">Invalidácia</label>'
-        +       '<div class="panel-muted">' + (m.autoDraft?.invalidation || '') + '</div>'
-
-        +       '<div class="action-row">'
-        +         '<button class="btn-primary" onclick="copyTradeLog()">Kopírovať trade-log šablónu</button>'
-        +         '<button onclick="downloadTradeLog()">Stiahnuť trade-log</button>'
-        +       '</div>'
-
-        +       '<div class="saved-note" id="savedNote"></div>'
-        +     '</div>'
-
-        +     '<div class="detail-card">'
-        +       '<h3>Entry / Exit plán</h3>'
-        +       '<div class="draft-grid">'
-        +         '<div>Entry side</div><div>' + (m.executionPlan?.entrySide || '') + '</div>'
-        +         '<div>Limit</div><div>' + (fmtPrice(m.executionPlan?.limitPrice) || '') + '</div>'
-        +         '<div>Stake</div><div>' + (m.executionPlan?.stakeUSDC ?? 0) + ' USDC (' + (m.executionPlan?.stakePct || '0%') + ')</div>'
-        +         '<div>Tranche</div><div>' + (m.executionPlan?.tranche1USDC ?? 0) + ' / ' + (m.executionPlan?.tranche2USDC ?? 0) + ' / ' + (m.executionPlan?.tranche3USDC ?? 0) + ' USDC</div>'
-        +         '<div>TP1</div><div>' + (m.executionPlan?.takeProfit1 || '') + '</div>'
-        +         '<div>TP2</div><div>' + (m.executionPlan?.takeProfit2 || '') + '</div>'
-        +       '</div>'
-        +       '<div class="panel-muted">' + (m.executionPlan?.tp1Action || '') + '</div>'
-        +       '<div style="height:8px;"></div>'
-        +       '<div class="panel-muted">' + (m.executionPlan?.tp2Action || '') + '</div>'
-        +       '<label class="block-label">Runner rule</label>'
-        +       '<div class="panel-muted">' + (m.executionPlan?.runnerRule || '') + '</div>'
-        +       '<label class="block-label">Time-stop</label>'
-        +       '<div class="panel-muted">' + (m.executionPlan?.timeStop || '') + '</div>'
-        +       '<label class="block-label">Full exit trigger</label>'
-        +       '<div class="panel-muted">' + (m.executionPlan?.fullExitTrigger || '') + '</div>'
-        +     '</div>'
-
-        +     '<div class="detail-card">'
-        +       '<h3>Whale / Flow signal</h3>'
-        +       renderWhaleSignal(m)
-        +     '</div>'
-        +   '</div>'
-        + '</div>';
-    }
-
-    function renderTable(markets) {
-      const tbody = document.querySelector('#markets-table tbody');
-      tbody.innerHTML = '';
-
-      markets.forEach(function(m) {
-        const tr = document.createElement('tr');
-        tr.className = 'clickable';
-
-        tr.innerHTML = ''
-          + '<td>' + flagBadge(m.flagLabel) + '</td>'
-          + '<td>' + decisionBadge(m.autoDraft?.finalDecision || 'PASS') + '</td>'
-          + '<td>' + zoneBadge(m.entryZone) + '</td>'
-          + '<td>' + (Number.isFinite(Number(m.gateScore)) ? m.gateScore : '') + '/6</td>'
-          + '<td>' + (Number.isFinite(Number(m.candidateScore)) ? m.candidateScore : '') + '</td>'
-          + '<td>' + (m.frictionLabelSk || '') + '</td>'
-          + '<td>' + (m.exitLabelSk || '') + '</td>'
-          + '<td>' + (m.tradeTypeLabel || '') + '</td>'
-          + '<td>' + catBadge(m.categoryLabel || '') + '</td>'
-          + '<td>' + oracleBadge(m.oracleRiskLabel || '') + '</td>'
-          + '<td class="question-cell"><div class="question-truncate">' + (m.question || '') + '</div></td>'
-          + '<td>' + fmtPrice(m.yesPrice) + '</td>'
-          + '<td>' + fmtPrice(m.noPrice) + '</td>'
-          + '<td>' + fmtInt(m.volume24hr) + '</td>'
-          + '<td>' + fmtInt(m.liquidity) + '</td>'
-          + '<td>' + fmtDays(m.daysToEnd) + '</td>';
-
-        tr.addEventListener('click', function() {
-          showDetail(m);
-        });
-
-        tbody.appendChild(tr);
-      });
-
-      if (markets.length > 0 && !selectedMarket) {
-        showDetail(markets[0]);
-      } else if (markets.length > 0 && selectedMarket) {
-        const found = markets.find(function(x) {
-          return x.slug === selectedMarket.slug;
-        });
-        if (found) showDetail(found);
-      }
-    }
-
-    async function loadLeaderboard() {
-      try {
-        const res = await fetch('/leaderboard?limit=8');
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-        cachedLeaders = data.leaders || [];
-      } catch (err) {
-        cachedLeaders = [];
-      }
-      renderLeaderboard();
-    }
-
-    async function loadMarkets() {
-      const errorBox = document.getElementById('markets-error');
-      errorBox.style.display = 'none';
-      errorBox.textContent = '';
-
-      const category = document.getElementById('category').value;
-      const minLiquidity = document.getElementById('minLiquidity').value;
-      const hidePass = document.getElementById('hidePass').checked;
-      const diversify = document.getElementById('diversify').checked;
-      const watchlistOnly = document.getElementById('watchlistOnly').checked;
-      const strictMode = document.getElementById('strictMode').checked;
-
-      updateStatusLine();
-
-      const params = new URLSearchParams({
-        limit: '80',
-        min_liquidity: minLiquidity,
-        hide_pass: hidePass ? 'true' : 'false',
-        diversify: diversify ? 'true' : 'false',
-        watchlist_only: watchlistOnly ? 'true' : 'false',
-        strict_mode: strictMode ? 'true' : 'false',
-      });
-
-      if (category) params.set('category', category);
-
-      try {
-        const res = await fetch('/markets?' + params.toString());
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-
-        cachedMarkets = data.markets || [];
-        cachedWatchlist = data.watchlist || [];
-
-        computeDeltaMap(cachedMarkets);
-        renderWatchlist();
-        renderAlerts();
-        renderTable(cachedMarkets);
-
-        document.getElementById('countBox').textContent =
-          'Zobrazené markety: ' + (data.count || 0);
-
-        lastRefreshAt = new Date();
-        updateStatusLine();
-      } catch (err) {
-        errorBox.style.display = 'block';
-        errorBox.textContent = 'Nepodarilo sa načítať markety: ' + err.message;
-      }
-    }
-
-    async function loadAll() {
-      await Promise.all([loadLeaderboard(), loadMarkets()]);
-    }
-
-    document.getElementById('refreshBtn').addEventListener('click', loadAll);
-    document.getElementById('strictMode').addEventListener('change', function() {
-      updateStatusLine();
-    });
-
-    loadAll();
-    scheduleNextRefresh();
-  </script>
-</body>
-</html>
-"""
-    html = html.replace("__TITLE__", title)
-
-    if default_min_liquidity == 100000:
-        html = html.replace("__MIN_LIQ_SELECTED__", "selected")
-    else:
-        html = html.replace("__MIN_LIQ_SELECTED__", "")
-
-    return html
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    async function load
