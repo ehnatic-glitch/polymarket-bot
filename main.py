@@ -1750,7 +1750,8 @@ def dashboard():
     .header-left .small {{ margin: 0; }}
     .header-right {{ display: flex; justify-content: flex-end; }}
     .status-card {{ width: 100%; font-size: 12px; color: #555; background: #ffffff; border: 1px solid #e8e8e8; border-radius: 8px; padding: 10px 12px; line-height: 1.45; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
-    .top-strip {{ display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(180px, 0.45fr) minmax(340px, 1.1fr); gap: 12px; margin-bottom: 14px; align-items: start; }}
+    .top-strip {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); gap: 12px; margin-bottom: 14px; align-items: start; }}
+    .top-left-stack {{ display: grid; gap: 12px; }}
     .compact-section {{ padding: 12px; }}
     .compact-box {{ padding: 8px 10px; font-size: 12px; line-height: 1.4; }}
     .controls {{ display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; align-items: end; }}
@@ -1818,7 +1819,7 @@ def dashboard():
     .leader-click:hover {{ background: #fafcff; }}
     .detail-shell {{ display: grid; gap: 14px; }}
     .detail-top {{ display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr); gap: 14px; align-items: start; }}
-    .detail-grid {{ display: grid; grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.35fr) minmax(300px, 1fr) minmax(260px, 0.9fr); gap: 14px; align-items: start; }}
+    .detail-grid {{ display: grid; grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.35fr) minmax(300px, 1fr); gap: 14px; align-items: start; }}
     .detail-card {{ background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); padding: 14px; min-height: 100%; }}
     .trade-tape {{ display: grid; gap: 6px; }}
     .trade-line {{ display: grid; grid-template-columns: 90px 1fr 110px 110px 90px 90px; gap: 8px; align-items: center; padding: 7px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; }}
@@ -1836,7 +1837,7 @@ def dashboard():
     .large-badge {{ display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; background: #eef2ff; color: #3949ab; }}
     .subnote {{ font-size: 11px; color: #666; margin-top: 6px; }}
     @media (max-width: 1350px) {{
-      .top-strip {{ grid-template-columns: 1fr 1fr; }}
+      .top-strip {{ grid-template-columns: 1fr; }}
       .detail-grid {{ grid-template-columns: 1fr 1fr; }}
     }}
     @media (max-width: 1200px) {{
@@ -1863,17 +1864,19 @@ def dashboard():
   </div>
 
   <div class="top-strip">
-    <div class="section compact-section">
-      <h2>Na sledovanie</h2>
-      <div id="watchlistBox" class="panel-muted compact-box">Načítavam watchlist...</div>
+    <div class="top-left-stack">
+      <div class="section compact-section">
+        <h2>Na sledovanie</h2>
+        <div id="watchlistBox" class="panel-muted compact-box">Načítavam watchlist...</div>
+      </div>
+      <div class="section compact-section">
+        <h2>Alerty</h2>
+        <div id="alertsBox" class="panel-muted compact-box">Zatiaľ bez alertov.</div>
+      </div>
     </div>
     <div class="section compact-section">
-      <h2>Alerty</h2>
-      <div id="alertsBox" class="panel-muted compact-box">Zatiaľ bez alertov.</div>
-    </div>
-    <div class="section compact-section">
-      <h2>Leaderboard</h2>
-      <div id="leaderboardBox" class="panel-muted compact-box">Načítavam leaderboard...</div>
+      <h2>Whale / Flow signal</h2>
+      <div id="whaleSignalBox" class="panel-muted compact-box">Vyber market v tabuľke pre zobrazenie whale obchodov.</div>
     </div>
   </div>
 
@@ -2545,9 +2548,10 @@ def dashboard():
         +       '<label class="block-label">Time-stop</label><div class="panel-muted">' + ((m.executionPlan && m.executionPlan.timeStop) || '') + '</div>'
         +       '<label class="block-label">Full exit trigger</label><div class="panel-muted">' + ((m.executionPlan && m.executionPlan.fullExitTrigger) || '') + '</div>'
         +     '</div>'
-        +     '<div class="detail-card"><h3>Whale / Flow signal</h3>' + renderWhaleSignal(m) + '</div>'
         +   '</div>'
         + '</div>';
+      const whaleBox = document.getElementById('whaleSignalBox');
+      if (whaleBox) whaleBox.innerHTML = renderWhaleSignal(m);
     }}
 
     function renderTable(markets) {{
@@ -2638,7 +2642,7 @@ def dashboard():
     }}
 
     async function loadAll() {{
-      await Promise.all([loadLeaderboard(), loadMarkets()]);
+      await loadMarkets();
     }}
 
     document.getElementById('refreshBtn')?.addEventListener('click', loadAll);
