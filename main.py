@@ -1908,6 +1908,7 @@ def markets():
     category_filter = request.args.get("category", "").strip()
     diversify = request.args.get("diversify", "true").lower() == "true"
     watchlist_only = request.args.get("watchlist_only", "false").lower() == "true"
+    buy_only = request.args.get("buy_only", "false").lower() == "true"
     strict_mode = request.args.get("strict_mode", "false").lower() == "true"
 
     params = {
@@ -1940,8 +1941,20 @@ def markets():
 
         all_rows.append(row)
 
-        if hide_pass and row.get("autoDraft", {}).get("finalDecision") == "PASS":
+        decision = row.get("autoDraft", {}).get("finalDecision")
+        gate_score = to_float(row.get("gateScore"))
+        is_watch = bool(row.get("isWatchlist"))
+        flag_label = row.get("flagLabel")
+
+        # Strict mode: zobraz len BUY signály
+        if buy_only and decision not in ("BUY YES", "BUY NO"):
             continue
+
+        # Skryť PASS, ale len ak je nízkej kvality (gate <4 a nie watchlist a flag nie je POTENCIÁL/WATCH)
+        if hide_pass and decision == "PASS":
+            keep = (gate_score >= 4) or is_watch or flag_label in ("POTENCIÁL", "WATCH")
+            if not keep:
+                continue
         if category_filter and row.get("category") != category_filter:
             continue
         if watchlist_only and not row.get("isWatchlist"):
@@ -1951,8 +1964,8 @@ def markets():
 
     rows.sort(
         key=lambda x: (
-            decision_priority(x.get("autoDraft", {}).get("finalDecision")),
             flag_priority(x.get("flagLabel")),
+            decision_priority(x.get("autoDraft", {}).get("finalDecision")),
             0 if x.get("category") != "Sports" else 1,
             -to_float(x.get("gateScore")),
             oracle_priority(x.get("oracleRisk")),
@@ -1965,8 +1978,8 @@ def markets():
     diversified_rows = apply_diversity(
         rows,
         diversify=diversify,
-        max_per_category=3,
-        max_per_cluster=2,
+        max_per_category=5,
+        max_per_cluster=3,
     )
 
     diversified_rows = diversified_rows[:limit]
@@ -1984,6 +1997,7 @@ def markets():
             "category": category_filter,
             "diversify": diversify,
             "watchlist_only": watchlist_only,
+            "buy_only": buy_only,
             "strict_mode": strict_mode,
         }
     })
@@ -2191,6 +2205,11 @@ def dashboard():
       <div class="checkbox-wrap">
         <input type="checkbox" id="watchlistOnly" />
         <label for="watchlistOnly">Len watchlist</label>
+      </div>
+
+      <div class="checkbox-wrap">
+        <input type="checkbox" id="buyOnly" />
+        <label for="buyOnly">Len BUY signály</label>
       </div>
 
       <div class="checkbox-wrap">
@@ -2982,6 +3001,7 @@ def dashboard():
       const hidePass = document.getElementById('hidePass')?.checked || false;
       const diversify = document.getElementById('diversify')?.checked || false;
       const watchlistOnly = document.getElementById('watchlistOnly')?.checked || false;
+      const buyOnly = document.getElementById('buyOnly')?.checked || false;
       const strictMode = document.getElementById('strictMode')?.checked || false;
       updateStatusLine();
       const params = new URLSearchParams({{
@@ -2990,6 +3010,7 @@ def dashboard():
         hide_pass: hidePass ? 'true' : 'false',
         diversify: diversify ? 'true' : 'false',
         watchlist_only: watchlistOnly ? 'true' : 'false',
+        buy_only: buyOnly ? 'true' : 'false',
         strict_mode: strictMode ? 'true' : 'false'
       }});
       if (category) params.set('category', category);
@@ -3102,6 +3123,7 @@ def dashboard():
 
     document.getElementById('refreshBtn')?.addEventListener('click', loadAll);
     document.getElementById('strictMode')?.addEventListener('change', function() {{ updateStatusLine(); }});
+    document.getElementById('buyOnly')?.addEventListener('change', loadMarkets);
     document.getElementById('whaleMinAmount')?.addEventListener('change', loadGlobalWhaleFlow);
     document.getElementById('includeSettles')?.addEventListener('change', loadGlobalWhaleFlow);
     document.getElementById('includeClosed')?.addEventListener('change', loadGlobalWhaleFlow);
