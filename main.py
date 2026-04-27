@@ -1822,8 +1822,12 @@ def dashboard():
     .detail-grid {{ display: grid; grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.35fr) minmax(300px, 1fr); gap: 14px; align-items: start; }}
     .detail-card {{ background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); padding: 14px; min-height: 100%; }}
     .trade-tape {{ display: grid; gap: 6px; }}
-    .trade-line {{ display: grid; grid-template-columns: 90px 90px 80px 120px 100px 100px; gap: 10px; align-items: center; padding: 7px 0; border-bottom: 1px solid #f0f0f0; font-size: 12.5px; }}
-    .trade-line .trade-market {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .trade-line {{ display: grid; grid-template-columns: 80px minmax(0, 1fr) 70px 110px 100px 100px; gap: 10px; align-items: center; padding: 7px 0; border-bottom: 1px solid #f0f0f0; font-size: 12.5px; }}
+    .trade-line .trade-market {{ line-height: 1.35; word-break: break-word; }}
+    .trade-line .trade-market a {{ color: #1558d6; text-decoration: underline; }}
+    .whale-stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 10px; padding: 8px 10px; background: #f7faff; border: 1px solid #e3ecff; border-radius: 6px; font-size: 12px; }}
+    .whale-stats .stat-label {{ color: #666; font-size: 11px; }}
+    .whale-stats .stat-value {{ font-weight: 700; font-size: 14px; }}
     .leader-line {{ grid-template-columns: 20px 1fr 90px auto !important; }}
     .leader-line .leader-meta {{ font-size: 11px; color: #777; }}
     .trade-line:last-child {{ border-bottom: none; }}
@@ -2410,8 +2414,33 @@ def dashboard():
     function renderWhaleSignal(m) {{
       const trades = currentMarketTrades || [];
       if (trades.length === 0) {{
-        return '<div class="small">Zatiaľ žiadne whale obchody nad ' + getWhaleMin().toLocaleString('sk-SK') + '.</div>';
+        return '<div class="small">Zatiaľ žiadne whale obchody nad ' + getWhaleMin().toLocaleString('sk-SK') + ' pre tento trh.</div>';
       }}
+      // Agregát
+      let buyUSD = 0, sellUSD = 0, yesUSD = 0, noUSD = 0;
+      trades.forEach(function(t) {{
+        const usd = Number(t.notional || 0);
+        const side = String(t.side || '').toUpperCase();
+        const oc = String(t.outcome || '').toLowerCase();
+        if (side === 'BUY') buyUSD += usd; else if (side === 'SELL') sellUSD += usd;
+        if (oc.indexOf('yes') >= 0) yesUSD += usd;
+        else if (oc.indexOf('no') >= 0) noUSD += usd;
+      }});
+      const totalUSD = buyUSD + sellUSD;
+      const fmt = function(v) {{ return Number(v || 0).toLocaleString('sk-SK', {{maximumFractionDigits: 0}}); }};
+      const dominant = (buyUSD >= sellUSD)
+        ? ('BUY ' + Math.round(buyUSD / Math.max(totalUSD, 1) * 100) + '%')
+        : ('SELL ' + Math.round(sellUSD / Math.max(totalUSD, 1) * 100) + '%');
+      const yesNoNote = (yesUSD || noUSD)
+        ? ('Yes ' + fmt(yesUSD) + ' / No ' + fmt(noUSD))
+        : '—';
+      const stats = ''
+        + '<div class="whale-stats">'
+        +   '<div><div class="stat-label">Počet whale obchodov</div><div class="stat-value">' + trades.length + '</div></div>'
+        +   '<div><div class="stat-label">Spolu USDC</div><div class="stat-value">' + fmt(totalUSD) + '</div></div>'
+        +   '<div><div class="stat-label">Dominantná strana</div><div class="stat-value">' + dominant + '</div></div>'
+        +   '<div><div class="stat-label">Yes vs No (USDC)</div><div class="stat-value" style="font-size:12px;">' + yesNoNote + '</div></div>'
+        + '</div>';
       const header = ''
         + '<div class="trade-line" style="font-weight:700; color:#555; border-bottom:2px solid #ddd;">'
         +   '<div>Side</div>'
@@ -2446,7 +2475,7 @@ def dashboard():
           +   '<div class="small">' + tsText + '</div>'
           + '</div>';
       }}).join('');
-      return '<div class="trade-tape">' + header + rows + '</div>';
+      return stats + '<div class="trade-tape">' + header + rows + '</div>';
     }}
 
     function renderDeltaTracking(m) {{
