@@ -1799,20 +1799,54 @@ def pnl_log_post():
     return jsonify({"ok": True})
 
 
+def is_slug_ongoing(slug):
+    """True ak market ešte beží (active=true, closed!=true, archived!=true, endDate v budúcnosti).
+    Per-slug 5 min cache pre Gamma lookup."""
+    if not slug:
+        return False
+    cached = cache_get("market_status", slug)
+    if cached is not None:
+        return cached.get("ongoing", False)
+    try:
+        r = requests.get(f"{GAMMA_BASE}/markets", params={"slug": slug}, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            cache_set("market_status", slug, {"ongoing": False}, ttl=300)
+            return False
+        m = data[0] if isinstance(data, list) else data
+        active = m.get("active") is True
+        closed = m.get("closed") is True
+        archived = m.get("archived") is True
+        end_date = parse_date(m.get("endDate"))
+        end_in_future = True
+        if end_date is not None:
+            end_in_future = end_date > datetime.now(timezone.utc)
+        ongoing = active and not closed and not archived and end_in_future
+        cache_set("market_status", slug, {"ongoing": ongoing}, ttl=300)
+        return ongoing
+    except Exception:
+        return False
+
+
 @app.route("/whale-flow")
 def whale_flow():
     """Top whale obchody naprieč vsetkými Polymarket trhmi (independent na dashboard scoringu).
 
-    Defaultne filtruje "settle" obchody (cena <0.05 alebo >0.95) — tých je väčšina všetky
-    sú zatváranie pozicií pred resolútion, nie predictive signál. Pomocou ?include_settles=true
-    sa dajú pridat spät.
+    Defaultne:
+      - filter cena 0.05–0.95 (settle obchody preprec)
+      - filter only_ongoing=true (vyhadže trhy ktoré sú closed/archived alebo s endDate v minulosti)
     """
     limit = safe_int(request.args.get("limit", "15"), 15)
     min_amount = to_float(request.args.get("min_amount", str(APP_CONFIG["whale_trade_min_notional"])))
     include_settles = request.args.get("include_settles", "false").lower() == "true"
-    fetch_count = max(limit * 6, 80)
+    only_ongoing = request.args.get("only_ongoing", "true").lower() == "true"
+    # Data API dáva 408 pri limit > ~100. Pri only_ongoing musime fetchnut maximum,
+    # lebo top trades sú typicky zo zatvorenych zapasov — musime presievat hlúbšie.
+    fetch_count = 100
 
-    cached = cache_get("whale_flow", (limit, min_amount, include_settles))
+    cache_key = (limit, min_amount, include_settles, only_ongoing)
+    cached = cache_get("whale_flow", cache_key)
     if cached is not None:
         return jsonify(cached)
 
@@ -1833,16 +1867,33 @@ def whale_flow():
         if not include_settles:
             normalized = [x for x in normalized if 0.05 <= to_float(x.get("price"), 0) <= 0.95]
         normalized.sort(key=lambda x: to_float(x.get("notional"), 0), reverse=True)
+
+        if only_ongoing:
+            ongoing = []
+            seen_slugs = {}
+            for t in normalized:
+                slug = t.get("slug")
+                if not slug:
+                    continue
+                if slug not in seen_slugs:
+                    seen_slugs[slug] = is_slug_ongoing(slug)
+                if seen_slugs[slug]:
+                    ongoing.append(t)
+                if len(ongoing) >= limit:
+                    break
+            normalized = ongoing
+
         result = {
             "count": len(normalized[:limit]),
             "whaleMinNotional": min_amount,
             "includeSettles": include_settles,
+            "onlyOngoing": only_ongoing,
             "trades": normalized[:limit],
         }
-        cache_set("whale_flow", (limit, min_amount, include_settles), result, ttl=30)
+        cache_set("whale_flow", cache_key, result, ttl=30)
         return jsonify(result)
-    except Exception:
-        return jsonify({"count": 0, "trades": [], "whaleMinNotional": min_amount, "includeSettles": include_settles})
+    except Exception as e:
+        return jsonify({"count": 0, "trades": [], "whaleMinNotional": min_amount, "includeSettles": include_settles, "onlyOngoing": only_ongoing, "error": str(e)})
 
 
 @app.route("/markets")
@@ -2090,43 +2141,6 @@ def dashboard():
     </div>
   </div>
 
-  <div class="top-strip">
-    <div class="top-left-stack">
-      <div class="section compact-section">
-        <h2>Na sledovanie</h2>
-        <div id="watchlistBox" class="panel-muted compact-box">Načítavam watchlist...</div>
-      </div>
-      <div class="section compact-section">
-        <h2>Alerty</h2>
-        <div id="alertsBox" class="panel-muted compact-box">Zatiaľ bez alertov.</div>
-      </div>
-    </div>
-    <div class="section compact-section">
-      <h2>Whale / Flow signal <span class="small" style="font-weight:400;">— vybraný market</span></h2>
-      <div id="whaleSignalBox" class="panel-muted compact-box">Vyber market v tabuľke pre zobrazenie whale obchodov.</div>
-    </div>
-  </div>
-
-  <div class="section">
-    <h2>Globálny whale flow <span class="small" style="font-weight:400;">— top obchody naprieč Polymarket (independent na v6 filtri)</span></h2>
-    <div class="controls" style="margin-bottom:8px;">
-      <div class="control">
-        <label for="whaleMinAmount">Min USDC</label>
-        <select id="whaleMinAmount">
-          <option value="100000">100 000</option>
-          <option value="200000" selected>200 000</option>
-          <option value="500000">500 000</option>
-          <option value="1000000">1 000 000</option>
-        </select>
-      </div>
-      <div class="control" style="display:flex;align-items:center;gap:6px;">
-        <input type="checkbox" id="includeSettles" />
-        <label for="includeSettles">Vrátane settle obchodov (cena &lt;0.05 alebo &gt;0.95)</label>
-      </div>
-    </div>
-    <div id="globalWhaleBox" class="panel-muted compact-box">Načítavam globálny whale flow...</div>
-  </div>
-
   <div class="section">
     <h2>Top kandidáti</h2>
 
@@ -2225,6 +2239,49 @@ def dashboard():
       <p class="panel-muted">Klikni na riadok v tabuľke a zobrazí sa detail trhu, checklist, systémový draft, entry/exit plán, recent whale trades a história whale aktivít.</p>
     </div>
   </div>
+
+  <div class="top-strip">
+    <div class="top-left-stack">
+      <div class="section compact-section">
+        <h2>Na sledovanie</h2>
+        <div id="watchlistBox" class="panel-muted compact-box">Načítavam watchlist...</div>
+      </div>
+      <div class="section compact-section">
+        <h2>Alerty</h2>
+        <div id="alertsBox" class="panel-muted compact-box">Zatiaľ bez alertov.</div>
+      </div>
+    </div>
+    <div class="section compact-section">
+      <h2>Whale / Flow signal <span class="small" style="font-weight:400;">— vybraný market</span></h2>
+      <div id="whaleSignalBox" class="panel-muted compact-box">Vyber market v tabuľke pre zobrazenie whale obchodov.</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Globálny whale flow <span class="small" style="font-weight:400;">— top obchody naprieč Polymarket, len prebiehajúce trhy</span></h2>
+    <div class="controls" style="margin-bottom:8px;">
+      <div class="control">
+        <label for="whaleMinAmount">Min USDC</label>
+        <select id="whaleMinAmount">
+          <option value="50000">50 000</option>
+          <option value="100000" selected>100 000</option>
+          <option value="200000">200 000</option>
+          <option value="500000">500 000</option>
+          <option value="1000000">1 000 000</option>
+        </select>
+      </div>
+      <div class="control" style="display:flex;align-items:center;gap:6px;">
+        <input type="checkbox" id="includeSettles" />
+        <label for="includeSettles">Vrátane settle obchodov (cena &lt;0.05 alebo &gt;0.95)</label>
+      </div>
+      <div class="control" style="display:flex;align-items:center;gap:6px;">
+        <input type="checkbox" id="includeClosed" />
+        <label for="includeClosed">Vrátane uzavretých trhov</label>
+      </div>
+    </div>
+    <div id="globalWhaleBox" class="panel-muted compact-box">Načítavam globálny whale flow...</div>
+  </div>
+
 
   <script>
     let cachedMarkets = [];
@@ -3026,10 +3083,12 @@ def dashboard():
       if (!box) return;
       const minSel = document.getElementById('whaleMinAmount');
       const settlesEl = document.getElementById('includeSettles');
-      const minAmount = (minSel && minSel.value) ? minSel.value : '200000';
+      const closedEl = document.getElementById('includeClosed');
+      const minAmount = (minSel && minSel.value) ? minSel.value : '100000';
       const includeSettles = settlesEl && settlesEl.checked ? 'true' : 'false';
+      const onlyOngoing = closedEl && closedEl.checked ? 'false' : 'true';
       try {{
-        const res = await fetch('/whale-flow?limit=15&min_amount=' + encodeURIComponent(minAmount) + '&include_settles=' + includeSettles);
+        const res = await fetch('/whale-flow?limit=15&min_amount=' + encodeURIComponent(minAmount) + '&include_settles=' + includeSettles + '&only_ongoing=' + onlyOngoing);
         const data = await res.json();
         box.innerHTML = renderGlobalWhaleFlow(data);
       }} catch (err) {{
@@ -3045,6 +3104,7 @@ def dashboard():
     document.getElementById('strictMode')?.addEventListener('change', function() {{ updateStatusLine(); }});
     document.getElementById('whaleMinAmount')?.addEventListener('change', loadGlobalWhaleFlow);
     document.getElementById('includeSettles')?.addEventListener('change', loadGlobalWhaleFlow);
+    document.getElementById('includeClosed')?.addEventListener('change', loadGlobalWhaleFlow);
 
     loadAll();
     scheduleNextRefresh();
