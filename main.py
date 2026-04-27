@@ -1822,8 +1822,7 @@ def dashboard():
     .detail-grid {{ display: grid; grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.35fr) minmax(300px, 1fr); gap: 14px; align-items: start; }}
     .detail-card {{ background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); padding: 14px; min-height: 100%; }}
     .trade-tape {{ display: grid; gap: 6px; }}
-    .trade-line {{ display: grid; grid-template-columns: 90px 1fr 110px 110px 90px 90px; gap: 8px; align-items: center; padding: 7px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; }}
-    .trade-line .trade-market {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .trade-line {{ display: grid; grid-template-columns: 100px 90px 130px 110px 100px; gap: 12px; align-items: center; padding: 7px 0; border-bottom: 1px solid #f0f0f0; font-size: 12.5px; }}
     .leader-line {{ grid-template-columns: 20px 1fr 90px auto !important; }}
     .leader-line .leader-meta {{ font-size: 11px; color: #777; }}
     .trade-line:last-child {{ border-bottom: none; }}
@@ -2415,33 +2414,29 @@ def dashboard():
       const header = ''
         + '<div class="trade-line" style="font-weight:700; color:#555; border-bottom:2px solid #ddd;">'
         +   '<div>Side</div>'
-        +   '<div>Trh / Otvoriť</div>'
-        +   '<div>Cena × Size</div>'
-        +   '<div>USDC</div>'
-        +   '<div>Wallet</div>'
+        +   '<div>Cena</div>'
+        +   '<div>Objem (akcie)</div>'
+        +   '<div>USDC spolu</div>'
         +   '<div>Čas</div>'
         + '</div>';
-      const rows = trades.slice(0, 10).map(function(t) {{
+      const sorted = trades.slice().sort(function(a, b) {{
+        return Number(b.notional || 0) - Number(a.notional || 0);
+      }});
+      const rows = sorted.slice(0, 12).map(function(t) {{
         const side = String(t.side || '').toUpperCase();
         const sideHtml = sideBadge(side);
         const outcome = t.outcome || '';
         const ts = t.timestamp ? new Date(Number(t.timestamp) * 1000) : null;
         const tsText = ts ? fmtDateTime(ts) : (t.timestampIso || '');
-        const wallet = t.wallet || '';
-        const walletShort = t.walletShort || (wallet ? (wallet.slice(0, 6) + '…' + wallet.slice(-4)) : '');
         const usd = Number(t.notional || 0);
         const price = Number(t.price || 0);
         const sizeShares = Number(t.size || 0);
-        const title = String(t.title || m.question || '').replace(/"/g, '&quot;');
-        const slug = t.slug || m.slug || '';
-        const tradeUrl = slug ? ('https://polymarket.com/event/' + slug) : 'https://polymarket.com';
         return ''
           + '<div class="trade-line">'
           +   '<div>' + sideHtml + ' <span class="trade-outcome">' + outcome + '</span></div>'
-          +   '<div class="trade-market" title="' + title + '"><a href="' + tradeUrl + '" target="_blank" rel="noopener">' + (title || slug || '—') + '</a></div>'
-          +   '<div>' + (Number.isFinite(price) ? price.toFixed(3) : '') + ' × ' + (Number.isFinite(sizeShares) ? sizeShares.toLocaleString('sk-SK', {{maximumFractionDigits: 0}}) : '') + '</div>'
+          +   '<div>' + (Number.isFinite(price) ? price.toFixed(3) : '') + '</div>'
+          +   '<div>' + (Number.isFinite(sizeShares) ? sizeShares.toLocaleString('sk-SK', {{maximumFractionDigits: 0}}) : '') + '</div>'
           +   '<div><strong>' + (Number.isFinite(usd) ? usd.toLocaleString('sk-SK', {{maximumFractionDigits: 0}}) : '0') + '</strong></div>'
-          +   '<div class="small mono leader-click" onclick="loadWalletHistory(\\'' + wallet + '\\')">' + walletShort + '</div>'
           +   '<div class="small">' + tsText + '</div>'
           + '</div>';
       }}).join('');
