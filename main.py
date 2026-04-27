@@ -331,7 +331,7 @@ def categorize_market(question):
 def detect_trade_type(question, yes_price, days_to_end):
     q = (question or "").lower()
 
-    if isinstance(yes_price, (int, float)) and 0.01 <= yes_price <= 0.05:
+    if isinstance(yes_price, (int, float)) and 0.005 <= yes_price <= 0.07:
         return "Centovka"
 
     resolution_keywords = [
@@ -391,6 +391,8 @@ def detect_catalyst(question, days_to_end):
 
     if any(k in q for k in ["vote", "voting", "election", "runoff"]):
         return ("Vote/Election", "High")
+    if any(k in q for k in ["nomination", "nominee", "primary", "primaries", "convention", "debate"]):
+        return ("Nomination/Primary", "Medium")
     if any(k in q for k in ["deadline", "by ", "before ", "by end of", "before end of"]):
         return ("Deadline", "Medium")
     if any(k in q for k in ["earnings", "cpi", "report", "announcement", "fomc", "fed"]):
@@ -537,9 +539,6 @@ def exit_score(liquidity, volume24hr, yes_price, days_to_end):
 
 
 def decision_bias(flag, yes_price, oracle_risk, trade_type, gate_score, fr_score, ex_score, category=None):
-    if flag == "PASS":
-        return "No trade", "PASS"
-
     if not isinstance(yes_price, (int, float)):
         return "No trade", "PASS"
 
@@ -550,26 +549,69 @@ def decision_bias(flag, yes_price, oracle_risk, trade_type, gate_score, fr_score
     # lebo kategória je už penalizovaná a centovky tu väčšinou nie sú edge, len lottery ticket.
     sport_or_narrative = category in ("Sports", "Narrative")
 
+    # Centovka by-pass: aj keď score_market dá PASS flag (lebo extreme price + far expiry penalty),
+    # podla v6 sú centovky legítne lottery tickety s asymetrickým R:R. Vyžaduje len gate>=4 + Low oracle.
+    centovka_qualifies = (
+        trade_type == "Centovka"
+        and gate_score >= 4
+        and fr_score >= 1
+        and ex_score >= 1
+        and oracle_risk == "Low"
+        and not sport_or_narrative
+    )
+
+    # Mirror centovka by-pass: yes >= 0.95 — BUY NO ako symetrický centovka
+    mirror_qualifies = (
+        gate_score >= 4
+        and fr_score >= 1
+        and ex_score >= 1
+        and oracle_risk == "Low"
+        and not sport_or_narrative
+    )
+
+    if flag == "PASS" and not (centovka_qualifies or mirror_qualifies):
+        return "No trade", "PASS"
+
+    # POTENCIÁL (REVIEW) trh — pri rozumnom gate dovolíme BUY signal aj mimo "WATCH" flagu
+    review_qualifies = flag in ("WATCH", "REVIEW") and gate_score >= 5 and not sport_or_narrative
+
+    # Cenovo extrémna zóna YES <= 5c — klasická v6 centovka (5–12 USDC)
+    if yes_price <= 0.05:
+        if centovka_qualifies:
+            return "Lean YES (centovka)", "BUY YES"
+        if sport_or_narrative:
+            return "Lean YES (watch)", "PASS"
+        return "No trade", "PASS"
+
+    # 5–15c — lacný long-tail tip, vyžaduje gate≥5
     if yes_price < 0.15:
-        if gate_score >= 5 and fr_score >= 3 and ex_score >= 2 and trade_type == "Centovka":
-            if sport_or_narrative:
-                return "Lean YES (watch)", "PASS"
+        if review_qualifies and trade_type in ("Centovka", "Momentum", "Resolution", "Time Decay"):
             return "Lean YES", "BUY YES"
         if sport_or_narrative:
             return "Lean NO (watch)", "PASS"
         return "Lean NO", "BUY NO"
+
+    # 85–95c — BUY NO ako mirror centovka
+    if yes_price >= 0.95:
+        if mirror_qualifies:
+            return "Lean NO (mirror centovka)", "BUY NO"
+        return "No trade", "PASS"
 
     if yes_price > 0.85:
+        if review_qualifies:
+            return "Lean NO", "BUY NO"
         if sport_or_narrative:
             return "Lean NO (watch)", "PASS"
         return "Lean NO", "BUY NO"
 
+    # Mid-band BUY YES (0.15–0.45)
     if 0.15 <= yes_price <= 0.45:
-        if flag == "WATCH" and gate_score >= 5 and not sport_or_narrative:
+        if review_qualifies:
             return "Lean YES", "BUY YES"
 
+    # Mid-band BUY NO (0.55–0.85)
     if 0.55 <= yes_price <= 0.85:
-        if flag == "WATCH" and gate_score >= 5 and not sport_or_narrative:
+        if review_qualifies:
             return "Lean NO", "BUY NO"
 
     return "No trade", "PASS"
@@ -1007,7 +1049,9 @@ def score_market(m, strict_mode=False):
     gate_base_rate = category in ["Politics", "Crypto", "Sports", "Other", "Geopolitics"]
     gate_friction = fr_score >= 3
     gate_exit = ex_score >= 2
-    gate_catalyst = catalyst_confidence in ["High", "Medium"] and days_to_end is not None and days_to_end <= 180
+    # Centovky môžu byť dlhodobé (volby 2028, BTC ATH atd) - rozsahy až do 540 dní
+    catalyst_window_days = 540 if trade_type == "Centovka" else 180
+    gate_catalyst = catalyst_confidence in ["High", "Medium"] and days_to_end is not None and days_to_end <= catalyst_window_days
     gate_oracle = oracle_risk != "High"
 
     gate_score = sum([
@@ -1385,9 +1429,25 @@ def watchlist_priority(row):
     return 3
 
 
-def apply_diversity(rows, diversify=True, max_per_category=3, max_per_cluster=2):
+def apply_diversity(rows, diversify=True, max_per_category=None, max_per_cluster=3):
+    """Per-kategória diverzifikacia. Sport/Narrative obmedzené (úží cap),
+    ostatné majú široký priestor (Politics 2028 nominees maď cca 100 trhov)."""
     if not diversify:
         return rows
+
+    if max_per_category is None or isinstance(max_per_category, int):
+        # backwards compat: ak je int, použije sa global cap, ale Sports/Narrative obmedzíme
+        global_cap = max_per_category if isinstance(max_per_category, int) else 8
+        max_per_category = {
+            "Sports": 3,
+            "Narrative": 2,
+            "Politics": global_cap,
+            "Crypto": global_cap,
+            "Geopolitics": global_cap,
+            "Other": global_cap,
+        }
+
+    default_cap = max(max_per_category.values()) if max_per_category else 8
 
     category_counts = defaultdict(int)
     cluster_counts = defaultdict(int)
@@ -1396,8 +1456,9 @@ def apply_diversity(rows, diversify=True, max_per_category=3, max_per_cluster=2)
     for row in rows:
         cat = row.get("category", "Other")
         cluster = row.get("cluster", "misc")
+        cap = max_per_category.get(cat, default_cap)
 
-        if category_counts[cat] >= max_per_category:
+        if category_counts[cat] >= cap:
             continue
         if cluster_counts[cluster] >= max_per_cluster:
             continue
@@ -1962,12 +2023,24 @@ def markets():
 
         rows.append(row)
 
+    def price_edge_distance(x):
+        # ako ďaleko od 0.50 — väčšia vzdialenosť = silnejší convict signal
+        op = x.get("outcomePrices") or [None]
+        try:
+            yes = float(op[0]) if op else None
+        except (TypeError, ValueError):
+            yes = None
+        if not isinstance(yes, (int, float)):
+            return 0.0
+        return -abs(yes - 0.5)  # neg — čím ďalej, tým vyššie v sortingu
+
     rows.sort(
         key=lambda x: (
+            decision_priority(x.get("autoDraft", {}).get("finalDecision")),  # BUY hore
             flag_priority(x.get("flagLabel")),
-            decision_priority(x.get("autoDraft", {}).get("finalDecision")),
-            0 if x.get("category") != "Sports" else 1,
             -to_float(x.get("gateScore")),
+            0 if x.get("category") != "Sports" else 1,
+            price_edge_distance(x),
             oracle_priority(x.get("oracleRisk")),
             -to_float(x.get("candidateScore")),
             -to_float(x.get("liquidity")),
@@ -1978,7 +2051,14 @@ def markets():
     diversified_rows = apply_diversity(
         rows,
         diversify=diversify,
-        max_per_category=5,
+        max_per_category={
+            "Sports": 3,
+            "Narrative": 2,
+            "Politics": 10,
+            "Crypto": 8,
+            "Geopolitics": 8,
+            "Other": 8,
+        },
         max_per_cluster=3,
     )
 
