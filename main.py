@@ -349,9 +349,25 @@ def categorize_market(question):
     q = (question or "").lower()
 
     sports_keywords = [
+        # leagues / events
         "world cup", "nba finals", "nfl", "mlb", "stanley cup",
         "champions league", "premier league", "ufc", "fifa",
-        "win the 2026", "win the finals", "win the world cup"
+        "super bowl", "world series", "nhl", "nascar", "f1", "formula 1",
+        "tennis", "atp", "wta", "golf", "pga", "masters", "open champ",
+        "esports", "counter-strike", "valorant", "league of legends", "lol world",
+        "olympics", "euroleague", "bundesliga", "la liga", "serie a", "mls",
+        "copa america", "euro 2028", "afcon", "asian cup",
+        # generic event phrasings (športové — confer/cup/finals sú typické pre sport)
+        "win the finals", "win the world cup", "win the western confer",
+        "win the eastern confer", "win the conference",
+        "win the western", "win the eastern", "win the playoffs",
+        "win the divisional", "win the wild card",
+        # team-name proxies (covers individual team markets)
+        "lakers", "celtics", "knicks", "warriors", "heat", "nuggets",
+        "thunder", "raptors", "magic", "pistons", "bucks", "76ers",
+        "chiefs", "eagles", "cowboys", "49ers",
+        "manchester united", "liverpool", "arsenal", "chelsea", "barcelona",
+        "real madrid", "bayern", "psg",
     ]
     politics_keywords = [
         "presidential", "election", "senate", "house", "democratic",
@@ -2622,6 +2638,221 @@ def markets_top():
     return markets()
 
 
+def candidate_score_v7(row):
+    """Sniper v7 non-sports candidate scoring.
+
+    score = resolution_score + oracle_clarity_score + catalyst_score − friction_score
+
+    — resolution_score: text trade type bonus (Resolution/Trap/Info-Timing > Momentum > Other)
+    — oracle_clarity_score: Low oracle = +3, Medium = +1, High = −2
+    — catalyst_score: High = +3, Medium = +1, Low/None = 0; bonus +2 ak deadline 2–45d
+    — friction_score: friction_pp / 2 (penalizuje vyšší friction)
+    — hard penalt: -100 ak hardOK=False alebo finalDecision=PASS
+    """
+    auto = row.get("autoDraft") or {}
+    final = auto.get("finalDecision", "PASS")
+    cv7 = row.get("checklistV7") or {}
+    summary = cv7.get("summary", {})
+
+    # Hard disqualify
+    if final == "PASS":
+        return -1000
+    if not summary.get("hardAllOk", False):
+        return -100
+
+    score = 0.0
+
+    # Resolution score — trade type bonus
+    tt = (row.get("tradeType") or "").strip()
+    score += {
+        "Resolution": 4.0,
+        "Trap": 3.5,
+        "Info-Timing": 3.0,
+        "Time Decay": 2.5,
+        "Momentum": 2.0,
+        "Value": 1.5,
+        "Mean reversion": 1.0,
+        "Centovka": 1.5,
+        "Other": 0.5,
+    }.get(tt, 0.0)
+
+    # Oracle clarity (zisk z hard.edge a soft.oracleTrap)
+    oracle_grade = (cv7.get("soft", {}).get("oracleTrap", {}) or {}).get("grade", "slabo")
+    score += {"silne": 3.0, "stredne": 1.0, "slabo": -2.0}.get(oracle_grade, 0)
+
+    # Catalyst
+    catalyst_grade = (cv7.get("soft", {}).get("catalyst", {}) or {}).get("grade", "slabo")
+    score += {"silne": 3.0, "stredne": 1.0, "slabo": 0.0}.get(catalyst_grade, 0)
+
+    # Catalyst window bonus (2–45 dňí = ideál)
+    days = row.get("daysToEnd")
+    if isinstance(days, (int, float)):
+        if 2 <= days <= 45:
+            score += 2.0
+        elif 45 < days <= 60:
+            score += 1.0
+
+    # Friction penalty (z hard.edge.frictionPp)
+    edge_obj = cv7.get("hard", {}).get("edge", {})
+    friction_pp = edge_obj.get("frictionPp")
+    if isinstance(friction_pp, (int, float)):
+        score -= friction_pp / 2.0
+
+    # Liquidity bonus (silnejšia exekutíva)
+    liq = float(row.get("liquidityNum") or row.get("liquidity") or 0)
+    if liq >= 500000:
+        score += 1.0
+    elif liq >= 100000:
+        score += 0.5
+
+    # Spread penalty (nad 5pp = penalizuj)
+    ep = row.get("executionPlan") or {}
+    spread = ep.get("spreadPct")
+    if isinstance(spread, (int, float)) and spread > 5.0:
+        score -= 2.0
+
+    return round(score, 2)
+
+
+@app.route("/candidates/non-sports")
+def candidates_non_sports():
+    """Sniper v7 non-sports kandidáti, prefiltrovaní podľa užívateľa-defined kriterií.
+
+    Filters:
+      — ne-sport kategória (Sports = vyhodené)
+      — expiry 2–60 dňí
+      — spread ≤ 6pp
+      — likvidita ≥ 50k USDC
+      — BUY YES/NO decision + hardAllOk
+
+    Vráti top 5 zoradených podľa candidate_score_v7.
+    """
+    try:
+        # Relaxed liquidity to catch resolution markets
+        min_liq = float(request.args.get("min_liquidity", "50000"))
+        limit = int(request.args.get("limit", "5"))
+    except Exception:
+        min_liq = 50000.0
+        limit = 5
+
+    # Fetch markets via Gamma API (same pattern ako /markets endpoint)
+    cache_key_gamma = ("gamma_markets", False)
+    data = cache_get("gamma", cache_key_gamma)
+    if data is None:
+        try:
+            r = requests.get(
+                f"{GAMMA_BASE}/markets",
+                params={"limit": 400, "active": "true", "closed": "false"},
+                timeout=20,
+            )
+            r.raise_for_status()
+            data = r.json()
+            cache_set("gamma", cache_key_gamma, data, ttl=60)
+        except Exception as exc:
+            return jsonify({"error": f"Gamma fetch failed: {exc}", "top": []}), 502
+
+    rows = []
+    for m in (data or []):
+        if m.get("active") is not True or m.get("closed") is True:
+            continue
+        try:
+            row = build_market_row(m, strict_mode=False)
+        except Exception:
+            continue
+        if not row:
+            continue
+        if to_float(row.get("liquidity")) < min_liq:
+            continue
+        rows.append(row)
+
+    qualified = []
+    for row in rows:
+        # 1) Vyhoď šport
+        if row.get("category") == "Sports":
+            continue
+
+        # 2) Expiry 2–60 dňí
+        days = row.get("daysToEnd")
+        if not isinstance(days, (int, float)) or days < 2 or days > 60:
+            continue
+
+        # 3) Spread ≤ 6pp
+        ep = row.get("executionPlan") or {}
+        spread = ep.get("spreadPct")
+        if isinstance(spread, (int, float)) and spread > 6.0:
+            continue
+
+        # 4) BUY decision + hardOK
+        auto = row.get("autoDraft") or {}
+        if not auto.get("finalDecision", "").startswith("BUY"):
+            continue
+        cv7 = row.get("checklistV7") or {}
+        if not (cv7.get("summary") or {}).get("hardAllOk", False):
+            continue
+
+        score = candidate_score_v7(row)
+        if score <= 0:
+            continue
+
+        qualified.append((score, row))
+
+    qualified.sort(key=lambda x: -x[0])
+    top = qualified[:limit]
+
+    out = []
+    for score, row in top:
+        ep = row.get("executionPlan") or {}
+        cv7 = row.get("checklistV7") or {}
+        edge = cv7.get("hard", {}).get("edge", {})
+        out.append({
+            "candidateScore": score,
+            "slug": row.get("slug"),
+            "question": row.get("question"),
+            "category": row.get("category"),
+            "tradeType": row.get("tradeType"),
+            "finalDecision": (row.get("autoDraft") or {}).get("finalDecision"),
+            "yesPrice": row.get("yesPrice"),
+            "noPrice": row.get("noPrice"),
+            "liquidity": row.get("liquidity"),
+            "volume24hr": row.get("volume24hr"),
+            "daysToEnd": row.get("daysToEnd"),
+            "endDate": row.get("endDate"),
+            "oracleRisk": row.get("oracleRisk"),
+            "resolutionSource": row.get("resolutionSource"),
+            "executionPlan": {
+                "entrySide": ep.get("entrySide"),
+                "buyLimitPrice": ep.get("buyLimitPrice"),
+                "sellLimitPrice": ep.get("sellLimitPrice"),
+                "bestBid": ep.get("bestBid"),
+                "bestAsk": ep.get("bestAsk"),
+                "spreadPct": ep.get("spreadPct"),
+                "stakeUSDC": ep.get("stakeUSDC"),
+                "takeProfit1": ep.get("takeProfit1"),
+                "takeProfit2": ep.get("takeProfit2"),
+            },
+            "hardEdge": {
+                "thresholdPp": edge.get("thresholdPp"),
+                "frictionPp": edge.get("frictionPp"),
+                "afterCostEdgePp": edge.get("afterCostEdgePp"),
+                "note": edge.get("note"),
+            },
+            "polymarketUrl": f"https://polymarket.com/event/{row.get('slug')}" if row.get("slug") else None,
+        })
+
+    return jsonify({
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "filters": {
+            "min_liquidity": min_liq,
+            "expiry_days": [2, 60],
+            "max_spread_pp": 6.0,
+            "non_sports_only": True,
+            "hard_ok_required": True,
+        },
+        "totalQualified": len(qualified),
+        "top": out,
+    })
+
+
 @app.route("/analyze-market", methods=["POST"])
 def analyze_market():
     payload = request.get_json(force=True, silent=True) or {}
@@ -2782,6 +3013,12 @@ def dashboard():
   <div class="section" id="riskManagerSection">
     <h2>v7 Risk Manager</h2>
     <div id="riskManager" class="risk-grid">Načítava sa risk overview...</div>
+  </div>
+
+  <div class="section" id="nonSportsSection">
+    <h2>Top non-sports kandidáti <span class="small" style="font-weight:400;">— Sniper v7.0 edge engine</span></h2>
+    <div class="small" style="margin-bottom:8px;color:#666;">Filter: ne-šport · expiry 2–60d · spread ≤ 6pp · likvidita ≥ 50k · BUY+hardOK. Zoradené podľa resolution + oracle_clarity + catalyst − friction.</div>
+    <div id="nonSportsBox">Načítava sa...</div>
   </div>
 
   <div class="section">
@@ -3844,8 +4081,56 @@ def dashboard():
       }}
     }}
 
+    async function loadNonSports() {{
+      const box = document.getElementById('nonSportsBox');
+      if (!box) return;
+      try {{
+        const res = await fetch('/candidates/non-sports?limit=5');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const d = await res.json();
+        if (!d.top || d.top.length === 0) {{
+          box.innerHTML = '<div class="small">Žiadny non-sports kandidát nespĺňa v7.0 kvalifikácie (BUY + hardOK + spread ≤ 6pp + expiry 2–60d).</div>';
+          return;
+        }}
+        let html = '<table style="width:100%;border-collapse:collapse;font-size:13px;">';
+        html += '<thead><tr style="background:#f0f0f0;text-align:left;"><th style="padding:6px;">#</th><th style="padding:6px;">Score</th><th style="padding:6px;">Market</th><th style="padding:6px;">Typ</th><th style="padding:6px;">Smer</th><th style="padding:6px;">Cena</th><th style="padding:6px;">Edge pp</th><th style="padding:6px;">BUY @</th><th style="padding:6px;">SELL TP1</th><th style="padding:6px;">Stake</th><th style="padding:6px;">Expiry</th><th style="padding:6px;">Kateg.</th><th style="padding:6px;">Link</th></tr></thead><tbody>';
+        d.top.forEach(function(t, i) {{
+          const ep = t.executionPlan || {{}};
+          const he = t.hardEdge || {{}};
+          const price = t.yesPrice != null ? Number(t.yesPrice).toFixed(3) : '-';
+          const buyAt = ep.buyLimitPrice != null ? Number(ep.buyLimitPrice).toFixed(3) : '-';
+          const tp1 = ep.takeProfit1 != null ? Number(ep.takeProfit1).toFixed(3) : '-';
+          const stake = ep.stakeUSDC != null ? ep.stakeUSDC : '-';
+          const edge = he.afterCostEdgePp != null ? (Number(he.afterCostEdgePp).toFixed(1) + 'pp') : '-';
+          const days = t.daysToEnd != null ? (Number(t.daysToEnd).toFixed(0) + 'd') : '-';
+          const url = t.polymarketUrl || ('https://polymarket.com/event/' + t.slug);
+          const q = (t.question || t.slug || '').replace(/</g,'&lt;');
+          html += '<tr style="border-top:1px solid #e0e0e0;">';
+          html += '<td style="padding:6px;">' + (i+1) + '</td>';
+          html += '<td style="padding:6px;font-weight:600;">' + t.candidateScore + '</td>';
+          html += '<td style="padding:6px;max-width:340px;">' + q + '</td>';
+          html += '<td style="padding:6px;">' + (t.tradeType || '-') + '</td>';
+          html += '<td style="padding:6px;">' + (t.finalDecision || '-') + '</td>';
+          html += '<td style="padding:6px;">' + price + '</td>';
+          html += '<td style="padding:6px;">' + edge + '</td>';
+          html += '<td style="padding:6px;">' + buyAt + '</td>';
+          html += '<td style="padding:6px;">' + tp1 + '</td>';
+          html += '<td style="padding:6px;">' + stake + ' USDC</td>';
+          html += '<td style="padding:6px;">' + days + '</td>';
+          html += '<td style="padding:6px;">' + (t.category || '-') + '</td>';
+          html += '<td style="padding:6px;"><a href="' + url + '" target="_blank" rel="noopener">otvoriť</a></td>';
+          html += '</tr>';
+        }});
+        html += '</tbody></table>';
+        html += '<div class="small" style="margin-top:6px;color:#666;">Kvalifikovaní: ' + d.totalQualified + ' · generated: ' + (d.generatedAt || '').slice(0,19) + 'Z</div>';
+        box.innerHTML = html;
+      }} catch (err) {{
+        box.innerHTML = '<div class="small">Nepodarilo sa načítať non-sports kandidátov: ' + err.message + '</div>';
+      }}
+    }}
+
     async function loadAll() {{
-      await Promise.all([loadMarkets(), loadGlobalWhaleFlow(), loadRiskStatus()]);
+      await Promise.all([loadMarkets(), loadGlobalWhaleFlow(), loadRiskStatus(), loadNonSports()]);
     }}
 
     document.getElementById('refreshBtn')?.addEventListener('click', loadAll);
