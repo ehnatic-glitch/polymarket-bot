@@ -88,14 +88,35 @@ def read_pnl_log(limit=100):
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 DATA_API_BASE = "https://data-api.polymarket.com"
 
+# === v7.0 SNIPER CONFIG ===
 APP_CONFIG = {
-    "dashboard_title": "Polymarket kandidátny dashboard",
+    "dashboard_title": "Polymarket Sniper v7.0",
     "default_min_liquidity": 100000.0,
+    "system_version": "v7.0",
+    # Bankroll a risk limity (v7)
     "bankroll_total": 500.0,
-    "cash_reserve": 150.0,
-    "max_total_exposure": 200.0,
-    "max_narrative_exposure": 75.0,
-    "max_active_positions": 3,
+    "cash_reserve": 150.0,            # 30% nedotknuteľná rezerva
+    "max_total_exposure": 200.0,      # 40% bankrollu
+    "max_narrative_exposure": 100.0,  # 20% na 1 naraťív
+    "max_active_positions": 4,        # 3–4, 4. iba ak prvé 3 small
+    "daily_drawdown_limit_pct": 0.15,
+    "loss_streak_pause": 3,
+    # Edge prahy v percentuálnych bodoch (after-cost)
+    "edge_pp_momentum": 8.0,
+    "edge_pp_time_decay": 10.0,
+    "edge_pp_resolution": 15.0,
+    "edge_pp_min_after_friction": 4.0,
+    # Sizing tiery v7 (USDC)
+    "sizing_centovka": (5, 10),
+    "sizing_standard": (10, 18),       # 10-12pp edge
+    "sizing_strong": (20, 35),         # 15+pp edge
+    "sizing_extreme": (50, 60),        # extrémy, max 1 naraťív
+    # Time window v7
+    "preferred_days_min": 2,
+    "preferred_days_max": 60,
+    "far_expiry_days": 90,
+    "catalyst_proximity_days": 45,
+    # Whale flow
     "whale_trade_min_notional": 200000.0,
     "whale_wallet_recent_sum": 500000.0,
 }
@@ -638,13 +659,107 @@ def fail_point(checklist, oracle_risk, notes):
 
 
 def sizing_cap_from_v6(flag, trade_type, final_decision):
+    """v7 sizing tiery (USDC) na bankrolli 500."""
     if final_decision == "PASS":
         return "0 USDC"
     if trade_type == "Centovka":
-        return "5–12 USDC"
+        return "5–10 USDC"        # 1–2% — lottery ticket
     if flag == "WATCH":
-        return "25–40 USDC"
-    return "10–20 USDC"
+        return "20–35 USDC"       # 4–7% — strong edge
+    return "10–18 USDC"           # 2–3.5% — štandard
+
+
+def edge_threshold_pp_v7(trade_type):
+    """v7 vyžaduje rôzne edge prahy podľa typu tradu (po frikcii)."""
+    if trade_type == "Resolution":
+        return APP_CONFIG["edge_pp_resolution"]      # 15+
+    if trade_type == "Time Decay":
+        return APP_CONFIG["edge_pp_time_decay"]      # 10–12
+    if trade_type == "Momentum":
+        return APP_CONFIG["edge_pp_momentum"]        # 8–10
+    if trade_type == "Centovka":
+        return 0.0                                    # asymetria, nie pp edge
+    return APP_CONFIG["edge_pp_momentum"]
+
+
+def build_hard_soft_checklist_v7(
+    gate_resolutability, gate_friction, gate_exit, gate_catalyst, gate_oracle,
+    fr_score, ex_score, fr_label, ex_label, catalyst_type, catalyst_confidence,
+    oracle_risk, trade_type, days_to_end, category,
+):
+    """v7: HARD podmienky musia byť OK; SOFT sú stupne (silne/stredne/slabo).
+    HARD: Resolutability, Edge (po frikcii), Cash rezerva, Korelácia.
+    SOFT: Frikcia, Exit, Catalyst, Oracle Trap.
+    """
+    # HARD
+    hard_resolutability_ok = gate_resolutability
+    # Edge — in-app nepoznajú skutočnú quoted edge, použijeme proxy: gate ok + good window
+    hard_edge_ok = gate_friction and gate_exit and oracle_risk in ("Low", "Medium")
+    # Cash rezerva a korelácia sú portfolioúrovňové — dashboard predpokladá OK,
+    # užívateľ ich kontroluje pred kliknutím "Otvoriť trade".
+    hard_cash_reserve_ok = True
+    hard_correlation_ok = True
+
+    # SOFT — stupne
+    def grade(ok, score=None, mid=None, hi=None):
+        """vráti 'silne'/'stredne'/'slabo' podľa číselného score."""
+        if score is None:
+            return "silne" if ok else "slabo"
+        if hi is not None and score >= hi:
+            return "silne"
+        if mid is not None and score >= mid:
+            return "stredne"
+        return "slabo"
+
+    soft_friction = grade(gate_friction, fr_score, mid=3, hi=4)
+    soft_exit = grade(gate_exit, ex_score, mid=2, hi=3)
+    soft_catalyst = ("silne" if catalyst_confidence == "High"
+                     else "stredne" if catalyst_confidence == "Medium"
+                     else "slabo")
+    soft_oracle = ("silne" if oracle_risk == "Low"
+                   else "stredne" if oracle_risk == "Medium"
+                   else "slabo")
+
+    hard_all_ok = (hard_resolutability_ok and hard_edge_ok
+                   and hard_cash_reserve_ok and hard_correlation_ok)
+    soft_weak_count = sum(1 for s in (soft_friction, soft_exit, soft_catalyst, soft_oracle)
+                          if s == "slabo")
+
+    return {
+        "hard": {
+            "resolutability": {"ok": hard_resolutability_ok,
+                "note": "Pravidlá čisté — vieš, čo je YES/NO." if hard_resolutability_ok
+                        else "Pravidlá alebo wording obsahujú ambiguities („sole discretion“, „materiality“)."},
+            "edge": {"ok": hard_edge_ok,
+                "note": (f"Edge prah po frikcii: {edge_threshold_pp_v7(trade_type):.0f}pp pre {trade_type}."
+                         + (" Frikcia + likvidita dávajú priestor." if hard_edge_ok
+                            else " Frikcia/likvidita/oracle bria edge."))},
+            "cashReserve": {"ok": hard_cash_reserve_ok,
+                "note": f"Skontroluj: po vstupe min. {int(APP_CONFIG['cash_reserve'])} USDC rezerva + 10% buffer."},
+            "correlation": {"ok": hard_correlation_ok,
+                "note": f"Skontroluj koreláciu: max {int(APP_CONFIG['max_narrative_exposure'])} USDC na naraťív."},
+        },
+        "soft": {
+            "friction": {"grade": soft_friction, "score": fr_score,
+                "note": f"{fr_label} (score {fr_score})."},
+            "exit": {"grade": soft_exit, "score": ex_score,
+                "note": f"{ex_label} (score {ex_score})."},
+            "catalyst": {"grade": soft_catalyst,
+                "note": f"{catalyst_type} ({catalyst_confidence})."},
+            "oracleTrap": {"grade": soft_oracle,
+                "note": f"Oracle riziko: {oracle_risk}."},
+        },
+        "summary": {
+            "hardAllOk": hard_all_ok,
+            "softWeakCount": soft_weak_count,
+            "recommendation": (
+                "Poď sniper — všetky HARD OK" if hard_all_ok and soft_weak_count <= 1
+                else "Možný vstup s menším sizingom" if hard_all_ok and soft_weak_count == 2
+                else "PASS — SOFT podmienky príliš slabé" if hard_all_ok
+                else "PASS — HARD podmienka zlyhala"
+            ),
+        },
+    }
 
 
 def normalize_words(text):
@@ -903,11 +1018,11 @@ def build_auto_draft(question, category, trade_type, yes_price, no_price, days_t
     sizing_hint = "Žiadny sizing."
     if final_decision in ["BUY YES", "BUY NO"]:
         if trade_type == "Centovka":
-            sizing_hint = "Orientačný sizing podľa v6: 5–12 USDC."
+            sizing_hint = "v7 sizing: 5–10 USDC (1–2% bankroll, asymetrický lottery ticket)."
         elif flag == "WATCH":
-            sizing_hint = "Orientačný sizing podľa v6: 25–40 USDC len ak zostane setup čistý."
+            sizing_hint = "v7 sizing: 20–35 USDC (4–7% pri 15+pp edge a blízkom katalyzátore)."
         else:
-            sizing_hint = "Orientačný sizing podľa v6: 10–20 USDC až po ďalšom potvrdení edge-u."
+            sizing_hint = "v7 sizing: 10–18 USDC (2–3.5% pri štandardnom 10–12pp edge po frikcii)."
 
     return {
         "thesis": thesis,
@@ -1049,7 +1164,7 @@ def score_market(m, strict_mode=False):
     gate_base_rate = category in ["Politics", "Crypto", "Sports", "Other", "Geopolitics"]
     gate_friction = fr_score >= 3
     gate_exit = ex_score >= 2
-    # Centovky môžu byť dlhodobé (volby 2028, BTC ATH atd) - rozsahy až do 540 dní
+    # v7: katalyzátor je platný ak je do 45 dní (proximity), centovky majú 540 dňový výnimku
     catalyst_window_days = 540 if trade_type == "Centovka" else 180
     gate_catalyst = catalyst_confidence in ["High", "Medium"] and days_to_end is not None and days_to_end <= catalyst_window_days
     gate_oracle = oracle_risk != "High"
@@ -1067,24 +1182,31 @@ def score_market(m, strict_mode=False):
     score += ex_score // 2
 
     if days_to_end is not None:
-        if 7 <= days_to_end <= 180:
+        # v7 time window: 2–60 dňí preferred, 60–90 obchodovateľné, >90 len ak je
+        # blízky katalyzátor (riešené v gate_catalyst window).
+        if 2 <= days_to_end <= 60:
             score += 2
-            notes.append("good_time_window")
-        elif 3 <= days_to_end < 7:
+            notes.append("v7_preferred_window")
+        elif 60 < days_to_end <= 90:
             score += 1
-            notes.append("near_time_window")
+            notes.append("v7_extended_window")
         elif days_to_end < 1:
             score -= 4
             notes.append("too_close_to_expiry")
-        elif days_to_end < 3:
-            score -= 3
+        elif days_to_end < 2:
+            score -= 2
             notes.append("close_to_expiry")
         elif days_to_end > 365:
             score -= 3
             notes.append("too_far_expiry")
-        elif days_to_end > 180:
-            score -= 1
-            notes.append("far_expiry")
+        elif days_to_end > 90:
+            # >90d: bez blízkeho catalyst penalize, s katalyzátorom OK
+            if catalyst_confidence in ["High", "Medium"]:
+                score -= 1
+                notes.append("far_expiry_with_catalyst")
+            else:
+                score -= 2
+                notes.append("far_expiry_no_catalyst")
     else:
         score -= 2
         notes.append("missing_end_date")
@@ -1216,6 +1338,25 @@ def score_market(m, strict_mode=False):
         }
     }
 
+    # v7 HARD/SOFT checklist (zachovávame aj pre kompatibilitu legacy 6/6)
+    checklist_v7 = build_hard_soft_checklist_v7(
+        gate_resolutability=gate_resolutability,
+        gate_friction=gate_friction,
+        gate_exit=gate_exit,
+        gate_catalyst=gate_catalyst,
+        gate_oracle=gate_oracle,
+        fr_score=fr_score,
+        ex_score=ex_score,
+        fr_label=sk_friction_label(fr_label),
+        ex_label=sk_exit_label(ex_label),
+        catalyst_type=sk_catalyst_type(catalyst_type),
+        catalyst_confidence=sk_oracle_risk(catalyst_confidence),
+        oracle_risk=sk_oracle_risk(oracle_risk),
+        trade_type=trade_type,
+        days_to_end=days_to_end,
+        category=category,
+    )
+
     auto_draft = build_auto_draft(
         question=raw_question,
         category=category,
@@ -1318,6 +1459,8 @@ def score_market(m, strict_mode=False):
         "catalystConfidence": catalyst_confidence,
         "catalystConfidenceLabel": sk_oracle_risk(catalyst_confidence),
         "checklist": checklist,
+        "checklistV7": checklist_v7,
+        "edgeThresholdPp": edge_threshold_pp_v7(trade_type),
         "gate": {
             "resolutability": gate_resolutability,
             "baseRate": gate_base_rate,
@@ -1382,6 +1525,8 @@ def build_market_row(m, strict_mode=False):
         "catalystConfidence": scored["catalystConfidence"],
         "catalystConfidenceLabel": scored["catalystConfidenceLabel"],
         "checklist": scored["checklist"],
+        "checklistV7": scored.get("checklistV7"),
+        "edgeThresholdPp": scored.get("edgeThresholdPp"),
         "autoDraft": scored["autoDraft"],
         "executionPlan": scored["executionPlan"],
         "failPoint": scored["failPoint"],
@@ -1848,6 +1993,109 @@ def pnl_log_get():
     return jsonify({"entries": read_pnl_log(limit=limit)})
 
 
+@app.route("/risk-status")
+def risk_status():
+    """v7 portfolio risk overview: bankroll, rezerva, open pozicíe, expozícia, drawdown, loss streak.
+    Počíta z append-only PnL logu (open/close events)."""
+    entries = read_pnl_log(limit=1000)
+    open_positions = {}   # slug -> {side, usdc, price, narrative, ts}
+    closed = []
+    for e in entries:
+        slug = e.get("slug") or e.get("question")
+        kind = e.get("kind")
+        if kind == "open":
+            open_positions[slug] = {
+                "slug": slug,
+                "question": e.get("question"),
+                "side": e.get("side"),
+                "usdc": to_float(e.get("usdc")),
+                "price": to_float(e.get("price")),
+                "narrative": e.get("narrative") or "",
+                "ts": e.get("ts"),
+            }
+        elif kind == "close":
+            if slug in open_positions:
+                op = open_positions.pop(slug)
+                pnl = to_float(e.get("pnl"))
+                closed.append({**op, "pnl": pnl, "closeTs": e.get("ts")})
+            else:
+                closed.append({
+                    "slug": slug,
+                    "question": e.get("question"),
+                    "pnl": to_float(e.get("pnl")),
+                    "closeTs": e.get("ts"),
+                })
+
+    total_exposure = sum(p["usdc"] for p in open_positions.values())
+    realized_pnl = sum(c.get("pnl", 0) for c in closed)
+    equity = APP_CONFIG["bankroll_total"] + realized_pnl
+
+    # Day drawdown: P&L záznamy z dneška
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_pnl = sum(
+        c.get("pnl", 0) for c in closed
+        if (c.get("closeTs") or "").startswith(today)
+    )
+    today_pnl_pct = today_pnl / APP_CONFIG["bankroll_total"] if APP_CONFIG["bankroll_total"] else 0
+
+    # Loss streak: poč po sebe idúcich záporných closed
+    loss_streak = 0
+    for c in reversed(closed):
+        if c.get("pnl", 0) < 0:
+            loss_streak += 1
+        else:
+            break
+
+    # Per-narrative expozícia
+    narrative_exposure = {}
+    for p in open_positions.values():
+        narr = p.get("narrative") or "misc"
+        narrative_exposure[narr] = narrative_exposure.get(narr, 0) + p["usdc"]
+
+    # v7 limity check
+    cash_available = max(0, equity - total_exposure)
+    reserve_ok = cash_available >= APP_CONFIG["cash_reserve"]
+    exposure_ok = total_exposure <= APP_CONFIG["max_total_exposure"]
+    positions_ok = len(open_positions) < APP_CONFIG["max_active_positions"]
+    drawdown_ok = today_pnl_pct > -APP_CONFIG["daily_drawdown_limit_pct"]
+    streak_ok = loss_streak < APP_CONFIG["loss_streak_pause"]
+    narrative_breaches = [
+        n for n, e in narrative_exposure.items()
+        if e > APP_CONFIG["max_narrative_exposure"]
+    ]
+
+    can_trade = reserve_ok and exposure_ok and positions_ok and drawdown_ok and streak_ok
+
+    return jsonify({
+        "version": APP_CONFIG["system_version"],
+        "bankroll": APP_CONFIG["bankroll_total"],
+        "equity": round(equity, 2),
+        "cashAvailable": round(cash_available, 2),
+        "cashReserveTarget": APP_CONFIG["cash_reserve"],
+        "totalExposure": round(total_exposure, 2),
+        "maxTotalExposure": APP_CONFIG["max_total_exposure"],
+        "realizedPnl": round(realized_pnl, 2),
+        "todayPnl": round(today_pnl, 2),
+        "todayPnlPct": round(today_pnl_pct * 100, 2),
+        "openPositions": list(open_positions.values()),
+        "openPositionsCount": len(open_positions),
+        "maxActivePositions": APP_CONFIG["max_active_positions"],
+        "narrativeExposure": narrative_exposure,
+        "maxNarrativeExposure": APP_CONFIG["max_narrative_exposure"],
+        "narrativeBreaches": narrative_breaches,
+        "lossStreak": loss_streak,
+        "lossStreakLimit": APP_CONFIG["loss_streak_pause"],
+        "limits": {
+            "reserveOk": reserve_ok,
+            "exposureOk": exposure_ok,
+            "positionsOk": positions_ok,
+            "drawdownOk": drawdown_ok,
+            "streakOk": streak_ok,
+        },
+        "canTrade": can_trade,
+    })
+
+
 @app.route("/pnl-log", methods=["POST"])
 def pnl_log_post():
     """Append-only záznam pri kliknutí Otvoriť trade alebo manuálne logovanie pnł entry/exit.
@@ -2159,6 +2407,16 @@ def dashboard():
     .check:last-child {{ border-bottom: none; }}
     .ok {{ color: #137333; font-weight: 700; min-width: 28px; }}
     .no {{ color: #c5221f; font-weight: 700; min-width: 28px; }}
+    .mid {{ color: #b06000; font-weight: 700; min-width: 28px; }}
+    .v7-summary {{ background: #f7f9fc; padding: 8px; border-radius: 4px; margin-top: 6px; }}
+    .risk-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }}
+    .risk-card {{ background: #fff; border: 1px solid #e0e3e7; padding: 10px 12px; border-radius: 6px; }}
+    .risk-card .label {{ font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.4px; }}
+    .risk-card .value {{ font-size: 18px; font-weight: 700; margin-top: 2px; }}
+    .risk-card.alert {{ background: #fff3f0; border-color: #c5221f; }}
+    .risk-card.ok {{ background: #f0f7f0; border-color: #137333; }}
+    .risk-card .sub {{ font-size: 11px; color: #666; margin-top: 2px; }}
+    #riskManagerSection.no-trade {{ background: #fff3f0; border: 2px solid #c5221f; }}
     .metric-pill {{ display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; margin-right: 6px; margin-bottom: 6px; background: #f3f4f6; color: #333; }}
     .delta-up {{ color: #137333; font-weight: 700; }}
     .delta-down {{ color: #c5221f; font-weight: 700; }}
@@ -2228,11 +2486,16 @@ def dashboard():
   <div class="header-strip">
     <div class="header-left">
       <h1>{title}</h1>
-      <p class="small">v6.2: whale tape iba pre veľké pohyby, default filter {whale_min:,.0f} cash notional.</p>
+      <p class="small">v7.0: HARD/SOFT checklist, edge prahy 8–15pp, sizing 5–60 USDC, daily DD 15%, max 3–4 pozície.</p>
     </div>
     <div class="header-right">
       <div class="status-card" id="statusLine">Dashboard sa inicializuje...</div>
     </div>
+  </div>
+
+  <div class="section" id="riskManagerSection">
+    <h2>v7 Risk Manager</h2>
+    <div id="riskManager" class="risk-grid">Načítava sa risk overview...</div>
   </div>
 
   <div class="section">
@@ -2600,6 +2863,54 @@ def dashboard():
           +   '<div><strong>' + label + '</strong><br>' + (item.note || '') + '</div>'
           + '</div>';
       }}).join('');
+    }}
+
+    function gradeColor(grade) {{
+      if (grade === 'silne') return 'ok';
+      if (grade === 'stredne') return 'mid';
+      return 'no';
+    }}
+
+    function renderChecklistV7(v7) {{
+      if (!v7) return '';
+      const hardOrder = [
+        ['resolutability', 'Resolutability (HARD)'],
+        ['edge', 'Edge po frikcii (HARD)'],
+        ['cashReserve', 'Cash rezerva (HARD)'],
+        ['correlation', 'Korelácia (HARD)']
+      ];
+      const softOrder = [
+        ['friction', 'Frikcia (SOFT)'],
+        ['exit', 'Exit (SOFT)'],
+        ['catalyst', 'Catalyst (SOFT)'],
+        ['oracleTrap', 'Oracle Trap (SOFT)']
+      ];
+      let html = '';
+      hardOrder.forEach(function(pair) {{
+        const item = (v7.hard || {{}})[pair[0]];
+        if (!item) return;
+        html += '<div class="check">'
+             +   '<div class="' + (item.ok ? 'ok' : 'no') + '">' + (item.ok ? 'ÁNO' : 'NIE') + '</div>'
+             +   '<div><strong>' + pair[1] + '</strong><br>' + (item.note || '') + '</div>'
+             + '</div>';
+      }});
+      softOrder.forEach(function(pair) {{
+        const item = (v7.soft || {{}})[pair[0]];
+        if (!item) return;
+        const cls = gradeColor(item.grade);
+        const lbl = (item.grade || '').toUpperCase();
+        html += '<div class="check">'
+             +   '<div class="' + cls + '">' + lbl + '</div>'
+             +   '<div><strong>' + pair[1] + '</strong><br>' + (item.note || '') + '</div>'
+             + '</div>';
+      }});
+      const summary = v7.summary || {{}};
+      const cls = summary.hardAllOk ? 'ok' : 'no';
+      html += '<div class="check v7-summary">'
+           +   '<div class="' + cls + '">v7</div>'
+           +   '<div><strong>Odporúčanie:</strong> ' + (summary.recommendation || '') + '</div>'
+           + '</div>';
+      return html;
     }}
 
     function deltaClass(value) {{
@@ -2984,7 +3295,7 @@ def dashboard():
         +     '</div>'
         +   '</div>'
         +   '<div class="detail-grid">'
-        +     '<div class="detail-card"><h3>Mini 6/6 checklist</h3>' + renderChecklist(m.checklist || {{}}) + '</div>'
+        +     '<div class="detail-card"><h3>v7 HARD/SOFT checklist</h3>' + renderChecklistV7(m.checklistV7) + '<details style="margin-top:8px"><summary>Legacy 6/6</summary>' + renderChecklist(m.checklist || {{}}) + '</details></div>'
         +     '<div class="detail-card">'
         +       '<h3>Systémový draft</h3>'
         +       '<div class="draft-grid">'
@@ -3197,8 +3508,57 @@ def dashboard():
       }}
     }}
 
+    function pctFmt(n) {{ return (n>=0?'+':'') + Number(n).toFixed(1) + '%'; }}
+
+    async function loadRiskStatus() {{
+      const box = document.getElementById('riskManager');
+      if (!box) return;
+      try {{
+        const res = await fetch('/risk-status');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const d = await res.json();
+        const sec = document.getElementById('riskManagerSection');
+        if (sec) sec.classList.toggle('no-trade', !d.canTrade);
+        const cards = [];
+        // Bankroll/Equity
+        cards.push('<div class="risk-card"><div class="label">Bankroll</div><div class="value">' + d.bankroll + ' USDC</div><div class="sub">Equity: ' + d.equity + ' (' + pctFmt(((d.equity-d.bankroll)/d.bankroll*100)) + ')</div></div>');
+        // Cash
+        const cashCls = d.limits.reserveOk ? 'ok' : 'alert';
+        cards.push('<div class="risk-card ' + cashCls + '"><div class="label">Cash dostupný</div><div class="value">' + d.cashAvailable + ' USDC</div><div class="sub">Min rezerva: ' + d.cashReserveTarget + '</div></div>');
+        // Exposure
+        const expCls = d.limits.exposureOk ? 'ok' : 'alert';
+        cards.push('<div class="risk-card ' + expCls + '"><div class="label">Total expozícia</div><div class="value">' + d.totalExposure + ' / ' + d.maxTotalExposure + '</div><div class="sub">Max 40% bankrollu</div></div>');
+        // Positions
+        const posCls = d.limits.positionsOk ? 'ok' : 'alert';
+        cards.push('<div class="risk-card ' + posCls + '"><div class="label">Otvorené pozície</div><div class="value">' + d.openPositionsCount + ' / ' + d.maxActivePositions + '</div></div>');
+        // Day P&L
+        const ddCls = d.limits.drawdownOk ? '' : 'alert';
+        cards.push('<div class="risk-card ' + ddCls + '"><div class="label">Dnes P&L</div><div class="value">' + d.todayPnl + ' USDC</div><div class="sub">' + pctFmt(d.todayPnlPct) + ' (limit -15%)</div></div>');
+        // Realized
+        cards.push('<div class="risk-card"><div class="label">Realized P&L</div><div class="value">' + d.realizedPnl + ' USDC</div></div>');
+        // Loss streak
+        const lsCls = d.limits.streakOk ? '' : 'alert';
+        cards.push('<div class="risk-card ' + lsCls + '"><div class="label">Loss streak</div><div class="value">' + d.lossStreak + ' / ' + d.lossStreakLimit + '</div><div class="sub">Po 3x stop 48h</div></div>');
+        // Can trade
+        const ctCls = d.canTrade ? 'ok' : 'alert';
+        cards.push('<div class="risk-card ' + ctCls + '"><div class="label">Status</div><div class="value">' + (d.canTrade ? 'CAN TRADE' : 'NO TRADE') + '</div><div class="sub">v7 limit checker</div></div>');
+        // Open positions list
+        if (d.openPositions && d.openPositions.length) {{
+          let posHtml = '<div class="risk-card" style="grid-column: 1/-1"><div class="label">Otvorené pozície (' + d.openPositionsCount + ')</div>';
+          d.openPositions.forEach(function(p) {{
+            posHtml += '<div class="sub" style="font-size:13px;color:#222;margin-top:4px"><strong>' + (p.side||'?') + '</strong> ' + p.usdc + ' USDC @ ' + p.price + ' — ' + (p.question||p.slug) + (p.narrative ? ' (' + p.narrative + ')' : '') + '</div>';
+          }});
+          posHtml += '</div>';
+          cards.push(posHtml);
+        }}
+        box.innerHTML = cards.join('');
+      }} catch (err) {{
+        box.innerHTML = '<div class="small">Risk status nedostupný: ' + err.message + '</div>';
+      }}
+    }}
+
     async function loadAll() {{
-      await Promise.all([loadMarkets(), loadGlobalWhaleFlow()]);
+      await Promise.all([loadMarkets(), loadGlobalWhaleFlow(), loadRiskStatus()]);
     }}
 
     document.getElementById('refreshBtn')?.addEventListener('click', loadAll);
