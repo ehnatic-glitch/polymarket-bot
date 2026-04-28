@@ -1075,11 +1075,22 @@ def exit_split_for_trade(trade_type):
     return {"tp1Pct": 50, "tp2Pct": 30, "runnerPct": 20}
 
 
-def build_execution_plan(flag, trade_type, final_decision, yes_price, no_price, liquidity, volume24hr, days_to_end):
+def build_execution_plan(flag, trade_type, final_decision, yes_price, no_price, liquidity, volume24hr, days_to_end,
+                        best_bid=None, best_ask=None):
+    """v7 execution plan + live bid/ask z Polymarket order book.
+
+    bestBid/bestAsk pochádzaju z Gamma API a vzťahujú sa na YES stranu. Pre BUY NO
+    odvodíme NO stranu: noBid = 1 − yesAsk, noAsk = 1 − yesBid.
+    """
     if final_decision == "PASS":
         return {
             "entrySide": "NONE",
             "limitPrice": None,
+            "buyLimitPrice": None,
+            "sellLimitPrice": None,
+            "bestBid": best_bid,
+            "bestAsk": best_ask,
+            "spreadPct": None,
             "stakeUSDC": 0,
             "stakePct": "0%",
             "tranche1USDC": 0,
@@ -1148,9 +1159,52 @@ def build_execution_plan(flag, trade_type, final_decision, yes_price, no_price, 
 
     full_exit = "Okamžitý full exit pri zrušení asymetrie, novom oracle alebo dispute riziku, faktickej chybe v téze alebo prudkom zhoršení likvidity."
 
+    # Live bid/ask z Polymarket order book — odvod pre stranu, na ktorú vstupujeme
+    if entry_side == "YES":
+        side_best_bid = best_bid if isinstance(best_bid, (int, float)) else None
+        side_best_ask = best_ask if isinstance(best_ask, (int, float)) else None
+    else:  # NO strana — invertuj YES bid/ask
+        side_best_bid = (1.0 - best_ask) if isinstance(best_ask, (int, float)) else None
+        side_best_ask = (1.0 - best_bid) if isinstance(best_bid, (int, float)) else None
+
+    if isinstance(side_best_bid, (int, float)) and isinstance(side_best_ask, (int, float)) and side_best_ask > side_best_bid:
+        spread_pct = round((side_best_ask - side_best_bid) * 100.0, 2)
+    else:
+        spread_pct = None
+
+    # Polymarket tick = 0.001
+    TICK = 0.001
+
+    # BUY limit (maker entry) — sedieť na bestBid (top of bid book = maker, fill po prvom takerovi)
+    # Ak je spread prázdny (best_ask <= best_bid + tick), použi base limit_price
+    if isinstance(side_best_bid, (int, float)) and isinstance(side_best_ask, (int, float)):
+        if side_best_ask - side_best_bid > TICK + 1e-9:
+            # bid + tick je ešte pod ask → môžeme byť top of bid book
+            buy_limit = clamp_price(round(side_best_bid + TICK, 3))
+        else:
+            # spread = 1 tick → sedieť priamo na bestBid (penny stuck)
+            buy_limit = clamp_price(round(side_best_bid, 3))
+    elif isinstance(side_best_bid, (int, float)):
+        buy_limit = clamp_price(round(side_best_bid, 3))
+    elif limit_price is not None:
+        buy_limit = limit_price
+    else:
+        buy_limit = None
+
+    # SELL limit (TP1 maker exit) — limitka priamo na TP1 cene (chceš predaj NAD aktuálnym ask)
+    if tp1 is not None:
+        sell_limit = clamp_price(round(tp1, 3))
+    else:
+        sell_limit = None
+
     return {
         "entrySide": entry_side,
         "limitPrice": limit_price,
+        "buyLimitPrice": buy_limit,
+        "sellLimitPrice": sell_limit,
+        "bestBid": round(side_best_bid, 4) if isinstance(side_best_bid, (int, float)) else None,
+        "bestAsk": round(side_best_ask, 4) if isinstance(side_best_ask, (int, float)) else None,
+        "spreadPct": spread_pct,
         "stakeUSDC": stake,
         "stakePct": f"{round(stake / 500 * 100, 1)}%",
         "tranche1USDC": t1,
@@ -1617,6 +1671,8 @@ def score_market(m, strict_mode=False):
         liquidity=liquidity,
         volume24hr=volume24hr,
         days_to_end=days_to_end,
+        best_bid=best_bid_val,
+        best_ask=best_ask_val,
     )
 
     fail = fail_point(checklist, oracle_risk, notes)
@@ -3547,11 +3603,12 @@ def dashboard():
         +       '<h3>Entry / Exit plán</h3>'
         +       '<div class="draft-grid">'
         +         '<div>Entry side</div><div>' + ((m.executionPlan && m.executionPlan.entrySide) || '') + '</div>'
-        +         '<div>Limit</div><div>' + fmtPrice(m.executionPlan && m.executionPlan.limitPrice) + '</div>'
+        +         '<div>Best Bid / Ask</div><div>' + fmtPrice(m.executionPlan && m.executionPlan.bestBid) + ' / ' + fmtPrice(m.executionPlan && m.executionPlan.bestAsk) + ((m.executionPlan && m.executionPlan.spreadPct != null) ? ' <span class="small">(spread ' + m.executionPlan.spreadPct + 'pp)</span>' : '') + '</div>'
+        +         '<div><b>BUY limit (maker)</b></div><div><b>' + fmtPrice(m.executionPlan && m.executionPlan.buyLimitPrice) + '</b></div>'
+        +         '<div><b>SELL limit (TP1)</b></div><div><b>' + fmtPrice(m.executionPlan && m.executionPlan.sellLimitPrice) + '</b></div>'
         +         '<div>Stake</div><div>' + ((m.executionPlan && m.executionPlan.stakeUSDC) || 0) + ' USDC (' + ((m.executionPlan && m.executionPlan.stakePct) || '0%') + ')</div>'
         +         '<div>Tranche</div><div>' + ((m.executionPlan && m.executionPlan.tranche1USDC) || 0) + ' / ' + ((m.executionPlan && m.executionPlan.tranche2USDC) || 0) + ' / ' + ((m.executionPlan && m.executionPlan.tranche3USDC) || 0) + '</div>'
-        +         '<div>TP1</div><div>' + ((m.executionPlan && m.executionPlan.takeProfit1) || '') + '</div>'
-        +         '<div>TP2</div><div>' + ((m.executionPlan && m.executionPlan.takeProfit2) || '') + '</div>'
+        +         '<div>TP1 / TP2</div><div>' + ((m.executionPlan && m.executionPlan.takeProfit1) || '') + ' / ' + ((m.executionPlan && m.executionPlan.takeProfit2) || '') + '</div>'
         +       '</div>'
         +       '<div class="panel-muted">' + ((m.executionPlan && m.executionPlan.tp1Action) || '') + '</div>'
         +       '<div class="panel-muted">' + ((m.executionPlan && m.executionPlan.tp2Action) || '') + '</div>'
