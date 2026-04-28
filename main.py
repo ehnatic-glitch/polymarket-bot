@@ -1379,6 +1379,12 @@ def score_market(m, strict_mode=False):
         ex_score=ex_score,
     )
 
+    # Konzistentnosť: ak final_decision je BUY (centovka/mirror bypass), upgradni flag/displayFlag.
+    # Bez tohto vidno PASS flag + BUY YES decision, čo je mütiace.
+    if auto_draft["finalDecision"] in ("BUY YES", "BUY NO") and flag == "PASS":
+        flag = "REVIEW"
+        display_flag = "POTENCIÁL"
+
     execution_plan = build_execution_plan(
         flag=flag,
         trade_type=trade_type,
@@ -2431,8 +2437,8 @@ def dashboard():
     .draft-grid {{ display: grid; grid-template-columns: 140px 1fr; gap: 8px; font-size: 13px; margin-bottom: 10px; }}
     .draft-grid div:first-child {{ color: #666; font-weight: 600; }}
     .block-label {{ margin-top: 10px; display: block; font-size: 12px; color: #555; font-weight: 600; }}
-    .question-cell {{ max-width: 320px; }}
-    .question-truncate {{ display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.35; max-height: 2.7em; word-break: break-word; }}
+    .question-cell {{ min-width: 280px; max-width: 520px; }}
+    .question-truncate {{ line-height: 1.35; word-break: break-word; white-space: normal; }}
     .watchlist-compact {{ display: grid; gap: 4px; }}
     .watchlist-row {{ display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 12px; }}
     .watchlist-row:last-child {{ border-bottom: none; }}
