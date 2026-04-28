@@ -66,11 +66,44 @@ def save_state(state):
             pass
 
 def append_pnl_log(entry):
+    """Append-only PnL log. PDF v7 sekcia 12: pri stake <= 5 USDC stačí skrátený format.
+
+    Skrátený log obsahuje len: ts, kind, slug, question, side, price, usdc, pnl, decision.
+    Plný log obsahuje celý payload (včitane ex. plan, checklist, etc.).
+    """
     entry["loggedAt"] = datetime.now(timezone.utc).isoformat()
+
+    # Detekuj stake (rozne názvy: usdc / size / stakeUSDC)
+    stake = 0.0
+    for key in ("usdc", "stakeUSDC", "stake", "size"):
+        v = entry.get(key)
+        if isinstance(v, (int, float)) and v > 0:
+            stake = float(v)
+            break
+
+    if 0 < stake <= 5.0:
+        # Skrátený format pre testovacie sizingy
+        compact = {
+            "loggedAt": entry["loggedAt"],
+            "logFormat": "short",
+            "kind": entry.get("kind"),
+            "slug": entry.get("slug"),
+            "question": entry.get("question"),
+            "side": entry.get("side"),
+            "price": entry.get("price"),
+            "usdc": stake,
+            "pnl": entry.get("pnl"),
+            "decision": entry.get("decision") or entry.get("finalDecision"),
+        }
+        payload = compact
+    else:
+        entry["logFormat"] = entry.get("logFormat") or "full"
+        payload = entry
+
     with _STATE_LOCK:
         try:
             with open(PNL_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception:
             pass
 
@@ -102,10 +135,12 @@ APP_CONFIG = {
     "daily_drawdown_limit_pct": 0.15,
     "loss_streak_pause": 3,
     # Edge prahy v percentuálnych bodoch (after-cost)
-    "edge_pp_momentum": 8.0,
-    "edge_pp_time_decay": 10.0,
-    "edge_pp_resolution": 15.0,
-    "edge_pp_min_after_friction": 4.0,
+    # PDF v7 sekcia 10: HARD prah Momentum/Time Decay = 10pp, Resolution = 15pp
+    "edge_pp_momentum_soft": 8.0,        # PDF sekcia 2 mantinel
+    "edge_pp_momentum": 10.0,            # HARD prah pre Momentum (sekcia 10)
+    "edge_pp_time_decay": 10.0,          # HARD prah Time Decay
+    "edge_pp_resolution": 15.0,          # HARD prah Resolution/Dispute
+    "edge_pp_min_after_friction": 4.0,   # spread+fees+sklz nesmú zožrať pod 4pp
     # Sizing tiery v7 (USDC)
     "sizing_centovka": (5, 10),
     "sizing_standard": (10, 18),       # 10-12pp edge
@@ -350,21 +385,55 @@ def categorize_market(question):
 
 
 def detect_trade_type(question, yes_price, days_to_end):
+    """v7 PDF sekcia 11 — kategorizuj trh do jednej z:
+    Momentum / Time Decay / Resolution / Centovka / Value / Trap / Info-Timing / Mean reversion / Other
+    """
     q = (question or "").lower()
 
+    # Centovka — čisto cenová detekcia (asymetrická 0.005–0.07)
     if isinstance(yes_price, (int, float)) and 0.005 <= yes_price <= 0.07:
         return "Centovka"
 
+    # Trap — vágne pravidlá „sole discretion“, bez precedensu (Čierna diera oraclu)
+    trap_keywords = [
+        "sole discretion", "poly admin", "judges discretion", "subjective",
+        "good faith",
+    ]
+    if any(k in q for k in trap_keywords):
+        return "Trap"
+
+    # Resolution / Dispute — textové ambiguity, UMA edge
     resolution_keywords = [
-        "called by", "out by", "official sources", "good faith",
+        "called by", "out by", "official sources",
         "materially", "substantially", "at any time"
     ]
     if any(k in q for k in resolution_keywords):
         return "Resolution"
 
+    # Time Decay — blížka expirácia tlačí cenu
     if days_to_end is not None and days_to_end <= 7:
         return "Time Decay"
 
+    # Info-Timing — mám bližšiu informáciu / report pred trhom (CPI/FOMC/earnings v okne 1–14 dňí)
+    info_timing_keywords = [
+        "cpi", "fomc", "jobs report", "nfp", "unemployment rate",
+        "earnings call", "sec filing", "jackson hole",
+    ]
+    if any(k in q for k in info_timing_keywords) and days_to_end is not None and days_to_end <= 14:
+        return "Info-Timing"
+
+    # Mean reversion — trh sa odchýlil od dlhodobej hodnoty (extrémne odds bez catalyst)
+    if isinstance(yes_price, (int, float)):
+        if (0.85 <= yes_price <= 0.97) or (0.03 <= yes_price < 0.05):
+            if days_to_end is not None and days_to_end > 14:
+                return "Mean reversion"
+
+    # Value — NO strana má lepší price/probability mismatch než YES (longshot filter z PDF sekcia 4)
+    if isinstance(yes_price, (int, float)) and 0.07 < yes_price <= 0.20:
+        if days_to_end is not None and days_to_end > 30:
+            return "Value"
+
+    # Momentum — rýchly repricing okolo newého eventu
     momentum_keywords = [
         "ipo", "ceasefire", "announcement", "report", "vote", "deadline", "earnings"
     ]
@@ -658,51 +727,179 @@ def fail_point(checklist, oracle_risk, notes):
     return "Žiadny kritický fail"
 
 
-def sizing_cap_from_v6(flag, trade_type, final_decision):
-    """v7 sizing tiery (USDC) na bankrolli 500."""
+def sizing_cap_v7(flag, trade_type, final_decision, soft_weak_count=0):
+    """v7 sizing tiery (USDC) na bankrolli 500.
+
+    PDF sekcia 6 + sekcia 10:
+    - Centovka: 5–10 (1–2%)
+    - Štandard: 10–18 (2–3.5%)
+    - Strong:   20–35 (4–7%)
+    - Extrém:   50–60 (10–12%) — len 1 naraťív
+
+    Ak su·1–2 SOFT podmienky slabé → zníž tier o jeden stupeň (PDF sekcia 10).
+    soft_weak_count >= 2 → downgrade.
+    """
     if final_decision == "PASS":
         return "0 USDC"
+
+    # Základný tier
     if trade_type == "Centovka":
-        return "5–10 USDC"        # 1–2% — lottery ticket
-    if flag == "WATCH":
-        return "20–35 USDC"       # 4–7% — strong edge
-    return "10–18 USDC"           # 2–3.5% — štandard
+        base_tier = "centovka"
+    elif flag == "WATCH":
+        base_tier = "strong"
+    else:
+        base_tier = "standard"
+
+    # Downgrade pri 2+ slabých SOFT (PDF: zníž sizing / vyžaduj väčší edge)
+    if soft_weak_count >= 2:
+        downgrade = {"strong": "standard", "standard": "centovka", "centovka": "centovka"}
+        base_tier = downgrade.get(base_tier, base_tier)
+
+    return {
+        "centovka": "5–10 USDC",
+        "standard": "10–18 USDC",
+        "strong": "20–35 USDC",
+        "extreme": "50–60 USDC",
+    }[base_tier]
+
+
+# Backwards-compat alias — niektoré callsites možno ešte volajú starý názov
+def sizing_cap_from_v6(flag, trade_type, final_decision, soft_weak_count=0):
+    return sizing_cap_v7(flag, trade_type, final_decision, soft_weak_count)
 
 
 def edge_threshold_pp_v7(trade_type):
-    """v7 vyžaduje rôzne edge prahy podľa typu tradu (po frikcii)."""
+    """v7 HARD edge prahy po frikcii (PDF sekcia 10).
+    Resolution/Dispute = 15pp, Momentum/Time Decay = 10pp,
+    Centovka = asymetria (žiadny pp prah, R:R-driven),
+    Value/Mean reversion/Info-Timing/Trap/Other = default 10pp.
+    """
     if trade_type == "Resolution":
         return APP_CONFIG["edge_pp_resolution"]      # 15+
+    if trade_type == "Trap":
+        return APP_CONFIG["edge_pp_resolution"]      # rovnaké ako Resolution — vyžaduje vyšší prah
     if trade_type == "Time Decay":
-        return APP_CONFIG["edge_pp_time_decay"]      # 10–12
+        return APP_CONFIG["edge_pp_time_decay"]      # 10
     if trade_type == "Momentum":
-        return APP_CONFIG["edge_pp_momentum"]        # 8–10
+        return APP_CONFIG["edge_pp_momentum"]        # 10 (HARD)
     if trade_type == "Centovka":
-        return 0.0                                    # asymetria, nie pp edge
-    return APP_CONFIG["edge_pp_momentum"]
+        return 0.0                                    # R:R asymetria, nie pp edge
+    if trade_type in ("Value", "Mean reversion", "Info-Timing"):
+        return APP_CONFIG["edge_pp_momentum"]        # 10
+    return APP_CONFIG["edge_pp_momentum"]            # default 10
+
+
+def estimate_friction_pp(yes_price, no_price, liquidity, best_bid=None, best_ask=None):
+    """Odhadni friction v percentuálnych bodoch (PDF sekcia 2: spread + fees + sklz).
+
+    spread_pp: best_ask − best_bid v pp (po prevedení na centálne body x100)
+    fees_pp: ~2pp (Polymarket protocol)
+    slippage_pp: priblizne 1pp ak liq < 100k, 0.5pp ak < 500k, 0.2pp inak
+    """
+    # spread
+    if isinstance(best_bid, (int, float)) and isinstance(best_ask, (int, float)) and best_ask > best_bid:
+        spread_pp = (best_ask - best_bid) * 100.0
+    elif isinstance(yes_price, (int, float)) and isinstance(no_price, (int, float)):
+        # ak nemáme bid/ask, predpokladaj 1–2% spread podľa likvidity
+        implied = abs(1.0 - (yes_price + no_price)) * 100.0
+        spread_pp = max(implied, 1.0)
+    else:
+        spread_pp = 2.0
+
+    fees_pp = 2.0
+
+    liq = float(liquidity or 0)
+    if liq >= 500000:
+        slippage_pp = 0.2
+    elif liq >= 100000:
+        slippage_pp = 0.5
+    elif liq >= 20000:
+        slippage_pp = 1.0
+    else:
+        slippage_pp = 2.0
+
+    return round(spread_pp + fees_pp + slippage_pp, 2)
+
+
+def estimate_quoted_edge_pp(yes_price, no_price, trade_type, oracle_risk):
+    """Odhad surového (pre-friction) edgu v pp.
+
+    Pre dashboard nemáme pri peňažný model pravdepodobnosti, ale vieme
+    proxy z míery odchylky od midpointu, kategorickej heuristiky a oracle bias-u.
+    Vráti odhadnutý edge v pp (može byť 0 ak nevíme).
+    """
+    if not isinstance(yes_price, (int, float)):
+        return 0.0
+
+    # Centovky: edge nepočítame v pp — R:R asymetria (1c → cca 100c)
+    if trade_type == "Centovka":
+        # Aproximácia: edge je pomer skutočnej P k cene; bez modelu vracíme high default
+        # iba ak oracle je low (ináč nie je verifikovateľný)
+        return 0.0
+
+    # Resolution / Trap — edge je v interpretácii pravidiel; nedetáme ho z ceny
+    if trade_type in ("Resolution", "Trap"):
+        return 0.0
+
+    # Momentum / Time Decay / Value / Mean reversion / Info-Timing
+    # Heuristika: odchýlka od 0.5 (mid) je približne proxy edge-u, keďže retail často
+    # útočí na ne. Vrátime pp distance od najbližšieho „fair“ bodu (0.05/0.5/0.95).
+    nearest = min([0.05, 0.5, 0.95], key=lambda x: abs(yes_price - x))
+    distance_pp = abs(yes_price - nearest) * 100.0
+
+    # Kontrolovaný return — max 30pp, než to začne klamať
+    return round(min(distance_pp, 30.0), 2)
 
 
 def build_hard_soft_checklist_v7(
     gate_resolutability, gate_friction, gate_exit, gate_catalyst, gate_oracle,
     fr_score, ex_score, fr_label, ex_label, catalyst_type, catalyst_confidence,
     oracle_risk, trade_type, days_to_end, category,
+    yes_price=None, no_price=None, liquidity=None, best_bid=None, best_ask=None,
 ):
-    """v7: HARD podmienky musia byť OK; SOFT sú stupne (silne/stredne/slabo).
+    """v7 (PDF sekcia 10): HARD podmienky musia byť OK; SOFT sú stupne (silne/stredne/slabo).
+
     HARD: Resolutability, Edge (po frikcii), Cash rezerva, Korelácia.
     SOFT: Frikcia, Exit, Catalyst, Oracle Trap.
+
+    Edge prah: Momentum/TimeDecay 10pp, Resolution/Trap 15pp, Centovka R:R asymetria.
+    Frikcia (PDF sekcia 2): spread + fees + sklz <= 1/2 edge prahu = "silne".
     """
-    # HARD
+    edge_threshold = edge_threshold_pp_v7(trade_type)
+    quoted_edge_pp = estimate_quoted_edge_pp(yes_price, no_price, trade_type, oracle_risk)
+    friction_pp = estimate_friction_pp(yes_price, no_price, liquidity, best_bid, best_ask)
+    after_cost_edge_pp = round(quoted_edge_pp - friction_pp, 2)
+
+    # HARD #1: Resolutability
     hard_resolutability_ok = gate_resolutability
-    # Edge — in-app nepoznajú skutočnú quoted edge, použijeme proxy: gate ok + good window
-    hard_edge_ok = gate_friction and gate_exit and oracle_risk in ("Low", "Medium")
-    # Cash rezerva a korelácia sú portfolioúrovňové — dashboard predpokladá OK,
-    # užívateľ ich kontroluje pred kliknutím "Otvoriť trade".
+
+    # HARD #2: Edge po frikcii >= prah (PDF sekcia 10)
+    if trade_type == "Centovka":
+        # Centovky: edge je R:R asymetria (1c -> ~100c). HARD = low oracle + likvidita.
+        hard_edge_ok = oracle_risk == "Low" and gate_friction
+        if isinstance(yes_price, (int, float)) and yes_price > 0:
+            edge_note = (f"Centovka R:R — cena {yes_price:.3f}, asymetria {(1.0/yes_price):.0f}x. "
+                         f"Frikcia {friction_pp}pp.")
+        else:
+            edge_note = f"Centovka asymetria, frikcia {friction_pp}pp."
+    elif trade_type in ("Resolution", "Trap"):
+        # Resolution/Trap edge je textový/pravidlový, nemerateľný z ceny.
+        hard_edge_ok = gate_resolutability and oracle_risk != "High" and gate_friction
+        edge_note = (f"Resolution/Trap edge je textový — vyžaduje {edge_threshold:.0f}pp prah "
+                     f"po frikcii ({friction_pp}pp).")
+    else:
+        # Štandard: po frikcii edge >= threshold
+        hard_edge_ok = after_cost_edge_pp >= edge_threshold and gate_friction
+        edge_note = (f"Po frikcii edge ~ {after_cost_edge_pp}pp "
+                     f"(quoted {quoted_edge_pp}pp - frikcia {friction_pp}pp), "
+                     f"prah {edge_threshold:.0f}pp pre {trade_type}.")
+
+    # HARD #3 + #4: portfoliové (dashboard predpokladá OK, /risk-status overí pri kliknutí)
     hard_cash_reserve_ok = True
     hard_correlation_ok = True
 
     # SOFT — stupne
     def grade(ok, score=None, mid=None, hi=None):
-        """vráti 'silne'/'stredne'/'slabo' podľa číselného score."""
         if score is None:
             return "silne" if ok else "slabo"
         if hi is not None and score >= hi:
@@ -711,7 +908,21 @@ def build_hard_soft_checklist_v7(
             return "stredne"
         return "slabo"
 
-    soft_friction = grade(gate_friction, fr_score, mid=3, hi=4)
+    # SOFT #1: Frikcia podľa PDF sekcia 2 — spread+fees+sklz <= 1/2 edge prahu
+    if edge_threshold > 0:
+        if friction_pp <= 0.5 * edge_threshold:
+            soft_friction = "silne"
+        elif friction_pp <= edge_threshold:
+            soft_friction = "stredne"
+        else:
+            soft_friction = "slabo"
+        friction_note = (f"{fr_label} — friction ~ {friction_pp}pp "
+                         f"(½ prahu = {0.5*edge_threshold:.1f}pp).")
+    else:
+        # Centovka — fall-back na fr_score
+        soft_friction = grade(gate_friction, fr_score, mid=3, hi=4)
+        friction_note = f"{fr_label} (score {fr_score}), friction ~ {friction_pp}pp."
+
     soft_exit = grade(gate_exit, ex_score, mid=2, hi=3)
     soft_catalyst = ("silne" if catalyst_confidence == "High"
                      else "stredne" if catalyst_confidence == "Medium"
@@ -730,10 +941,14 @@ def build_hard_soft_checklist_v7(
             "resolutability": {"ok": hard_resolutability_ok,
                 "note": "Pravidlá čisté — vieš, čo je YES/NO." if hard_resolutability_ok
                         else "Pravidlá alebo wording obsahujú ambiguities („sole discretion“, „materiality“)."},
-            "edge": {"ok": hard_edge_ok,
-                "note": (f"Edge prah po frikcii: {edge_threshold_pp_v7(trade_type):.0f}pp pre {trade_type}."
-                         + (" Frikcia + likvidita dávajú priestor." if hard_edge_ok
-                            else " Frikcia/likvidita/oracle bria edge."))},
+            "edge": {
+                "ok": hard_edge_ok,
+                "note": edge_note,
+                "thresholdPp": edge_threshold,
+                "quotedEdgePp": quoted_edge_pp,
+                "frictionPp": friction_pp,
+                "afterCostEdgePp": after_cost_edge_pp,
+            },
             "cashReserve": {"ok": hard_cash_reserve_ok,
                 "note": f"Skontroluj: po vstupe min. {int(APP_CONFIG['cash_reserve'])} USDC rezerva + 10% buffer."},
             "correlation": {"ok": hard_correlation_ok,
@@ -741,13 +956,14 @@ def build_hard_soft_checklist_v7(
         },
         "soft": {
             "friction": {"grade": soft_friction, "score": fr_score,
-                "note": f"{fr_label} (score {fr_score})."},
+                "frictionPp": friction_pp,
+                "note": friction_note},
             "exit": {"grade": soft_exit, "score": ex_score,
                 "note": f"{ex_label} (score {ex_score})."},
             "catalyst": {"grade": soft_catalyst,
-                "note": f"{catalyst_type} ({catalyst_confidence})."},
+                "note": f"{sk_catalyst_type(catalyst_type)} ({sk_oracle_risk(catalyst_confidence)})."},
             "oracleTrap": {"grade": soft_oracle,
-                "note": f"Oracle riziko: {oracle_risk}."},
+                "note": f"Oracle riziko: {sk_oracle_risk(oracle_risk)}."},
         },
         "summary": {
             "hardAllOk": hard_all_ok,
@@ -1339,6 +1555,8 @@ def score_market(m, strict_mode=False):
     }
 
     # v7 HARD/SOFT checklist (zachovávame aj pre kompatibilitu legacy 6/6)
+    best_bid_val = safe_num_or_none(m.get("bestBid"))
+    best_ask_val = safe_num_or_none(m.get("bestAsk"))
     checklist_v7 = build_hard_soft_checklist_v7(
         gate_resolutability=gate_resolutability,
         gate_friction=gate_friction,
@@ -1350,11 +1568,16 @@ def score_market(m, strict_mode=False):
         fr_label=sk_friction_label(fr_label),
         ex_label=sk_exit_label(ex_label),
         catalyst_type=sk_catalyst_type(catalyst_type),
-        catalyst_confidence=sk_oracle_risk(catalyst_confidence),
-        oracle_risk=sk_oracle_risk(oracle_risk),
+        catalyst_confidence=catalyst_confidence,
+        oracle_risk=oracle_risk,
         trade_type=trade_type,
         days_to_end=days_to_end,
         category=category,
+        yes_price=yes_price,
+        no_price=no_price,
+        liquidity=liquidity,
+        best_bid=best_bid_val,
+        best_ask=best_ask_val,
     )
 
     auto_draft = build_auto_draft(
@@ -1397,7 +1620,8 @@ def score_market(m, strict_mode=False):
     )
 
     fail = fail_point(checklist, oracle_risk, notes)
-    sizing_cap = sizing_cap_from_v6(flag, trade_type, auto_draft["finalDecision"])
+    soft_weak_count = (checklist_v7.get("summary", {}) or {}).get("softWeakCount", 0)
+    sizing_cap = sizing_cap_v7(flag, trade_type, auto_draft["finalDecision"], soft_weak_count=soft_weak_count)
     cluster = detect_cluster(raw_question, category)
     entry_zone = entry_zone_status(
         auto_draft["finalDecision"],
