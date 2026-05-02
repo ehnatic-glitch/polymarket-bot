@@ -6,7 +6,7 @@ import re
 import time
 import threading
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
 
@@ -2550,6 +2550,245 @@ def risk_status():
     })
 
 
+# === v9 P2 — catalyst calendar (hardcoded macro + manual + auto z pozícií) ===
+_HARDCODED_MACRO_CATALYSTS = [
+    # 2026 makro/political kal. (kontrolovaný zoznam pre 30-dňové okno) — user môže predať cez POST
+    # FOMC 2026: 28.1, 18.3, 29.4, 17.6, 29.7, 16.9, 28.10, 9.12
+    {"date": "2026-04-29", "label": "FOMC rate decision", "kind": "macro", "impact": "high"},
+    {"date": "2026-05-13", "label": "US CPI (April)", "kind": "macro", "impact": "high"},
+    {"date": "2026-05-02", "label": "US NFP (April)", "kind": "macro", "impact": "high"},
+    {"date": "2026-06-12", "label": "US CPI (May)", "kind": "macro", "impact": "high"},
+    {"date": "2026-06-17", "label": "FOMC rate decision", "kind": "macro", "impact": "high"},
+    {"date": "2026-06-04", "label": "ECB rate decision", "kind": "macro", "impact": "medium"},
+    {"date": "2026-06-06", "label": "US NFP (May)", "kind": "macro", "impact": "high"},
+    # 2026 voľby/political
+    {"date": "2026-11-03", "label": "US midterms 2026", "kind": "election", "impact": "high"},
+    {"date": "2026-09-27", "label": "DE Bundestag (predpoklad)", "kind": "election", "impact": "medium"},
+]
+
+
+def _p2_catalyst_calendar(window_days=30):
+    """Vráti catalyst kalendár v okne window_days dopředu.
+
+    Zdroje:
+      - hardcoded macro/election events (_HARDCODED_MACRO_CATALYSTS)
+      - manuálne (state.catalysts — user pridané cez POST /catalysts)
+      - auto z otvorených pozícií (endDate každej pozicíie)
+    """
+    now = datetime.now(timezone.utc)
+    horizon = now + timedelta(days=window_days)
+    out = []
+    # Hardcoded
+    for c in _HARDCODED_MACRO_CATALYSTS:
+        try:
+            dt = datetime.strptime(c["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if now <= dt <= horizon:
+                out.append({**c, "source": "hardcoded", "daysAway": (dt - now).days})
+        except Exception:
+            continue
+    # Manual (state.catalysts)
+    state = load_state()
+    for c in (state.get("catalysts") or []):
+        try:
+            dt = datetime.strptime((c.get("date") or "")[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if now <= dt <= horizon:
+                out.append({
+                    "date": c.get("date"),
+                    "label": c.get("label") or "manual",
+                    "kind": c.get("kind") or "manual",
+                    "impact": c.get("impact") or "medium",
+                    "note": c.get("note") or "",
+                    "source": "manual",
+                    "daysAway": (dt - now).days,
+                })
+        except Exception:
+            continue
+    # Auto z pozícií
+    open_positions, _ = _p1_portfolio_summary()
+    for p in open_positions.values():
+        end_iso = p.get("endDate")
+        slug = p.get("slug")
+        if not end_iso and slug:
+            try:
+                r = requests.get(f"{GAMMA_BASE}/markets", params={"slug": slug}, timeout=6)
+                if r.ok:
+                    data = r.json()
+                    m = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
+                    if m:
+                        end_iso = m.get("endDate")
+            except Exception:
+                pass
+        if not end_iso:
+            continue
+        try:
+            end_dt = parse_date(end_iso)
+            if end_dt and now <= end_dt <= horizon:
+                out.append({
+                    "date": end_dt.strftime("%Y-%m-%d"),
+                    "label": (p.get("question") or slug or "position")[:80],
+                    "kind": "position",
+                    "impact": "position",
+                    "slug": slug,
+                    "book": p.get("book"),
+                    "usdc": p.get("usdc"),
+                    "source": "position",
+                    "daysAway": (end_dt - now).days,
+                })
+        except Exception:
+            continue
+    out.sort(key=lambda x: x.get("daysAway", 999))
+    return out
+
+
+@app.route("/catalyst-calendar")
+def catalyst_calendar():
+    window = safe_int(request.args.get("days", "30"), 30)
+    return jsonify({
+        "windowDays": window,
+        "catalysts": _p2_catalyst_calendar(window),
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@app.route("/catalysts", methods=["POST"])
+def catalysts_post():
+    """Manuálne pridanie catalyst eventu. Body: {date: 'YYYY-MM-DD', label, kind?, impact?, note?}"""
+    payload = request.get_json(force=True, silent=True) or {}
+    if not payload.get("date") or not payload.get("label"):
+        return jsonify({"ok": False, "error": "missing date/label"}), 400
+    state = load_state()
+    catalysts = state.get("catalysts") or []
+    catalysts.append({
+        "date": payload.get("date"),
+        "label": payload.get("label"),
+        "kind": payload.get("kind") or "manual",
+        "impact": payload.get("impact") or "medium",
+        "note": payload.get("note") or "",
+        "addedAt": datetime.now(timezone.utc).isoformat(),
+    })
+    state["catalysts"] = catalysts[-100:]
+    save_state(state)
+    return jsonify({"ok": True, "count": len(state["catalysts"])})
+
+
+@app.route("/catalysts", methods=["DELETE"])
+def catalysts_delete():
+    """Zmaže jedneho cataylst: ?label=...&date=..."""
+    label = request.args.get("label")
+    date = request.args.get("date")
+    state = load_state()
+    catalysts = state.get("catalysts") or []
+    new_list = [c for c in catalysts if not (c.get("label") == label and c.get("date") == date)]
+    state["catalysts"] = new_list
+    save_state(state)
+    return jsonify({"ok": True, "count": len(new_list)})
+
+
+# === v9 P2 — narrative correlation map ===
+def _p2_narrative_keywords(question):
+    """Heuristika: extrahuj naratív zo question stringu (lower-cased keyword matching).
+
+    Vracia napr. 'russia-ukraine', 'us-2028-elections', 'crypto-btc', 'china-taiwan' ...
+    """
+    if not question:
+        return "misc"
+    q = question.lower()
+    pairs = [
+        ("russia-ukraine", ["russia", "ukraine", "ceasefire", "putin", "zelensky", "crimea"]),
+        ("israel-gaza", ["israel", "gaza", "hamas", "hezbollah", "netanyahu"]),
+        ("china-taiwan", ["taiwan", "china invade", "xi jinping"]),
+        ("us-2028", ["2028", "presidential election 2028"]),
+        ("us-midterms", ["midterm", "senate 2026", "house 2026"]),
+        ("us-politics", ["trump", "biden", "harris", "vance", "desantis", "newsom"]),
+        ("crypto-btc", ["bitcoin", "btc"]),
+        ("crypto-eth", ["ethereum", "eth "]),
+        ("crypto-other", ["sol ", "solana", "xrp", "doge", "crypto"]),
+        ("fed-macro", ["fed", "fomc", "rate cut", "rate hike", "cpi", "inflation", "recession"]),
+        ("sports-nba", ["nba", "lakers", "celtics", "warriors"]),
+        ("sports-nfl", ["nfl", "super bowl"]),
+        ("sports-mlb", ["mlb", "world series"]),
+        ("ai-tech", ["openai", "sam altman", "agi", "gpt-", "anthropic", "google ai"]),
+        ("climate", ["climate", "hurricane", "temperature"]),
+    ]
+    for narrative, kws in pairs:
+        for kw in kws:
+            if kw in q:
+                return narrative
+    return "misc"
+
+
+@app.route("/narrative-map")
+def narrative_map():
+    """Korelačná mapa: koľko USDC v každom naratíve naprieč open pozíciami."""
+    open_positions, _ = _p1_portfolio_summary()
+    buckets = {}
+    for p in open_positions.values():
+        narr_field = (p.get("narrative") or "").strip().lower()
+        if narr_field and narr_field != "misc":
+            key = narr_field
+        else:
+            key = _p2_narrative_keywords(p.get("question"))
+        b = buckets.setdefault(key, {
+            "narrative": key,
+            "usdc": 0.0,
+            "count": 0,
+            "books": {"CORE": 0.0, "SANDBOX": 0.0},
+            "slugs": [],
+        })
+        b["usdc"] += p.get("usdc") or 0.0
+        b["count"] += 1
+        book = p.get("book") or "CORE"
+        b["books"][book] = b["books"].get(book, 0.0) + (p.get("usdc") or 0.0)
+        if p.get("slug"):
+            b["slugs"].append({"slug": p["slug"], "usdc": p.get("usdc") or 0.0, "book": book, "question": (p.get("question") or "")[:80]})
+    out = list(buckets.values())
+    for b in out:
+        b["usdc"] = round(b["usdc"], 2)
+        b["books"] = {k: round(v, 2) for k, v in b["books"].items()}
+    out.sort(key=lambda x: -x["usdc"])
+    total = round(sum(b["usdc"] for b in out), 2)
+    # Červena flag ak nejaky naratív > 70 USDC (core_max_narrative)
+    cap = APP_CONFIG["core_max_narrative"]
+    breaches = [b["narrative"] for b in out if b["usdc"] > cap]
+    return jsonify({
+        "narratives": out,
+        "total": total,
+        "narrativeCap": cap,
+        "breaches": breaches,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+# === v9 P2 — client-side helper: book classification by market data (re-used in detail panel) ===
+@app.route("/v9-classify")
+def v9_classify_market():
+    """Vráti book label (CORE/SANDBOX/WAIT/PASS) pre konkretny market podla v9 prahov.
+
+    Volane lazy z detail panel-a.
+    Body alternatívne: ?slug=...
+    """
+    slug = request.args.get("slug")
+    payload = request.get_json(force=True, silent=True) if request.method == "POST" else None
+    row = payload
+    # Ak je slug, hladaj v cache (last v9 candidates) — inak vrat n/a
+    if not row and slug:
+        # try cache
+        cached = cache_get("v9_cand_full", slug)
+        if cached:
+            row = cached
+    if not isinstance(row, dict):
+        return jsonify({"ok": False, "error": "need row payload or known slug", "book": None})
+    edge = ((row.get("checklistV7") or {}).get("hard", {}) or {}).get("edge", {}) or {}
+    eff_edge = edge.get("effectiveEdgePp") or edge.get("afterCostEdgePp")
+    pat_edge = edge.get("patientEdgePp")
+    book, reason = _v9_classify_book(row, effective_edge=eff_edge)
+    if book == "PASS":
+        wait_book = _v9_patient_book(row, pat_edge)
+        if wait_book:
+            return jsonify({"ok": True, "book": "WAIT", "viaPatient": wait_book, "reason": reason})
+    return jsonify({"ok": True, "book": book, "reason": reason})
+
+
 @app.route("/positions/open")
 def positions_open():
     """v9 P1: open pozície z pnl-log + live midprice z Gamma + PnL%.
@@ -3623,6 +3862,40 @@ def dashboard():
     .pnl-neg {{ color: #c5221f; font-weight: 600; }}
     .guard-banner {{ background: #fdecea; border: 2px solid #c5221f; color: #8b1a17; padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 13px; font-weight: 600; }}
     .guard-banner.warn {{ background: #fff8e1; border-color: #e6a700; color: #6a4f00; }}
+    /* === v9 P2: detail panel velky book pill === */
+    .book-pill-xl {{ display: inline-block; padding: 6px 16px; border-radius: 6px; font-size: 14px; font-weight: 800; letter-spacing: 1.2px; text-transform: uppercase; vertical-align: middle; margin-right: 8px; }}
+    .book-pill-xl.core {{ background: #1a4d8c; color: #fff; }}
+    .book-pill-xl.sandbox {{ background: #b8801a; color: #fff; }}
+    .book-pill-xl.wait {{ background: #4a4a4a; color: #fff; }}
+    .book-pill-xl.pass {{ background: #d6d6d6; color: #555; }}
+    /* === v9 P2 catalyst kalendar === */
+    .cal-row {{ display: grid; grid-template-columns: 90px 70px 1fr 110px; gap: 10px; padding: 7px 8px; border-top: 1px solid #e0e0e0; font-size: 13px; align-items: center; }}
+    .cal-row.first {{ border-top: none; }}
+    .cal-day {{ font-weight: 700; }}
+    .cal-day.urgent {{ color: #c5221f; }}
+    .cal-day.soon {{ color: #e6a700; }}
+    .cal-impact {{ font-size: 10px; padding: 2px 6px; border-radius: 10px; font-weight: 700; text-transform: uppercase; text-align: center; }}
+    .cal-impact.high {{ background: #fdecea; color: #8b1a17; }}
+    .cal-impact.medium {{ background: #fff8e1; color: #6a4f00; }}
+    .cal-impact.position {{ background: #e3edf8; color: #1a4d8c; }}
+    .cal-source {{ font-size: 10px; color: #888; text-align: right; }}
+    /* === v9 P2 narrative map === */
+    .narr-row {{ display: grid; grid-template-columns: 160px 1fr 90px; gap: 10px; padding: 7px 8px; border-top: 1px solid #e0e0e0; font-size: 13px; align-items: center; }}
+    .narr-bar-track {{ background: #f0f0f0; border-radius: 4px; height: 16px; position: relative; overflow: hidden; }}
+    .narr-bar-fill {{ height: 100%; background: linear-gradient(90deg, #1a4d8c, #4a90e2); }}
+    .narr-bar-fill.warn {{ background: linear-gradient(90deg, #e6a700, #f4b400); }}
+    .narr-bar-fill.alert {{ background: linear-gradient(90deg, #c5221f, #e64a47); }}
+    .narr-name {{ font-weight: 600; }}
+    .narr-usdc {{ text-align: right; font-weight: 600; }}
+    /* === v9 P2 exit plan bullets === */
+    .exit-bullets {{ list-style: none; padding-left: 0; margin: 0; }}
+    .exit-bullets li {{ padding: 6px 0; border-bottom: 1px dashed #e0e0e0; font-size: 13px; }}
+    .exit-bullets li:last-child {{ border-bottom: none; }}
+    .exit-bullets li b {{ color: #1a4d8c; }}
+    .exit-bullets li.stop {{ color: #8b1a17; }}
+    .exit-bullets li.stop b {{ color: #c5221f; }}
+    .exit-bullets li.tp1 b {{ color: #137333; }}
+    .exit-bullets li.tp2 b {{ color: #137333; }}
     #riskManagerSection.no-trade {{ background: #fff3f0; border: 2px solid #c5221f; }}
     .metric-pill {{ display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; margin-right: 6px; margin-bottom: 6px; background: #f3f4f6; color: #333; }}
     .delta-up {{ color: #137333; font-weight: 700; }}
@@ -3714,6 +3987,23 @@ def dashboard():
   <div class="section" id="positionsSection">
     <h2>Otvorené pozície <span class="small" style="font-weight:400;">— live midprice z Gammy, PnL%, TP/stop</span></h2>
     <div id="positionsBox">Načítava sa...</div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px;" id="p2Grid">
+    <div class="section" style="margin:0;">
+      <h2>Catalyst kalendár <span class="small" style="font-weight:400;">— 30 dní (FOMC, CPI, voľby + tvoje pozície)</span></h2>
+      <div class="controls" style="margin-bottom:6px;">
+        <input id="calDate" type="date" style="padding:4px;" />
+        <input id="calLabel" type="text" placeholder="napr. ECB rate decision" style="padding:4px;width:200px;" />
+        <select id="calImpact" style="padding:4px;"><option value="high">high</option><option value="medium" selected>medium</option><option value="low">low</option></select>
+        <button onclick="addCatalyst()" class="btn-primary" style="padding:4px 10px;">+ Pridať</button>
+      </div>
+      <div id="catalystBox">Načítava sa...</div>
+    </div>
+    <div class="section" style="margin:0;">
+      <h2>Korelačná mapa naratívov <span class="small" style="font-weight:400;">— USDC v každom námete (cap 70)</span></h2>
+      <div id="narrativeBox">Načítava sa...</div>
+    </div>
   </div>
 
   <div class="section" id="riskManagerSection">
@@ -4505,17 +4795,91 @@ def dashboard():
       URL.revokeObjectURL(url);
     }}
 
+    function classifyMarketBook(m) {{
+      // P2: client-side klasifikácia v9 book label (CORE/SANDBOX/WAIT/PASS)
+      const cv = m.checklistV7 || {{}};
+      const dec = (m.autoDraft && m.autoDraft.finalDecision) || 'PASS';
+      if (!String(dec).toUpperCase().startsWith('BUY')) return {{book: 'PASS', reason: 'no BUY decision'}};
+      const edge = ((cv.hard || {{}}).edge) || {{}};
+      const eff = edge.effectiveEdgePp != null ? edge.effectiveEdgePp : edge.afterCostEdgePp;
+      const pat = edge.patientEdgePp;
+      const summary = cv.summary || {{}};
+      const oracle = ((cv.soft || {{}}).oracleTrap || {{}}).grade || 'slabo';
+      const fam = m.family || m.tradeTypeLabel || '';
+      // approx prahy: dispute/resolution = 12, ostatné core 9, sandbox 6 — align s _v9_edge_threshold
+      let corePrah = 9, sandboxPrah = 6;
+      const famLow = String(fam).toLowerCase();
+      if (famLow.indexOf('disp') >= 0 || famLow.indexOf('resol') >= 0 || famLow.indexOf('oracle') >= 0) {{
+        corePrah = 12;
+      }}
+      const days = m.daysToEnd || 0;
+      if (typeof eff !== 'number') return {{book: 'PASS', reason: 'no after-cost edge'}};
+      if (summary.hardAllOk && eff >= corePrah && (oracle === 'silne' || oracle === 'stredne') && days >= 2 && days <= 365) {{
+        return {{book: 'CORE', reason: 'eff edge ' + eff + 'pp >= ' + corePrah + 'pp'}};
+      }}
+      if (eff >= sandboxPrah && days >= 2 && days <= 365) {{
+        if (oracle === 'slabo' && eff < corePrah) return {{book: 'PASS', reason: 'oracle slabo'}};
+        return {{book: 'SANDBOX', reason: 'eff edge ' + eff + 'pp medzi ' + sandboxPrah + ' a ' + corePrah}};
+      }}
+      // skontroluj WAIT (patient edge nad core prah)
+      if (typeof pat === 'number' && pat >= sandboxPrah) {{
+        return {{book: 'WAIT', reason: 'patient edge ' + pat + 'pp — zadaj limit'}};
+      }}
+      return {{book: 'PASS', reason: 'eff edge ' + eff + 'pp pod prah'}};
+    }}
+
+    function bookPillXl(book) {{
+      const cls = String(book || 'pass').toLowerCase();
+      return '<span class="book-pill-xl ' + cls + '">' + (book || 'PASS') + '</span>';
+    }}
+
+    function renderExitBullets(m) {{
+      const ep = m.executionPlan || {{}};
+      const items = [];
+      if (ep.buyLimitPrice != null) {{
+        items.push('<li><b>VSTUP</b> @ ' + Number(ep.buyLimitPrice).toFixed(3) + ' · stake ' + (ep.stakeUSDC || 0) + ' USDC · ' + (ep.entrySide || '?') + (ep.spreadPct != null ? ' · spread ' + ep.spreadPct + 'pp' : '') + '</li>');
+      }}
+      if (ep.takeProfit1 != null) {{
+        items.push('<li class="tp1"><b>TP1</b> @ ' + Number(ep.takeProfit1).toFixed(3) + ' · ' + (ep.tp1Pct ? 'predaj ' + ep.tp1Pct + '%' : 'predaj 40%') + (ep.tranche2USDC ? ' (' + ep.tranche2USDC + ' USDC)' : '') + (ep.tp1Action ? ' — ' + ep.tp1Action : '') + '</li>');
+      }}
+      if (ep.takeProfit2 != null) {{
+        items.push('<li class="tp2"><b>TP2</b> @ ' + Number(ep.takeProfit2).toFixed(3) + ' · ' + (ep.tp2Pct ? 'predaj ' + ep.tp2Pct + '%' : 'predaj 35%') + (ep.tranche3USDC ? ' (' + ep.tranche3USDC + ' USDC)' : '') + (ep.tp2Action ? ' — ' + ep.tp2Action : '') + '</li>');
+      }}
+      // Stop / invalidácia — odhad z entry pri chýbajúcom poli
+      const stopPrice = ep.stopLoss != null ? ep.stopLoss : (ep.buyLimitPrice ? Number(ep.buyLimitPrice) * 0.75 : null);
+      if (stopPrice != null) {{
+        items.push('<li class="stop"><b>STOP</b> @ ' + Number(stopPrice).toFixed(3) + ' · vÝpredaj ' + (ep.fullExitTrigger ? '— ' + ep.fullExitTrigger : '— fundament sa zlomil alebo dispute risk vzrástol') + '</li>');
+      }}
+      if (ep.timeStop) {{
+        items.push('<li><b>TIME-STOP</b> ' + ep.timeStop + '</li>');
+      }} else if (m.daysToEnd) {{
+        items.push('<li><b>TIME-STOP</b> ' + Math.max(2, Math.floor(Number(m.daysToEnd) / 3)) + ' dní pred deadline ak edge neprišiel</li>');
+      }}
+      const inv = (m.autoDraft && m.autoDraft.invalidation) || ep.invalidation;
+      if (inv) {{
+        items.push('<li><b>INVALIDÁCIA</b> ' + inv + '</li>');
+      }}
+      if (ep.runnerRule) {{
+        items.push('<li><b>RUNNER</b> ' + ep.runnerRule + '</li>');
+      }}
+      if (items.length === 0) return '<div class="small">Default = PASS — nie je BUY plán.</div>';
+      return '<ul class="exit-bullets">' + items.join('') + '</ul>';
+    }}
+
     function showDetail(m) {{
       selectedMarket = m;
       const panel = document.getElementById('detailPanel');
       if (!panel) return;
       const tradeUrl = m.slug ? ('https://polymarket.com/event/' + m.slug) : 'https://polymarket.com';
+      const cls = classifyMarketBook(m);
       panel.innerHTML = ''
         + '<div class="detail-shell">'
         +   '<div class="section">'
         +     '<div class="title-row">'
         +       '<div class="title-main">'
-        +         '<h3>' + (m.question || '') + '</h3>'
+        +         bookPillXl(cls.book)
+        +         '<h3 style="display:inline;">' + (m.question || '') + '</h3>'
+        +         '<div class="small" style="margin-top:4px;color:#666;">' + cls.reason + '</div>'
         +         flagBadge(m.flagLabel)
         +         ' ' + decisionBadge((m.autoDraft && m.autoDraft.finalDecision) || 'PASS')
         +         ' ' + catBadge(m.categoryLabel || '')
@@ -4572,6 +4936,8 @@ def dashboard():
         +       '<label class="block-label">Runner rule</label><div class="panel-muted">' + ((m.executionPlan && m.executionPlan.runnerRule) || '') + '</div>'
         +       '<label class="block-label">Time-stop</label><div class="panel-muted">' + ((m.executionPlan && m.executionPlan.timeStop) || '') + '</div>'
         +       '<label class="block-label">Full exit trigger</label><div class="panel-muted">' + ((m.executionPlan && m.executionPlan.fullExitTrigger) || '') + '</div>'
+        +       '<label class="block-label" style="margin-top:10px;">Per-trade plán výstupu (v9)</label>'
+        +       renderExitBullets(m)
         +     '</div>'
         +   '</div>'
         + '</div>';
@@ -4981,8 +5347,103 @@ def dashboard():
       }}
     }}
 
+    async function loadCatalystCalendar() {{
+      const box = document.getElementById('catalystBox');
+      if (!box) return;
+      try {{
+        const res = await fetch('/catalyst-calendar?days=30');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const d = await res.json();
+        const cats = d.catalysts || [];
+        if (cats.length === 0) {{
+          box.innerHTML = '<div class="small">Žiadne catalysts v okne 30 dní.</div>';
+          return;
+        }}
+        let html = '';
+        cats.forEach(function(c, i) {{
+          const days = c.daysAway != null ? c.daysAway : '?';
+          let dayCls = '';
+          if (typeof days === 'number') {{
+            if (days <= 3) dayCls = 'urgent';
+            else if (days <= 7) dayCls = 'soon';
+          }}
+          const impact = c.impact || 'medium';
+          const lbl = (c.label || '').replace(/</g,'&lt;');
+          const slug = c.slug ? ' · <a href="https://polymarket.com/event/' + c.slug + '" target="_blank">link</a>' : '';
+          const usdc = c.usdc ? ' · ' + c.usdc + ' USDC' : '';
+          const book = c.book ? ' · ' + c.book : '';
+          const dateStr = c.date || '';
+          html += '<div class="cal-row' + (i === 0 ? ' first' : '') + '">';
+          html += '<div class="cal-day ' + dayCls + '">' + (typeof days === 'number' ? ('+' + days + 'd') : '?') + '<div class="small" style="font-weight:400;color:#888;">' + dateStr + '</div></div>';
+          html += '<div class="cal-impact ' + impact + '">' + impact + '</div>';
+          html += '<div>' + lbl + slug + usdc + book + '</div>';
+          html += '<div class="cal-source">' + (c.source || '') + (c.source === 'manual' ? ' <a href="javascript:void(0)" onclick="deleteCatalyst(\'' + (c.label || '').replace(/\x27/g,"\\\x27") + '\',\'' + (c.date || '') + '\')">✕</a>' : '') + '</div>';
+          html += '</div>';
+        }});
+        box.innerHTML = html;
+      }} catch (err) {{
+        box.innerHTML = '<div class="small">Catalyst kalendár nedostupný: ' + err.message + '</div>';
+      }}
+    }}
+
+    async function addCatalyst() {{
+      const date = document.getElementById('calDate').value;
+      const label = document.getElementById('calLabel').value;
+      const impact = document.getElementById('calImpact').value;
+      if (!date || !label) {{ alert('Vyplň dátum a label'); return; }}
+      try {{
+        const res = await fetch('/catalysts', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{date, label, impact, kind: 'manual'}})}});
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        document.getElementById('calLabel').value = '';
+        loadCatalystCalendar();
+      }} catch (err) {{
+        alert('Chyba: ' + err.message);
+      }}
+    }}
+
+    async function deleteCatalyst(label, date) {{
+      if (!confirm('Zmazať ' + label + '?')) return;
+      try {{
+        await fetch('/catalysts?label=' + encodeURIComponent(label) + '&date=' + encodeURIComponent(date), {{method: 'DELETE'}});
+        loadCatalystCalendar();
+      }} catch (err) {{}}
+    }}
+
+    async function loadNarrativeMap() {{
+      const box = document.getElementById('narrativeBox');
+      if (!box) return;
+      try {{
+        const res = await fetch('/narrative-map');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const d = await res.json();
+        const narrs = d.narratives || [];
+        if (narrs.length === 0) {{
+          box.innerHTML = '<div class="small">Žiadne otvorené pozície. Naratuívy sa zobrazia keď otvoríš trade.</div>';
+          return;
+        }}
+        const cap = d.narrativeCap || 70;
+        const max = Math.max.apply(null, narrs.map(function(n) {{ return n.usdc || 0; }}).concat([cap]));
+        let html = '';
+        narrs.forEach(function(n) {{
+          const ratio = max > 0 ? Math.min(1, (n.usdc || 0) / max) : 0;
+          let fillCls = '';
+          if ((n.usdc || 0) >= cap) fillCls = 'alert';
+          else if ((n.usdc || 0) >= cap * 0.7) fillCls = 'warn';
+          html += '<div class="narr-row">';
+          html += '<div class="narr-name">' + n.narrative + ' <div class="small" style="font-weight:400;color:#888;">' + n.count + ' × · CORE ' + (n.books.CORE || 0) + ' · SBX ' + (n.books.SANDBOX || 0) + '</div></div>';
+          html += '<div class="narr-bar-track"><div class="narr-bar-fill ' + fillCls + '" style="width:' + (ratio * 100).toFixed(1) + '%"></div></div>';
+          html += '<div class="narr-usdc">' + (n.usdc || 0) + ' / ' + cap + '</div>';
+          html += '</div>';
+        }});
+        html += '<div class="small" style="margin-top:8px;color:#666;">Total: ' + d.total + ' USDC · cap na naratív: ' + cap + ' (PDF v9 sekcia 2). ' + (d.breaches.length > 0 ? '<span style="color:#c5221f;font-weight:700;">⚠ Prekročený cap: ' + d.breaches.join(', ') + '</span>' : '✓ Všetky naratívy v limít-e.') + '</div>';
+        box.innerHTML = html;
+      }} catch (err) {{
+        box.innerHTML = '<div class="small">Naratuív mapa nedostupná: ' + err.message + '</div>';
+      }}
+    }}
+
     async function loadAll() {{
-      await Promise.all([loadMarkets(), loadGlobalWhaleFlow(), loadRiskStatus(), loadV9(), loadKpiBar(), loadPositions()]);
+      await Promise.all([loadMarkets(), loadGlobalWhaleFlow(), loadRiskStatus(), loadV9(), loadKpiBar(), loadPositions(), loadCatalystCalendar(), loadNarrativeMap()]);
     }}
 
     document.getElementById('refreshBtn')?.addEventListener('click', loadAll);
