@@ -3973,39 +3973,6 @@ def dashboard():
     </div>
   </div>
 
-  <div id="kpiBarSection">
-    <div id="guardBanner"></div>
-    <div id="kpiBar" class="kpi-bar">
-      <div class="kpi-card"><div class="kpi-label">CORE</div><div class="kpi-value">–</div><div class="kpi-sub">načítava sa</div></div>
-      <div class="kpi-card"><div class="kpi-label">SANDBOX</div><div class="kpi-value">–</div><div class="kpi-sub">načítava sa</div></div>
-      <div class="kpi-card"><div class="kpi-label">Exposure</div><div class="kpi-value">–</div><div class="kpi-sub">načítava sa</div></div>
-      <div class="kpi-card"><div class="kpi-label">Drawdown</div><div class="kpi-value">–</div><div class="kpi-sub">načítava sa</div></div>
-      <div class="kpi-card"><div class="kpi-label">Loss streak</div><div class="kpi-value">–</div><div class="kpi-sub">načítava sa</div></div>
-    </div>
-  </div>
-
-  <div class="section" id="positionsSection">
-    <h2>Otvorené pozície <span class="small" style="font-weight:400;">— live midprice z Gammy, PnL%, TP/stop</span></h2>
-    <div id="positionsBox">Načítava sa...</div>
-  </div>
-
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px;" id="p2Grid">
-    <div class="section" style="margin:0;">
-      <h2>Catalyst kalendár <span class="small" style="font-weight:400;">— 30 dní (FOMC, CPI, voľby + tvoje pozície)</span></h2>
-      <div class="controls" style="margin-bottom:6px;">
-        <input id="calDate" type="date" style="padding:4px;" />
-        <input id="calLabel" type="text" placeholder="napr. ECB rate decision" style="padding:4px;width:200px;" />
-        <select id="calImpact" style="padding:4px;"><option value="high">high</option><option value="medium" selected>medium</option><option value="low">low</option></select>
-        <button onclick="addCatalyst()" class="btn-primary" style="padding:4px 10px;">+ Pridať</button>
-      </div>
-      <div id="catalystBox">Načítava sa...</div>
-    </div>
-    <div class="section" style="margin:0;">
-      <h2>Korelačná mapa naratívov <span class="small" style="font-weight:400;">— USDC v každom námete (cap 70)</span></h2>
-      <div id="narrativeBox">Načítava sa...</div>
-    </div>
-  </div>
-
 
 
   <div class="section" id="v9Section">
@@ -5452,7 +5419,7 @@ def dashboard():
     }}
 
     async function loadAll() {{
-      await Promise.all([loadMarkets(), loadGlobalWhaleFlow(), loadV9(), loadKpiBar(), loadPositions(), loadCatalystCalendar(), loadNarrativeMap()]);
+      await Promise.all([loadMarkets(), loadGlobalWhaleFlow(), loadV9()]);
     }}
 
     document.getElementById('refreshBtn')?.addEventListener('click', loadAll);
