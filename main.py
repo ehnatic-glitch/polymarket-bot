@@ -2328,10 +2328,96 @@ def pnl_log_get():
     return jsonify({"entries": read_pnl_log(limit=limit)})
 
 
+# === v9 P1 helpers — book-aware portfolio metrics ===
+def _p1_book_of_entry(entry):
+    """Vráti 'CORE' alebo 'SANDBOX' z pnl-log entry. Fallback CORE pre staré záznamy."""
+    b = (entry.get("book") or "").upper()
+    if b in ("CORE", "SANDBOX"):
+        return b
+    # Fallback heuristika: ak stake <= sandbox_max_per_trade, predpokladaj SANDBOX
+    stake = to_float(entry.get("usdc")) or 0.0
+    if 0 < stake <= APP_CONFIG["sandbox_max_per_trade"]:
+        return "SANDBOX"
+    return "CORE"
+
+
+def _p1_portfolio_summary():
+    """Zrekonštruuje open pozície + closed PnL z pnl-log a vráti book-aware súhrn."""
+    entries = read_pnl_log(limit=1000)
+    open_positions = {}
+    closed = []
+    for e in entries:
+        slug = e.get("slug") or e.get("question")
+        kind = e.get("kind")
+        if kind == "open":
+            open_positions[slug] = {
+                "slug": slug,
+                "question": e.get("question"),
+                "side": e.get("side"),
+                "usdc": to_float(e.get("usdc")) or 0.0,
+                "price": to_float(e.get("price")) or 0.0,
+                "narrative": e.get("narrative") or "",
+                "book": _p1_book_of_entry(e),
+                "ts": e.get("ts") or e.get("loggedAt"),
+                "endDate": e.get("endDate"),
+            }
+        elif kind == "close":
+            if slug in open_positions:
+                op = open_positions.pop(slug)
+                pnl = to_float(e.get("pnl")) or 0.0
+                closed.append({**op, "pnl": pnl, "closeTs": e.get("ts") or e.get("loggedAt")})
+            else:
+                closed.append({
+                    "slug": slug,
+                    "question": e.get("question"),
+                    "pnl": to_float(e.get("pnl")) or 0.0,
+                    "book": _p1_book_of_entry(e),
+                    "closeTs": e.get("ts") or e.get("loggedAt"),
+                })
+    return open_positions, closed
+
+
+def _p1_compute_drawdown_pct(closed, book):
+    """Drawdown CORE alebo SANDBOX bookovej kapitály — od baseline (book_size).
+    Vracia záporné číslo v percentách (napr. -12.5 = -12.5%)."""
+    if book == "CORE":
+        baseline = APP_CONFIG["core_book_size"]
+    else:
+        baseline = APP_CONFIG["sandbox_book_size"]
+    realized = sum(c.get("pnl", 0) for c in closed if c.get("book") == book)
+    if baseline <= 0:
+        return 0.0
+    return round(realized / baseline * 100.0, 2)
+
+
+def _p1_sandbox_loss_streak(closed):
+    """Posledných N po sebe idúcich stratových sandbox close eventov."""
+    streak = 0
+    sandbox_closed = [c for c in closed if c.get("book") == "SANDBOX"]
+    for c in reversed(sandbox_closed):
+        if c.get("pnl", 0) < 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
 @app.route("/risk-status")
 def risk_status():
-    """v7 portfolio risk overview: bankroll, rezerva, open pozicíe, expozícia, drawdown, loss streak.
+    """v9 portfolio risk overview: book-aware (CORE+SANDBOX) split + drawdown guard + sandbox loss streak.
     Počíta z append-only PnL logu (open/close events)."""
+    _open_positions, _closed = _p1_portfolio_summary()
+    # Per-book split
+    core_open = [p for p in _open_positions.values() if p.get("book") == "CORE"]
+    sandbox_open = [p for p in _open_positions.values() if p.get("book") == "SANDBOX"]
+    core_exposure = round(sum(p["usdc"] for p in core_open), 2)
+    sandbox_exposure = round(sum(p["usdc"] for p in sandbox_open), 2)
+    global_exposure = round(core_exposure + sandbox_exposure, 2)
+    core_drawdown_pct = _p1_compute_drawdown_pct(_closed, "CORE")
+    sandbox_drawdown_pct = _p1_compute_drawdown_pct(_closed, "SANDBOX")
+    sandbox_loss_streak = _p1_sandbox_loss_streak(_closed)
+    tighten_to_v8 = core_drawdown_pct <= -15.0
+    sandbox_sizing_penalty = 0.5 if sandbox_loss_streak >= 3 else 1.0
     entries = read_pnl_log(limit=1000)
     open_positions = {}   # slug -> {side, usdc, price, narrative, ts}
     closed = []
@@ -2428,6 +2514,110 @@ def risk_status():
             "streakOk": streak_ok,
         },
         "canTrade": can_trade,
+        # === v9 P1 book-aware metrics ===
+        "v9": {
+            "core": {
+                "openCount": len(core_open),
+                "maxPositions": APP_CONFIG["core_max_positions"],
+                "exposureUsed": core_exposure,
+                "exposureMax": APP_CONFIG["core_max_exposure"],
+                "bookSize": APP_CONFIG["core_book_size"],
+                "reserve": APP_CONFIG["core_min_reserve"],
+                "drawdownPct": core_drawdown_pct,
+            },
+            "sandbox": {
+                "openCount": len(sandbox_open),
+                "maxPositions": APP_CONFIG["sandbox_max_positions"],
+                "exposureUsed": sandbox_exposure,
+                "exposureMax": APP_CONFIG["sandbox_max_exposure"],
+                "bookSize": APP_CONFIG["sandbox_book_size"],
+                "maxPerTrade": APP_CONFIG["sandbox_max_per_trade"],
+                "drawdownPct": sandbox_drawdown_pct,
+                "lossStreak": sandbox_loss_streak,
+                "sizingPenalty": sandbox_sizing_penalty,
+            },
+            "global": {
+                "exposureUsed": global_exposure,
+                "exposureMax": APP_CONFIG["global_max_exposure"],
+            },
+            "guards": {
+                "tightenToV8": tighten_to_v8,
+                "sandboxSizingPenalty": sandbox_sizing_penalty,
+                "sandboxLossStreakHit": sandbox_loss_streak >= 3,
+                "coreDrawdownHit": tighten_to_v8,
+            },
+        },
+    })
+
+
+@app.route("/positions/open")
+def positions_open():
+    """v9 P1: open pozície z pnl-log + live midprice z Gamma + PnL%.
+
+    Vracia {positions: [{book, slug, question, side, entry, current, pnlPct, daysRemaining, ...}]}
+    """
+    open_positions, _closed = _p1_portfolio_summary()
+    out = []
+    for p in open_positions.values():
+        slug = p.get("slug")
+        side = (p.get("side") or "YES").upper()
+        entry = p.get("price") or 0.0
+        usdc = p.get("usdc") or 0.0
+        current = None
+        days_remaining = None
+        end_date_iso = p.get("endDate")
+        try:
+            r = requests.get(f"{GAMMA_BASE}/markets", params={"slug": slug}, timeout=8)
+            if r.ok:
+                data = r.json()
+                m = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
+                if m:
+                    yes_p, no_p = get_yes_no_prices(m)
+                    if side.startswith("NO"):
+                        current = no_p
+                    else:
+                        current = yes_p
+                    end_date_iso = end_date_iso or m.get("endDate")
+        except Exception:
+            pass
+        if end_date_iso:
+            try:
+                end_dt = parse_date(end_date_iso)
+                if end_dt:
+                    days_remaining = max(0, (end_dt - datetime.now(timezone.utc)).days)
+            except Exception:
+                pass
+        pnl_pct = None
+        if isinstance(current, (int, float)) and entry and entry > 0:
+            pnl_pct = round((current - entry) / entry * 100.0, 2)
+        # TP/stop podla v9 (zjednodusene z entry: TP1 +30%, TP2 +60%, stop -25%)
+        tp1 = round(entry * 1.30, 3) if entry else None
+        tp2 = round(entry * 1.60, 3) if entry else None
+        stop = round(entry * 0.75, 3) if entry else None
+        out.append({
+            "book": p.get("book"),
+            "slug": slug,
+            "question": p.get("question"),
+            "side": side,
+            "entry": entry,
+            "current": current,
+            "usdc": usdc,
+            "pnlPct": pnl_pct,
+            "pnlUsdc": round(usdc * (pnl_pct or 0) / 100.0, 2) if pnl_pct is not None else None,
+            "tp1": tp1,
+            "tp2": tp2,
+            "stop": stop,
+            "daysRemaining": days_remaining,
+            "narrative": p.get("narrative"),
+            "openedAt": p.get("ts"),
+            "polymarketUrl": f"https://polymarket.com/event/{slug}" if slug else None,
+        })
+    # Sort: CORE first, then by pnl desc
+    out.sort(key=lambda x: (0 if x.get("book") == "CORE" else 1, -(x.get("pnlPct") or 0)))
+    return jsonify({
+        "positions": out,
+        "count": len(out),
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
     })
 
 
@@ -3410,6 +3600,29 @@ def dashboard():
     .risk-card.alert {{ background: #fff3f0; border-color: #c5221f; }}
     .risk-card.ok {{ background: #f0f7f0; border-color: #137333; }}
     .risk-card .sub {{ font-size: 11px; color: #666; margin-top: 2px; }}
+    /* === v9 P1 KPI bar === */
+    .kpi-bar {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 14px; }}
+    .kpi-card {{ background: #fff; border: 2px solid #e0e3e7; border-radius: 8px; padding: 10px 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }}
+    .kpi-card .kpi-label {{ font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }}
+    .kpi-card .kpi-value {{ font-size: 22px; font-weight: 700; margin-top: 4px; line-height: 1.1; }}
+    .kpi-card .kpi-sub {{ font-size: 11px; color: #666; margin-top: 3px; }}
+    .kpi-card.kpi-core {{ border-color: #1a4d8c; }}
+    .kpi-card.kpi-sandbox {{ border-color: #8c6a1a; }}
+    .kpi-card.kpi-warn {{ border-color: #e6a700; background: #fff8e1; }}
+    .kpi-card.kpi-alert {{ border-color: #c5221f; background: #fdecea; }}
+    .kpi-card.kpi-ok {{ border-color: #137333; background: #e8f5ec; }}
+    @media (max-width: 980px) {{ .kpi-bar {{ grid-template-columns: repeat(2, 1fr); }} }}
+    /* === v9 P1 position tracker === */
+    .pos-table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    .pos-table th, .pos-table td {{ padding: 7px 8px; border-top: 1px solid #e0e0e0; text-align: left; }}
+    .pos-table thead th {{ background: #f4f6f9; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: #555; }}
+    .pos-pill {{ display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 700; }}
+    .pos-pill.core {{ background: #e3edf8; color: #1a4d8c; }}
+    .pos-pill.sandbox {{ background: #fdf3e0; color: #8c6a1a; }}
+    .pnl-pos {{ color: #137333; font-weight: 600; }}
+    .pnl-neg {{ color: #c5221f; font-weight: 600; }}
+    .guard-banner {{ background: #fdecea; border: 2px solid #c5221f; color: #8b1a17; padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 13px; font-weight: 600; }}
+    .guard-banner.warn {{ background: #fff8e1; border-color: #e6a700; color: #6a4f00; }}
     #riskManagerSection.no-trade {{ background: #fff3f0; border: 2px solid #c5221f; }}
     .metric-pill {{ display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; margin-right: 6px; margin-bottom: 6px; background: #f3f4f6; color: #333; }}
     .delta-up {{ color: #137333; font-weight: 700; }}
@@ -3485,6 +3698,22 @@ def dashboard():
     <div class="header-right">
       <div class="status-card" id="statusLine">Dashboard sa inicializuje...</div>
     </div>
+  </div>
+
+  <div id="kpiBarSection">
+    <div id="guardBanner"></div>
+    <div id="kpiBar" class="kpi-bar">
+      <div class="kpi-card"><div class="kpi-label">CORE</div><div class="kpi-value">–</div><div class="kpi-sub">načítava sa</div></div>
+      <div class="kpi-card"><div class="kpi-label">SANDBOX</div><div class="kpi-value">–</div><div class="kpi-sub">načítava sa</div></div>
+      <div class="kpi-card"><div class="kpi-label">Exposure</div><div class="kpi-value">–</div><div class="kpi-sub">načítava sa</div></div>
+      <div class="kpi-card"><div class="kpi-label">Drawdown</div><div class="kpi-value">–</div><div class="kpi-sub">načítava sa</div></div>
+      <div class="kpi-card"><div class="kpi-label">Loss streak</div><div class="kpi-value">–</div><div class="kpi-sub">načítava sa</div></div>
+    </div>
+  </div>
+
+  <div class="section" id="positionsSection">
+    <h2>Otvorené pozície <span class="small" style="font-weight:400;">— live midprice z Gammy, PnL%, TP/stop</span></h2>
+    <div id="positionsBox">Načítava sa...</div>
   </div>
 
   <div class="section" id="riskManagerSection">
@@ -4632,8 +4861,128 @@ def dashboard():
       }}
     }}
 
+    function kpiSeverityForDrawdown(pct) {{
+      // pct is signed, e.g. -12.5 means -12.5%
+      const ap = Math.abs(pct || 0);
+      if (pct < 0 && ap >= 15) return 'kpi-alert';
+      if (pct < 0 && ap >= 10) return 'kpi-alert';
+      if (pct < 0 && ap >= 5)  return 'kpi-warn';
+      return 'kpi-ok';
+    }}
+    function kpiSeverityForStreak(s) {{
+      if (s >= 3) return 'kpi-alert';
+      if (s >= 2) return 'kpi-warn';
+      if (s >= 1) return 'kpi-warn';
+      return 'kpi-ok';
+    }}
+    function kpiSeverityForPositions(open, max) {{
+      if (open >= max) return 'kpi-alert';
+      if (open >= max - 1) return 'kpi-warn';
+      return '';
+    }}
+    function kpiSeverityForExposure(used, max) {{
+      const r = max > 0 ? used / max : 0;
+      if (r >= 1) return 'kpi-alert';
+      if (r >= 0.8) return 'kpi-warn';
+      return '';
+    }}
+
+    async function loadKpiBar() {{
+      const bar = document.getElementById('kpiBar');
+      const banner = document.getElementById('guardBanner');
+      if (!bar) return;
+      try {{
+        const res = await fetch('/risk-status');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const d = await res.json();
+        const v9 = d.v9 || {{}};
+        const core = v9.core || {{}};
+        const sb = v9.sandbox || {{}};
+        const gl = v9.global || {{}};
+        const guards = v9.guards || {{}};
+
+        const ddCore = core.drawdownPct != null ? Number(core.drawdownPct) : 0;
+        const ddSb = sb.drawdownPct != null ? Number(sb.drawdownPct) : 0;
+        const worstDd = ddCore < ddSb ? ddCore : ddSb;
+        const streak = sb.lossStreak || 0;
+
+        const cards = [];
+        const coreCls = kpiSeverityForPositions(core.openCount || 0, core.maxPositions || 3) || 'kpi-core';
+        cards.push('<div class="kpi-card ' + coreCls + '"><div class="kpi-label">CORE</div><div class="kpi-value">' + (core.openCount||0) + '/' + (core.maxPositions||3) + '</div><div class="kpi-sub">' + (core.exposureUsed||0) + ' / ' + (core.exposureMax||140) + ' USDC</div></div>');
+        const sbCls = kpiSeverityForPositions(sb.openCount || 0, sb.maxPositions || 4) || 'kpi-sandbox';
+        cards.push('<div class="kpi-card ' + sbCls + '"><div class="kpi-label">SANDBOX</div><div class="kpi-value">' + (sb.openCount||0) + '/' + (sb.maxPositions||4) + '</div><div class="kpi-sub">' + (sb.exposureUsed||0) + ' / ' + (sb.exposureMax||60) + ' USDC</div></div>');
+        const expCls = kpiSeverityForExposure(gl.exposureUsed || 0, gl.exposureMax || 200);
+        cards.push('<div class="kpi-card ' + expCls + '"><div class="kpi-label">Global Exposure</div><div class="kpi-value">' + (gl.exposureUsed||0) + ' / ' + (gl.exposureMax||200) + '</div><div class="kpi-sub">USDC nasadené v risku</div></div>');
+        const ddCls = kpiSeverityForDrawdown(worstDd);
+        cards.push('<div class="kpi-card ' + ddCls + '"><div class="kpi-label">Drawdown</div><div class="kpi-value">' + ddCore.toFixed(1) + '%</div><div class="kpi-sub">CORE · SANDBOX ' + ddSb.toFixed(1) + '%</div></div>');
+        const lsCls = kpiSeverityForStreak(streak);
+        cards.push('<div class="kpi-card ' + lsCls + '"><div class="kpi-label">Sandbox loss streak</div><div class="kpi-value">' + streak + '</div><div class="kpi-sub">' + (streak >= 3 ? 'sizing ×0.5' : 'limit 3 = sizing penalty') + '</div></div>');
+        bar.innerHTML = cards.join('');
+
+        // Guard banners
+        let banners = '';
+        if (guards.coreDrawdownHit) {{
+          banners += '<div class="guard-banner">⚠ CORE drawdown ' + ddCore.toFixed(1) + '% — sprísni prahy späť na v8 (Politics ' + 11 + 'pp, Resolution ' + 14 + 'pp), kým sa nevráti disciplina (PDF v9 sekcia 8).</div>';
+        }}
+        if (guards.sandboxLossStreakHit) {{
+          banners += '<div class="guard-banner warn">⚠ Sandbox loss streak ' + streak + ' — zníž sandbox sizing o 50% (max 7 USDC/trade ḿiesto 15) kým príde win (PDF v9 sekcia 8).</div>';
+        }}
+        if (banner) banner.innerHTML = banners;
+      }} catch (err) {{
+        bar.innerHTML = '<div class="small">KPI bar nedostupný: ' + err.message + '</div>';
+      }}
+    }}
+
+    async function loadPositions() {{
+      const box = document.getElementById('positionsBox');
+      if (!box) return;
+      try {{
+        const res = await fetch('/positions/open');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const d = await res.json();
+        const positions = d.positions || [];
+        if (positions.length === 0) {{
+          box.innerHTML = '<div class="small">Žiadne otvorené pozície. Otvor pozicíu cez „Otvoriť trade" — zaloguje sa do pnl-log a bude trackovaná tu.</div>';
+          return;
+        }}
+        let html = '<table class="pos-table">';
+        html += '<thead><tr><th>Book</th><th>Market</th><th>Smer</th><th>Entry</th><th>Current</th><th>PnL%</th><th>PnL USDC</th><th>Stake</th><th>TP1 / TP2 / Stop</th><th>Days</th><th>Link</th></tr></thead><tbody>';
+        positions.forEach(function(p) {{
+          const bookCls = (p.book === 'CORE') ? 'core' : 'sandbox';
+          const pnlPct = p.pnlPct;
+          const pnlCls = (pnlPct == null) ? '' : (pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg');
+          const pnlPctStr = (pnlPct == null) ? '–' : ((pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(1) + '%');
+          const pnlUsdcStr = (p.pnlUsdc == null) ? '–' : ((p.pnlUsdc >= 0 ? '+' : '') + p.pnlUsdc.toFixed(2));
+          const entryStr = p.entry != null ? Number(p.entry).toFixed(3) : '–';
+          const curStr = p.current != null ? Number(p.current).toFixed(3) : '–';
+          const tpStr = (p.tp1 || '?') + ' / ' + (p.tp2 || '?') + ' / ' + (p.stop || '?');
+          const daysStr = p.daysRemaining != null ? (p.daysRemaining + 'd') : '–';
+          const url = p.polymarketUrl || '#';
+          const q = (p.question || p.slug || '').replace(/</g, '&lt;');
+          html += '<tr>';
+          html += '<td><span class="pos-pill ' + bookCls + '">' + (p.book || '?') + '</span></td>';
+          html += '<td style="max-width:300px;">' + q + '</td>';
+          html += '<td>' + (p.side || '?') + '</td>';
+          html += '<td>' + entryStr + '</td>';
+          html += '<td><strong>' + curStr + '</strong></td>';
+          html += '<td class="' + pnlCls + '">' + pnlPctStr + '</td>';
+          html += '<td class="' + pnlCls + '">' + pnlUsdcStr + '</td>';
+          html += '<td>' + (p.usdc || 0) + ' USDC</td>';
+          html += '<td class="small">' + tpStr + '</td>';
+          html += '<td>' + daysStr + '</td>';
+          html += '<td><a href="' + url + '" target="_blank" rel="noopener">link</a></td>';
+          html += '</tr>';
+        }});
+        html += '</tbody></table>';
+        html += '<div class="small" style="margin-top:6px;color:#666;">Generated ' + (d.generatedAt || '').slice(0,19) + 'Z · ' + d.count + ' pozícia/pozície. TP/stop = entry ×1.30 / ×1.60 / ×0.75 (zjednodušený v9 SOP).</div>';
+        box.innerHTML = html;
+      }} catch (err) {{
+        box.innerHTML = '<div class="small">Position tracker nedostupný: ' + err.message + '</div>';
+      }}
+    }}
+
     async function loadAll() {{
-      await Promise.all([loadMarkets(), loadGlobalWhaleFlow(), loadRiskStatus(), loadV9()]);
+      await Promise.all([loadMarkets(), loadGlobalWhaleFlow(), loadRiskStatus(), loadV9(), loadKpiBar(), loadPositions()]);
     }}
 
     document.getElementById('refreshBtn')?.addEventListener('click', loadAll);
