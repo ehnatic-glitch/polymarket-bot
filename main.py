@@ -121,32 +121,65 @@ def read_pnl_log(limit=100):
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 DATA_API_BASE = "https://data-api.polymarket.com"
 
-# === v7.0 SNIPER CONFIG ===
+# === v9.0 SNIPER CONFIG (CORE + SANDBOX) ===
 APP_CONFIG = {
-    "dashboard_title": "Polymarket Sniper v7.0",
+    "dashboard_title": "Polymarket Sniper v9.0",
     "default_min_liquidity": 100000.0,
-    "system_version": "v7.0",
-    # Bankroll a risk limity (v7)
+    "system_version": "v9.0",
+    # Bankroll a risk limity (v9 – PDF sekcia 0+2)
     "bankroll_total": 500.0,
-    "cash_reserve": 150.0,            # 30% nedotknuteľná rezerva
-    "max_total_exposure": 200.0,      # 40% bankrollu
-    "max_narrative_exposure": 100.0,  # 20% na 1 naraťív
-    "max_active_positions": 4,        # 3–4, 4. iba ak prvé 3 small
+    # CORE BOOK (350 USDC)
+    "core_book_size": 350.0,
+    "core_min_reserve": 120.0,            # mimo trhu
+    "core_max_exposure": 140.0,           # max nasadený risk v core
+    "core_max_narrative": 70.0,           # max na 1 naraťív
+    "core_max_positions": 3,
+    # SANDBOX BOOK (150 USDC)
+    "sandbox_book_size": 150.0,
+    "sandbox_max_exposure": 60.0,
+    "sandbox_max_per_trade": 15.0,
+    "sandbox_max_positions": 4,
+    # GLOBAL
+    "global_max_exposure": 200.0,         # nikdy neprekroč kombinovaný risk
     "daily_drawdown_limit_pct": 0.15,
     "loss_streak_pause": 3,
-    # Edge prahy v percentuálnych bodoch (after-cost)
-    # PDF v7 sekcia 10: HARD prah Momentum/Time Decay = 10pp, Resolution = 15pp
-    "edge_pp_momentum_soft": 8.0,        # PDF sekcia 2 mantinel
-    "edge_pp_momentum": 10.0,            # HARD prah pre Momentum (sekcia 10)
-    "edge_pp_time_decay": 10.0,          # HARD prah Time Decay
-    "edge_pp_resolution": 15.0,          # HARD prah Resolution/Dispute
-    "edge_pp_min_after_friction": 4.0,   # spread+fees+sklz nesmú zožrať pod 4pp
-    # Sizing tiery v7 (USDC)
-    "sizing_centovka": (5, 10),
-    "sizing_standard": (10, 18),       # 10-12pp edge
-    "sizing_strong": (20, 35),         # 15+pp edge
-    "sizing_extreme": (50, 60),        # extrémy, max 1 naraťív
-    # Time window v7
+    # Společné (legacy nazvy používané inde v kóde)
+    "cash_reserve": 120.0,                # mapuje na core_min_reserve
+    "max_total_exposure": 200.0,          # = global_max_exposure
+    "max_narrative_exposure": 70.0,       # = core_max_narrative
+    "max_active_positions": 7,            # 3 core + 4 sandbox
+    # Edge prahy v9 (after-cost, percentuálne body) — PDF sekcia 3
+    # CORE: Politics/Macro/TimeDecay/Elections ≥ 8–9 pp; Resolution/Dispute/Oracle ≥ 12 pp
+    # SANDBOX: štandardne ≥ 5–6 pp
+    "edge_pp_core_momentum": 9.0,         # politics/macro/elections HARD
+    "edge_pp_core_momentum_soft": 8.0,    # mantinel pre core
+    "edge_pp_core_time_decay": 9.0,
+    "edge_pp_core_resolution": 12.0,      # resolution/dispute HARD
+    "edge_pp_sandbox": 6.0,               # sandbox HARD prah
+    "edge_pp_sandbox_soft": 5.0,
+    "edge_pp_min_after_friction": 4.0,
+    # Legacy v7 keys (driveší kód sa na ne odvoláva) — mapnuté na v9 core
+    "edge_pp_momentum": 9.0,
+    "edge_pp_momentum_soft": 8.0,
+    "edge_pp_time_decay": 9.0,
+    "edge_pp_resolution": 12.0,
+    # Sizing tiery v9 (USDC) — PDF sekcia 5
+    # CORE
+    "sizing_core_weak":   (10, 15),       # 8–9 pp edge
+    "sizing_core_solid":  (15, 22),       # 10–12 pp
+    "sizing_core_strong": (22, 30),       # >12 pp + blízky katalyzátor
+    "sizing_core_max":    35,             # výnimočný setup
+    # SANDBOX
+    "sizing_sandbox_std":    (5, 8),
+    "sizing_sandbox_strong": (8, 12),
+    "sizing_sandbox_max":    15,
+    # Centovky
+    "sizing_centovka": (3, 7),
+    # Legacy nazvy v7 (zachované pre kompatibilitu starej cesty kódu)
+    "sizing_standard": (10, 18),
+    "sizing_strong":   (20, 30),
+    "sizing_extreme":  (30, 35),
+    # Time window v9
     "preferred_days_min": 2,
     "preferred_days_max": 60,
     "far_expiry_days": 90,
@@ -2714,6 +2747,343 @@ def candidate_score_v7(row):
     return round(score, 2)
 
 
+# === v9.0 BOOK CLASSIFICATION + SIZING ===
+
+def _v9_trade_family(row):
+    """Mapuje detegovaný tradeType + kategóriu na v9 rodinu (PDF sekcia 7)."""
+    tt = (row.get("tradeType") or "").strip()
+    cat = (row.get("category") or "").strip()
+    # Resolution / Dispute / Oracle
+    if tt in ("Resolution", "Trap", "Info-Timing"):
+        return "Dispute"
+    if tt == "Time Decay":
+        return "Time Decay"
+    if tt == "Centovka":
+        return "Centovka"
+    if tt == "Momentum":
+        # politics/elections do Elections, iné do Momentum
+        if cat in ("Politics", "Elections"):
+            return "Elections"
+        if cat == "Macro":
+            return "Macro"
+        return "Momentum"
+    # fallback podľa kategórie
+    if cat in ("Politics", "Elections"):
+        return "Elections"
+    if cat == "Macro":
+        return "Macro"
+    return "Momentum"
+
+
+def _v9_edge_threshold(family, book):
+    cfg = APP_CONFIG
+    if book == "SANDBOX":
+        return cfg["edge_pp_sandbox"]
+    # CORE
+    if family == "Dispute":
+        return cfg["edge_pp_core_resolution"]
+    if family == "Time Decay":
+        return cfg["edge_pp_core_time_decay"]
+    return cfg["edge_pp_core_momentum"]
+
+
+def _v9_classify_book(row):
+    """Vráti (book, reason) pre daný row.
+
+    CORE  : jasné pravidlá + meratený edge >= core prah + naraťív vysvetliteľný
+    SANDBOX: edžo nad sandbox prahom ale pod core prahom, alebo Medium oracle
+    PASS   : edge < sandbox prah, alebo HARD fail iného typu
+    """
+    auto = row.get("autoDraft") or {}
+    if not auto.get("finalDecision", "").startswith("BUY"):
+        return "PASS", "no BUY decision"
+    cv7 = row.get("checklistV7") or {}
+    summary = cv7.get("summary", {}) or {}
+    edge_obj = (cv7.get("hard", {}) or {}).get("edge", {}) or {}
+    after_cost = edge_obj.get("afterCostEdgePp")
+    if not isinstance(after_cost, (int, float)):
+        return "PASS", "no after-cost edge"
+
+    family = _v9_trade_family(row)
+    core_prah = _v9_edge_threshold(family, "CORE")
+    sandbox_prah = _v9_edge_threshold(family, "SANDBOX")
+
+    oracle_grade = (cv7.get("soft", {}).get("oracleTrap", {}) or {}).get("grade", "slabo")
+    days = row.get("daysToEnd") or 0
+
+    # CORE — musí prejísť hardOK + edge nad core prah + oracle silne/stredne
+    if (
+        summary.get("hardAllOk")
+        and after_cost >= core_prah
+        and oracle_grade in ("silne", "stredne")
+        and 2 <= days <= 365
+    ):
+        return "CORE", f"edge {after_cost}pp ≥ core prah {core_prah}pp ({family})"
+
+    # SANDBOX — edge medzi sandbox a core prahom, alebo oracle slabšie
+    if after_cost >= sandbox_prah and 2 <= days <= 365:
+        # vyhod „feeling-only“ — musí byť jasné pravidlo (oracle nie High)
+        if oracle_grade == "slabo" and after_cost < core_prah:
+            return "PASS", f"oracle slabo + edge {after_cost}pp pod core prah"
+        return "SANDBOX", f"edge {after_cost}pp medzi sandbox {sandbox_prah}pp a core {core_prah}pp"
+
+    return "PASS", f"edge {after_cost}pp pod sandbox prah {sandbox_prah}pp"
+
+
+def _v9_sizing(row, book):
+    """Vráti odporučený sizing v USDC podľa v9 PDF sekcia 5."""
+    cfg = APP_CONFIG
+    cv7 = row.get("checklistV7") or {}
+    edge_obj = (cv7.get("hard", {}) or {}).get("edge", {}) or {}
+    after_cost = edge_obj.get("afterCostEdgePp") or 0
+    days = row.get("daysToEnd") or 90
+    family = _v9_trade_family(row)
+    yes_price = row.get("yesPrice") or 0.5
+
+    # Centovka tier (cena <= 0.07)
+    if family == "Centovka" or (isinstance(yes_price, (int, float)) and yes_price <= 0.07):
+        lo, hi = cfg["sizing_centovka"]
+        return int(round((lo + hi) / 2))
+
+    if book == "SANDBOX":
+        if after_cost >= 8:
+            lo, hi = cfg["sizing_sandbox_strong"]
+        else:
+            lo, hi = cfg["sizing_sandbox_std"]
+        size = (lo + hi) / 2
+        return int(min(round(size), cfg["sizing_sandbox_max"]))
+
+    # CORE
+    near_catalyst = isinstance(days, (int, float)) and days <= 14
+    if after_cost > 12 and near_catalyst:
+        lo, hi = cfg["sizing_core_strong"]
+    elif after_cost >= 10:
+        lo, hi = cfg["sizing_core_solid"]
+    else:
+        lo, hi = cfg["sizing_core_weak"]
+    size = (lo + hi) / 2
+    # exceptionálný setup: edge > 14pp + blízky katalyzátor + Dispute family
+    if after_cost > 14 and near_catalyst and family == "Dispute":
+        size = cfg["sizing_core_max"]
+    return int(round(size))
+
+
+def candidate_score_v9(row, book):
+    """V9 scoring: rovnaká ložka ako v7 ale normálne pre obe knihy.
+
+    score = trade_type_bonus + oracle_clarity + catalyst + window_bonus
+            + liq_bonus − friction/2 − spread_penalty + book_bonus
+    """
+    auto = row.get("autoDraft") or {}
+    if not auto.get("finalDecision", "").startswith("BUY"):
+        return -1000
+    cv7 = row.get("checklistV7") or {}
+    summary = cv7.get("summary", {}) or {}
+    score = 0.0
+
+    # Trade type bonus (po v9 — Dispute/Resolution > momentum)
+    family = _v9_trade_family(row)
+    score += {
+        "Dispute": 4.0,
+        "Time Decay": 3.0,
+        "Macro": 3.0,
+        "Elections": 2.5,
+        "Momentum": 2.0,
+        "Centovka": 1.5,
+    }.get(family, 0.5)
+
+    oracle_grade = (cv7.get("soft", {}).get("oracleTrap", {}) or {}).get("grade", "slabo")
+    score += {"silne": 3.0, "stredne": 1.0, "slabo": -2.0}.get(oracle_grade, 0)
+
+    catalyst_grade = (cv7.get("soft", {}).get("catalyst", {}) or {}).get("grade", "slabo")
+    score += {"silne": 3.0, "stredne": 1.0, "slabo": 0.0}.get(catalyst_grade, 0)
+
+    days = row.get("daysToEnd")
+    if isinstance(days, (int, float)):
+        if 2 <= days <= 14:
+            score += 2.5
+        elif 14 < days <= 45:
+            score += 1.5
+        elif 45 < days <= 60:
+            score += 0.5
+
+    edge_obj = (cv7.get("hard", {}) or {}).get("edge", {}) or {}
+    friction_pp = edge_obj.get("frictionPp")
+    if isinstance(friction_pp, (int, float)):
+        score -= friction_pp / 2.0
+    after_cost = edge_obj.get("afterCostEdgePp")
+    if isinstance(after_cost, (int, float)):
+        score += min(after_cost / 4.0, 5.0)  # bonus za čísta hodnotu edge
+
+    liq = float(row.get("liquidityNum") or row.get("liquidity") or 0)
+    if liq >= 500000:
+        score += 1.0
+    elif liq >= 100000:
+        score += 0.5
+
+    ep = row.get("executionPlan") or {}
+    spread = ep.get("spreadPct")
+    if isinstance(spread, (int, float)) and spread > 5.0:
+        score -= 2.0
+
+    if book == "CORE" and not summary.get("hardAllOk"):
+        score -= 5.0
+
+    return round(score, 2)
+
+
+@app.route("/candidates/v9")
+def candidates_v9():
+    """Sniper v9.0 — vracia top kandidátov rozdelených do CORE a SANDBOX kníh.
+
+    Filters:
+      - vyhoď šport
+      - expiry 2–90 dňí (sandbox akceptuje aj kratsie)
+      - spread ≤ 6 pp
+      - likvidita ≥ 50k USDC
+      - BUY decision
+      - Klasifikuje na CORE / SANDBOX / PASS podľa v9 prahov.
+    """
+    try:
+        min_liq = float(request.args.get("min_liquidity", "50000"))
+        limit_core = int(request.args.get("limit_core", "5"))
+        limit_sandbox = int(request.args.get("limit_sandbox", "5"))
+    except Exception:
+        min_liq = 50000.0
+        limit_core = 5
+        limit_sandbox = 5
+
+    cache_key_gamma = ("gamma_markets", False)
+    data = cache_get("gamma", cache_key_gamma)
+    if data is None:
+        try:
+            r = requests.get(
+                f"{GAMMA_BASE}/markets",
+                params={"limit": 500, "active": "true", "closed": "false"},
+                timeout=20,
+            )
+            r.raise_for_status()
+            data = r.json()
+            cache_set("gamma", cache_key_gamma, data, ttl=60)
+        except Exception as exc:
+            return jsonify({"error": f"Gamma fetch failed: {exc}", "core": [], "sandbox": []}), 502
+
+    rows = []
+    for m in (data or []):
+        if m.get("active") is not True or m.get("closed") is True:
+            continue
+        try:
+            row = build_market_row(m, strict_mode=False)
+        except Exception:
+            continue
+        if not row:
+            continue
+        if to_float(row.get("liquidity")) < min_liq:
+            continue
+        if row.get("category") == "Sports":
+            continue
+        days = row.get("daysToEnd")
+        if not isinstance(days, (int, float)) or days < 2 or days > 365:
+            continue
+        ep = row.get("executionPlan") or {}
+        spread = ep.get("spreadPct")
+        if isinstance(spread, (int, float)) and spread > 6.0:
+            continue
+        auto = row.get("autoDraft") or {}
+        if not auto.get("finalDecision", "").startswith("BUY"):
+            continue
+        rows.append(row)
+
+    core_list = []
+    sandbox_list = []
+    for row in rows:
+        book, reason = _v9_classify_book(row)
+        if book == "PASS":
+            continue
+        score = candidate_score_v9(row, book)
+        if score <= 0:
+            continue
+        suggested_size = _v9_sizing(row, book)
+        ep = row.get("executionPlan") or {}
+        cv7 = row.get("checklistV7") or {}
+        edge = (cv7.get("hard", {}) or {}).get("edge", {}) or {}
+        record = {
+            "book": book,
+            "bookReason": reason,
+            "family": _v9_trade_family(row),
+            "candidateScore": score,
+            "slug": row.get("slug"),
+            "question": row.get("question"),
+            "category": row.get("category"),
+            "tradeType": row.get("tradeType"),
+            "finalDecision": (row.get("autoDraft") or {}).get("finalDecision"),
+            "yesPrice": row.get("yesPrice"),
+            "noPrice": row.get("noPrice"),
+            "liquidity": row.get("liquidity"),
+            "volume24hr": row.get("volume24hr"),
+            "daysToEnd": row.get("daysToEnd"),
+            "endDate": row.get("endDate"),
+            "oracleRisk": row.get("oracleRisk"),
+            "executionPlan": {
+                "entrySide": ep.get("entrySide"),
+                "buyLimitPrice": ep.get("buyLimitPrice"),
+                "sellLimitPrice": ep.get("sellLimitPrice"),
+                "bestBid": ep.get("bestBid"),
+                "bestAsk": ep.get("bestAsk"),
+                "spreadPct": ep.get("spreadPct"),
+                "stakeUSDC": suggested_size,           # v9 sizing
+                "stakeUSDC_v7": ep.get("stakeUSDC"),   # zachované pre porovnanie
+                "takeProfit1": ep.get("takeProfit1"),
+                "takeProfit2": ep.get("takeProfit2"),
+            },
+            "hardEdge": {
+                "thresholdPp": edge.get("thresholdPp"),
+                "frictionPp": edge.get("frictionPp"),
+                "afterCostEdgePp": edge.get("afterCostEdgePp"),
+            },
+            "polymarketUrl": f"https://polymarket.com/event/{row.get('slug')}" if row.get("slug") else None,
+        }
+        if book == "CORE":
+            core_list.append((score, record))
+        else:
+            sandbox_list.append((score, record))
+
+    core_list.sort(key=lambda x: -x[0])
+    sandbox_list.sort(key=lambda x: -x[0])
+
+    return jsonify({
+        "systemVersion": APP_CONFIG["system_version"],
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "filters": {
+            "min_liquidity": min_liq,
+            "expiry_days": [2, 365],
+            "max_spread_pp": 6.0,
+            "non_sports_only": True,
+        },
+        "thresholds": {
+            "core_momentum_pp": APP_CONFIG["edge_pp_core_momentum"],
+            "core_resolution_pp": APP_CONFIG["edge_pp_core_resolution"],
+            "sandbox_pp": APP_CONFIG["edge_pp_sandbox"],
+        },
+        "books": {
+            "core": {
+                "size": APP_CONFIG["core_book_size"],
+                "max_exposure": APP_CONFIG["core_max_exposure"],
+                "max_positions": APP_CONFIG["core_max_positions"],
+            },
+            "sandbox": {
+                "size": APP_CONFIG["sandbox_book_size"],
+                "max_exposure": APP_CONFIG["sandbox_max_exposure"],
+                "max_positions": APP_CONFIG["sandbox_max_positions"],
+            },
+        },
+        "core": [r for _, r in core_list[:limit_core]],
+        "sandbox": [r for _, r in sandbox_list[:limit_sandbox]],
+        "totalCore": len(core_list),
+        "totalSandbox": len(sandbox_list),
+    })
+
+
 @app.route("/candidates/non-sports")
 def candidates_non_sports():
     """Sniper v7 non-sports kandidáti, prefiltrovaní podľa užívateľa-defined kriterií.
@@ -3011,14 +3381,24 @@ def dashboard():
   </div>
 
   <div class="section" id="riskManagerSection">
-    <h2>v7 Risk Manager</h2>
+    <h2>v9 Risk Manager <span class="small" style="font-weight:400;">— CORE 350 / SANDBOX 150 / Global cap 200 USDC</span></h2>
     <div id="riskManager" class="risk-grid">Načítava sa risk overview...</div>
   </div>
 
-  <div class="section" id="nonSportsSection">
-    <h2>Top non-sports kandidáti <span class="small" style="font-weight:400;">— Sniper v7.0 edge engine</span></h2>
-    <div class="small" style="margin-bottom:8px;color:#666;">Filter: ne-šport · expiry 2–60d · spread ≤ 6pp · likvidita ≥ 50k · BUY+hardOK. Zoradené podľa resolution + oracle_clarity + catalyst − friction.</div>
-    <div id="nonSportsBox">Načítava sa...</div>
+  <div class="section" id="v9Section">
+    <h2>Sniper v9.0 — CORE + SANDBOX kandidáti</h2>
+    <div class="small" style="margin-bottom:8px;color:#666;">
+      <b>CORE BOOK</b> (350 USDC, prahy: Politics/Macro/Time-Decay ≥ 9pp, Resolution/Dispute ≥ 12pp, oracle silne/stredne) ·
+      <b>SANDBOX BOOK</b> (150 USDC, prah ≥ 6pp, max 15 USDC/trade). Vyhodené: šport, expiry 2–365d, spread ≤ 6pp, likv ≥ 50k.
+    </div>
+    <div style="margin-bottom:14px;">
+      <h3 style="margin:6px 0;color:#1a4d8c;">CORE BOOK <span class="small" style="font-weight:400;">— jasné pravidlá + edge ≥ core prah</span></h3>
+      <div id="v9CoreBox">Načítava sa...</div>
+    </div>
+    <div>
+      <h3 style="margin:6px 0;color:#8c6a1a;">SANDBOX BOOK <span class="small" style="font-weight:400;">— learning, menší sizing, kratsi leash</span></h3>
+      <div id="v9SandboxBox">Načítava sa...</div>
+    </div>
   </div>
 
   <div class="section">
@@ -4081,56 +4461,61 @@ def dashboard():
       }}
     }}
 
-    async function loadNonSports() {{
-      const box = document.getElementById('nonSportsBox');
-      if (!box) return;
+    function v9RenderTable(rows, book) {{
+      if (!rows || rows.length === 0) {{
+        return '<div class="small">Žiadny kandidát pre ' + book + ' BOOK (default = PASS).</div>';
+      }}
+      let html = '<table style="width:100%;border-collapse:collapse;font-size:13px;">';
+      html += '<thead><tr style="background:#f0f0f0;text-align:left;"><th style="padding:6px;">#</th><th style="padding:6px;">Score</th><th style="padding:6px;">Market</th><th style="padding:6px;">Family</th><th style="padding:6px;">Smer</th><th style="padding:6px;">Cena</th><th style="padding:6px;">Edge pp</th><th style="padding:6px;">BUY @</th><th style="padding:6px;">SELL TP1</th><th style="padding:6px;">Stake</th><th style="padding:6px;">Expiry</th><th style="padding:6px;">Kateg.</th><th style="padding:6px;">Link</th></tr></thead><tbody>';
+      rows.forEach(function(t, i) {{
+        const ep = t.executionPlan || {{}};
+        const he = t.hardEdge || {{}};
+        const price = t.yesPrice != null ? Number(t.yesPrice).toFixed(3) : '-';
+        const buyAt = ep.buyLimitPrice != null ? Number(ep.buyLimitPrice).toFixed(3) : '-';
+        const tp1 = ep.takeProfit1 != null ? Number(ep.takeProfit1).toFixed(3) : '-';
+        const stake = ep.stakeUSDC != null ? ep.stakeUSDC : '-';
+        const edge = he.afterCostEdgePp != null ? (Number(he.afterCostEdgePp).toFixed(1) + 'pp') : '-';
+        const days = t.daysToEnd != null ? (Number(t.daysToEnd).toFixed(0) + 'd') : '-';
+        const url = t.polymarketUrl || ('https://polymarket.com/event/' + t.slug);
+        const q = (t.question || t.slug || '').replace(/</g,'&lt;');
+        html += '<tr style="border-top:1px solid #e0e0e0;">';
+        html += '<td style="padding:6px;">' + (i+1) + '</td>';
+        html += '<td style="padding:6px;font-weight:600;">' + t.candidateScore + '</td>';
+        html += '<td style="padding:6px;max-width:340px;">' + q + '</td>';
+        html += '<td style="padding:6px;">' + (t.family || '-') + '</td>';
+        html += '<td style="padding:6px;">' + (t.finalDecision || '-') + '</td>';
+        html += '<td style="padding:6px;">' + price + '</td>';
+        html += '<td style="padding:6px;">' + edge + '</td>';
+        html += '<td style="padding:6px;">' + buyAt + '</td>';
+        html += '<td style="padding:6px;">' + tp1 + '</td>';
+        html += '<td style="padding:6px;">' + stake + ' USDC</td>';
+        html += '<td style="padding:6px;">' + days + '</td>';
+        html += '<td style="padding:6px;">' + (t.category || '-') + '</td>';
+        html += '<td style="padding:6px;"><a href="' + url + '" target="_blank" rel="noopener">otvoriť</a></td>';
+        html += '</tr>';
+      }});
+      html += '</tbody></table>';
+      return html;
+    }}
+
+    async function loadV9() {{
+      const coreBox = document.getElementById('v9CoreBox');
+      const sbBox = document.getElementById('v9SandboxBox');
+      if (!coreBox || !sbBox) return;
       try {{
-        const res = await fetch('/candidates/non-sports?limit=5');
+        const res = await fetch('/candidates/v9?limit_core=5&limit_sandbox=5');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const d = await res.json();
-        if (!d.top || d.top.length === 0) {{
-          box.innerHTML = '<div class="small">Žiadny non-sports kandidát nespĺňa v7.0 kvalifikácie (BUY + hardOK + spread ≤ 6pp + expiry 2–60d).</div>';
-          return;
-        }}
-        let html = '<table style="width:100%;border-collapse:collapse;font-size:13px;">';
-        html += '<thead><tr style="background:#f0f0f0;text-align:left;"><th style="padding:6px;">#</th><th style="padding:6px;">Score</th><th style="padding:6px;">Market</th><th style="padding:6px;">Typ</th><th style="padding:6px;">Smer</th><th style="padding:6px;">Cena</th><th style="padding:6px;">Edge pp</th><th style="padding:6px;">BUY @</th><th style="padding:6px;">SELL TP1</th><th style="padding:6px;">Stake</th><th style="padding:6px;">Expiry</th><th style="padding:6px;">Kateg.</th><th style="padding:6px;">Link</th></tr></thead><tbody>';
-        d.top.forEach(function(t, i) {{
-          const ep = t.executionPlan || {{}};
-          const he = t.hardEdge || {{}};
-          const price = t.yesPrice != null ? Number(t.yesPrice).toFixed(3) : '-';
-          const buyAt = ep.buyLimitPrice != null ? Number(ep.buyLimitPrice).toFixed(3) : '-';
-          const tp1 = ep.takeProfit1 != null ? Number(ep.takeProfit1).toFixed(3) : '-';
-          const stake = ep.stakeUSDC != null ? ep.stakeUSDC : '-';
-          const edge = he.afterCostEdgePp != null ? (Number(he.afterCostEdgePp).toFixed(1) + 'pp') : '-';
-          const days = t.daysToEnd != null ? (Number(t.daysToEnd).toFixed(0) + 'd') : '-';
-          const url = t.polymarketUrl || ('https://polymarket.com/event/' + t.slug);
-          const q = (t.question || t.slug || '').replace(/</g,'&lt;');
-          html += '<tr style="border-top:1px solid #e0e0e0;">';
-          html += '<td style="padding:6px;">' + (i+1) + '</td>';
-          html += '<td style="padding:6px;font-weight:600;">' + t.candidateScore + '</td>';
-          html += '<td style="padding:6px;max-width:340px;">' + q + '</td>';
-          html += '<td style="padding:6px;">' + (t.tradeType || '-') + '</td>';
-          html += '<td style="padding:6px;">' + (t.finalDecision || '-') + '</td>';
-          html += '<td style="padding:6px;">' + price + '</td>';
-          html += '<td style="padding:6px;">' + edge + '</td>';
-          html += '<td style="padding:6px;">' + buyAt + '</td>';
-          html += '<td style="padding:6px;">' + tp1 + '</td>';
-          html += '<td style="padding:6px;">' + stake + ' USDC</td>';
-          html += '<td style="padding:6px;">' + days + '</td>';
-          html += '<td style="padding:6px;">' + (t.category || '-') + '</td>';
-          html += '<td style="padding:6px;"><a href="' + url + '" target="_blank" rel="noopener">otvoriť</a></td>';
-          html += '</tr>';
-        }});
-        html += '</tbody></table>';
-        html += '<div class="small" style="margin-top:6px;color:#666;">Kvalifikovaní: ' + d.totalQualified + ' · generated: ' + (d.generatedAt || '').slice(0,19) + 'Z</div>';
-        box.innerHTML = html;
+        coreBox.innerHTML = v9RenderTable(d.core || [], 'CORE') + '<div class="small" style="margin-top:6px;color:#666;">Total CORE: ' + (d.totalCore||0) + ' · prah ≥ ' + (d.thresholds||{{}}).core_momentum_pp + 'pp / Dispute ≥ ' + (d.thresholds||{{}}).core_resolution_pp + 'pp</div>';
+        sbBox.innerHTML = v9RenderTable(d.sandbox || [], 'SANDBOX') + '<div class="small" style="margin-top:6px;color:#666;">Total SANDBOX: ' + (d.totalSandbox||0) + ' · prah ≥ ' + (d.thresholds||{{}}).sandbox_pp + 'pp · max 15 USDC/trade · generated ' + (d.generatedAt || '').slice(0,19) + 'Z</div>';
       }} catch (err) {{
-        box.innerHTML = '<div class="small">Nepodarilo sa načítať non-sports kandidátov: ' + err.message + '</div>';
+        coreBox.innerHTML = '<div class="small">Nepodarilo sa načítať v9 kandidátov: ' + err.message + '</div>';
+        sbBox.innerHTML = '';
       }}
     }}
 
     async function loadAll() {{
-      await Promise.all([loadMarkets(), loadGlobalWhaleFlow(), loadRiskStatus(), loadNonSports()]);
+      await Promise.all([loadMarkets(), loadGlobalWhaleFlow(), loadRiskStatus(), loadV9()]);
     }}
 
     document.getElementById('refreshBtn')?.addEventListener('click', loadAll);
