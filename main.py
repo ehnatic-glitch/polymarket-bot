@@ -5377,10 +5377,22 @@ def dashboard():
           html += '<div class="cal-day ' + dayCls + '">' + (typeof days === 'number' ? ('+' + days + 'd') : '?') + '<div class="small" style="font-weight:400;color:#888;">' + dateStr + '</div></div>';
           html += '<div class="cal-impact ' + impact + '">' + impact + '</div>';
           html += '<div>' + lbl + slug + usdc + book + '</div>';
-          html += '<div class="cal-source">' + (c.source || '') + (c.source === 'manual' ? ' <a href="javascript:void(0)" onclick="deleteCatalyst(\'' + (c.label || '').replace(/\x27/g,"\\\x27") + '\',\'' + (c.date || '') + '\')">✕</a>' : '') + '</div>';
+          html += '<div class="cal-source">' + (c.source || '');
+          if (c.source === 'manual') {{
+            html += ' <a href="javascript:void(0)" data-cal-label="' + encodeURIComponent(c.label || '') + '" data-cal-date="' + encodeURIComponent(c.date || '') + '" class="cal-del">✕</a>';
+          }}
+          html += '</div>';
           html += '</div>';
         }});
         box.innerHTML = html;
+        // Re-bind delete links
+        box.querySelectorAll('.cal-del').forEach(function(a) {{
+          a.addEventListener('click', function() {{
+            const lbl = decodeURIComponent(a.getAttribute('data-cal-label') || '');
+            const dt = decodeURIComponent(a.getAttribute('data-cal-date') || '');
+            deleteCatalyst(lbl, dt);
+          }});
+        }});
       }} catch (err) {{
         box.innerHTML = '<div class="small">Catalyst kalendár nedostupný: ' + err.message + '</div>';
       }}
