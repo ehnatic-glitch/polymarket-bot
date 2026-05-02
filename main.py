@@ -2749,6 +2749,66 @@ def candidate_score_v7(row):
 
 # === v9.0 BOOK CLASSIFICATION + SIZING ===
 
+def _v9_effective_entry(row):
+    """PDF v9 sekcia 3: implied probability z relevantnej strany orderbooku, nie z midu.
+
+    BUY YES: ber bestAsk (taker)
+    BUY NO:  ber 1 − bestBid
+    Vráti dict: { side, mid, effective, slippage_pp, patient_limit }
+      - effective: reálna cena na vstup taker
+      - patient_limit: bid + 1 tick (sit on stack), optímistická cena
+      - slippage_pp: mid → effective v pp (penalizuje midprice edge)
+    """
+    auto = row.get("autoDraft") or {}
+    side = (auto.get("finalDecision") or "").replace("BUY ", "").strip() or "YES"
+    yes_price = row.get("yesPrice")
+    no_price = row.get("noPrice")
+    ep = row.get("executionPlan") or {}
+    best_bid = ep.get("bestBid")  # YES bid
+    best_ask = ep.get("bestAsk")  # YES ask
+    tick = 0.001
+
+    if side == "YES":
+        mid = yes_price
+        effective = best_ask if isinstance(best_ask, (int, float)) else mid
+        patient_limit = (best_bid + tick) if isinstance(best_bid, (int, float)) else mid
+    else:  # NO
+        mid = no_price
+        # NO ask = 1 − yesBid; NO bid = 1 − yesAsk
+        no_ask = (1 - best_bid) if isinstance(best_bid, (int, float)) else None
+        no_bid = (1 - best_ask) if isinstance(best_ask, (int, float)) else None
+        effective = no_ask if isinstance(no_ask, (int, float)) else mid
+        patient_limit = (no_bid + tick) if isinstance(no_bid, (int, float)) else mid
+
+    if not isinstance(effective, (int, float)) or not isinstance(mid, (int, float)):
+        return {"side": side, "mid": mid, "effective": mid, "slippage_pp": 0.0, "patient_limit": mid}
+
+    slippage_pp = round(max(0.0, (effective - mid) * 100.0), 2)
+    return {
+        "side": side,
+        "mid": round(mid, 4),
+        "effective": round(effective, 4),
+        "slippage_pp": slippage_pp,
+        "patient_limit": round(patient_limit, 4) if isinstance(patient_limit, (int, float)) else None,
+    }
+
+
+def _v9_effective_after_cost_edge(row, entry):
+    """Vráti edge pp po prehľadení mid→effective (PDF v9 sekcia 3).
+
+    quoted_edge je odhadnutý v build_market_row z midprice. V9 chce edge
+    z perspektívy taker-vstupu, takže odčítame slippage_pp.
+    """
+    cv7 = row.get("checklistV7") or {}
+    edge_obj = (cv7.get("hard", {}) or {}).get("edge", {}) or {}
+    after_cost_mid = edge_obj.get("afterCostEdgePp")
+    if not isinstance(after_cost_mid, (int, float)):
+        return None, None
+    slippage = entry.get("slippage_pp") or 0.0
+    effective = round(after_cost_mid - slippage, 2)
+    return after_cost_mid, effective
+
+
 def _v9_trade_family(row):
     """Mapuje detegovaný tradeType + kategóriu na v9 rodinu (PDF sekcia 7)."""
     tt = (row.get("tradeType") or "").strip()
@@ -2787,12 +2847,10 @@ def _v9_edge_threshold(family, book):
     return cfg["edge_pp_core_momentum"]
 
 
-def _v9_classify_book(row):
+def _v9_classify_book(row, effective_edge=None):
     """Vráti (book, reason) pre daný row.
 
-    CORE  : jasné pravidlá + meratený edge >= core prah + naraťív vysvetliteľný
-    SANDBOX: edžo nad sandbox prahom ale pod core prahom, alebo Medium oracle
-    PASS   : edge < sandbox prah, alebo HARD fail iného typu
+    Používa EFFECTIVE edge (z taker strany orderbooku) podľa v9 sekcia 3.
     """
     auto = row.get("autoDraft") or {}
     if not auto.get("finalDecision", "").startswith("BUY"):
@@ -2800,8 +2858,9 @@ def _v9_classify_book(row):
     cv7 = row.get("checklistV7") or {}
     summary = cv7.get("summary", {}) or {}
     edge_obj = (cv7.get("hard", {}) or {}).get("edge", {}) or {}
-    after_cost = edge_obj.get("afterCostEdgePp")
-    if not isinstance(after_cost, (int, float)):
+    if effective_edge is None:
+        effective_edge = edge_obj.get("afterCostEdgePp")
+    if not isinstance(effective_edge, (int, float)):
         return "PASS", "no after-cost edge"
 
     family = _v9_trade_family(row)
@@ -2811,23 +2870,40 @@ def _v9_classify_book(row):
     oracle_grade = (cv7.get("soft", {}).get("oracleTrap", {}) or {}).get("grade", "slabo")
     days = row.get("daysToEnd") or 0
 
-    # CORE — musí prejísť hardOK + edge nad core prah + oracle silne/stredne
+    # CORE — musí prejísť hardOK + EFFECTIVE edge nad core prah + oracle silne/stredne
     if (
         summary.get("hardAllOk")
-        and after_cost >= core_prah
+        and effective_edge >= core_prah
         and oracle_grade in ("silne", "stredne")
         and 2 <= days <= 365
     ):
-        return "CORE", f"edge {after_cost}pp ≥ core prah {core_prah}pp ({family})"
+        return "CORE", f"effective edge {effective_edge}pp ≥ core prah {core_prah}pp ({family})"
 
     # SANDBOX — edge medzi sandbox a core prahom, alebo oracle slabšie
-    if after_cost >= sandbox_prah and 2 <= days <= 365:
-        # vyhod „feeling-only“ — musí byť jasné pravidlo (oracle nie High)
-        if oracle_grade == "slabo" and after_cost < core_prah:
-            return "PASS", f"oracle slabo + edge {after_cost}pp pod core prah"
-        return "SANDBOX", f"edge {after_cost}pp medzi sandbox {sandbox_prah}pp a core {core_prah}pp"
+    if effective_edge >= sandbox_prah and 2 <= days <= 365:
+        if oracle_grade == "slabo" and effective_edge < core_prah:
+            return "PASS", f"oracle slabo + effective edge {effective_edge}pp pod core prah"
+        return "SANDBOX", f"effective edge {effective_edge}pp medzi sandbox {sandbox_prah}pp a core {core_prah}pp"
 
-    return "PASS", f"edge {after_cost}pp pod sandbox prah {sandbox_prah}pp"
+    return "PASS", f"effective edge {effective_edge}pp pod sandbox prah {sandbox_prah}pp"
+
+
+def _v9_patient_book(row, patient_edge):
+    """Vráti book ak by sa fillo na patient_limit (lepšia cena než taker).
+
+    Používame na označenie kandidátov ako WAIT („zadaj limit a počkaj“) keď effective
+    je pod core prahom ale patient by ho dosiahol.
+    """
+    if not isinstance(patient_edge, (int, float)):
+        return None
+    family = _v9_trade_family(row)
+    core_prah = _v9_edge_threshold(family, "CORE")
+    sandbox_prah = _v9_edge_threshold(family, "SANDBOX")
+    if patient_edge >= core_prah:
+        return "CORE"
+    if patient_edge >= sandbox_prah:
+        return "SANDBOX"
+    return None
 
 
 def _v9_sizing(row, book):
@@ -2996,19 +3072,38 @@ def candidates_v9():
 
     core_list = []
     sandbox_list = []
+    wait_list = []
     for row in rows:
-        book, reason = _v9_classify_book(row)
-        if book == "PASS":
+        # v9 sekcia 3: použi taker stranu orderbooku, nie mid
+        entry = _v9_effective_entry(row)
+        mid_edge, eff_edge = _v9_effective_after_cost_edge(row, entry)
+        # patient limit — ak sit on bid stack
+        patient_slippage = 0.0
+        if isinstance(entry.get("patient_limit"), (int, float)) and isinstance(entry.get("mid"), (int, float)):
+            patient_slippage = max(0.0, (entry["patient_limit"] - entry["mid"]) * 100.0)
+        patient_edge = round((mid_edge or 0) - patient_slippage, 2) if isinstance(mid_edge, (int, float)) else None
+
+        book, reason = _v9_classify_book(row, effective_edge=eff_edge)
+        patient_book = _v9_patient_book(row, patient_edge) if book == "PASS" else None
+
+        if book == "PASS" and not patient_book:
             continue
-        score = candidate_score_v9(row, book)
-        if score <= 0:
+
+        # ak prechádza len na patient_limit — do WAIT zoznamu
+        if book == "PASS" and patient_book:
+            score_book = patient_book
+        else:
+            score_book = book
+
+        score = candidate_score_v9(row, score_book)
+        if score <= 0 and book != "PASS":
             continue
-        suggested_size = _v9_sizing(row, book)
+        suggested_size = _v9_sizing(row, score_book)
         ep = row.get("executionPlan") or {}
         cv7 = row.get("checklistV7") or {}
-        edge = (cv7.get("hard", {}) or {}).get("edge", {}) or {}
+        edge_obj = (cv7.get("hard", {}) or {}).get("edge", {}) or {}
         record = {
-            "book": book,
+            "book": book if book != "PASS" else f"WAIT → {patient_book}",
             "bookReason": reason,
             "family": _v9_trade_family(row),
             "candidateScore": score,
@@ -3025,31 +3120,41 @@ def candidates_v9():
             "endDate": row.get("endDate"),
             "oracleRisk": row.get("oracleRisk"),
             "executionPlan": {
-                "entrySide": ep.get("entrySide"),
-                "buyLimitPrice": ep.get("buyLimitPrice"),
+                "entrySide": ep.get("entrySide") or entry["side"],
+                # v9: takerPrice = reálne stlačnú cenu, patientLimit = sit on stack
+                "effectivePrice": entry["effective"],
+                "patientLimitPrice": entry["patient_limit"],
+                "midPrice": entry["mid"],
+                "slippagePp": entry["slippage_pp"],
+                "buyLimitPrice": entry["patient_limit"],   # default odporúčame patient
                 "sellLimitPrice": ep.get("sellLimitPrice"),
                 "bestBid": ep.get("bestBid"),
                 "bestAsk": ep.get("bestAsk"),
                 "spreadPct": ep.get("spreadPct"),
-                "stakeUSDC": suggested_size,           # v9 sizing
-                "stakeUSDC_v7": ep.get("stakeUSDC"),   # zachované pre porovnanie
+                "stakeUSDC": suggested_size,
+                "stakeUSDC_v7": ep.get("stakeUSDC"),
                 "takeProfit1": ep.get("takeProfit1"),
                 "takeProfit2": ep.get("takeProfit2"),
             },
             "hardEdge": {
-                "thresholdPp": edge.get("thresholdPp"),
-                "frictionPp": edge.get("frictionPp"),
-                "afterCostEdgePp": edge.get("afterCostEdgePp"),
+                "thresholdPp": edge_obj.get("thresholdPp"),
+                "frictionPp": edge_obj.get("frictionPp"),
+                "afterCostEdgePp": edge_obj.get("afterCostEdgePp"),  # mid-based (legacy)
+                "effectiveEdgePp": eff_edge,                          # v9 taker
+                "patientEdgePp": patient_edge,                        # v9 limit
             },
             "polymarketUrl": f"https://polymarket.com/event/{row.get('slug')}" if row.get("slug") else None,
         }
         if book == "CORE":
             core_list.append((score, record))
-        else:
+        elif book == "SANDBOX":
             sandbox_list.append((score, record))
+        else:
+            wait_list.append((score, record))
 
     core_list.sort(key=lambda x: -x[0])
     sandbox_list.sort(key=lambda x: -x[0])
+    wait_list.sort(key=lambda x: -x[0])
 
     return jsonify({
         "systemVersion": APP_CONFIG["system_version"],
@@ -3079,8 +3184,10 @@ def candidates_v9():
         },
         "core": [r for _, r in core_list[:limit_core]],
         "sandbox": [r for _, r in sandbox_list[:limit_sandbox]],
+        "wait": [r for _, r in wait_list[:limit_sandbox]],
         "totalCore": len(core_list),
         "totalSandbox": len(sandbox_list),
+        "totalWait": len(wait_list),
     })
 
 
@@ -3395,9 +3502,13 @@ def dashboard():
       <h3 style="margin:6px 0;color:#1a4d8c;">CORE BOOK <span class="small" style="font-weight:400;">— jasné pravidlá + edge ≥ core prah</span></h3>
       <div id="v9CoreBox">Načítava sa...</div>
     </div>
-    <div>
+    <div style="margin-bottom:14px;">
       <h3 style="margin:6px 0;color:#8c6a1a;">SANDBOX BOOK <span class="small" style="font-weight:400;">— learning, menší sizing, kratsi leash</span></h3>
       <div id="v9SandboxBox">Načítava sa...</div>
+    </div>
+    <div>
+      <h3 style="margin:6px 0;color:#666;">WAIT — zadaj limit a počkaj <span class="small" style="font-weight:400;">— taker cena nestačí, ale na bid stacku by edge prehnal prah</span></h3>
+      <div id="v9WaitBox">Načítava sa...</div>
     </div>
   </div>
 
@@ -4465,33 +4576,36 @@ def dashboard():
       if (!rows || rows.length === 0) {{
         return '<div class="small">Žiadny kandidát pre ' + book + ' BOOK (default = PASS).</div>';
       }}
-      let html = '<table style="width:100%;border-collapse:collapse;font-size:13px;">';
-      html += '<thead><tr style="background:#f0f0f0;text-align:left;"><th style="padding:6px;">#</th><th style="padding:6px;">Score</th><th style="padding:6px;">Market</th><th style="padding:6px;">Family</th><th style="padding:6px;">Smer</th><th style="padding:6px;">Cena</th><th style="padding:6px;">Edge pp</th><th style="padding:6px;">BUY @</th><th style="padding:6px;">SELL TP1</th><th style="padding:6px;">Stake</th><th style="padding:6px;">Expiry</th><th style="padding:6px;">Kateg.</th><th style="padding:6px;">Link</th></tr></thead><tbody>';
+      let html = '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+      html += '<thead><tr style="background:#f0f0f0;text-align:left;"><th style="padding:5px;">#</th><th style="padding:5px;">Score</th><th style="padding:5px;">Market</th><th style="padding:5px;">Family</th><th style="padding:5px;">Smer</th><th style="padding:5px;">Mid</th><th style="padding:5px;">Taker</th><th style="padding:5px;">Eff. Edge</th><th style="padding:5px;">Patient Edge</th><th style="padding:5px;">BUY limit</th><th style="padding:5px;">TP1</th><th style="padding:5px;">Stake</th><th style="padding:5px;">Expiry</th><th style="padding:5px;">Link</th></tr></thead><tbody>';
       rows.forEach(function(t, i) {{
         const ep = t.executionPlan || {{}};
         const he = t.hardEdge || {{}};
-        const price = t.yesPrice != null ? Number(t.yesPrice).toFixed(3) : '-';
+        const mid = ep.midPrice != null ? Number(ep.midPrice).toFixed(3) : '-';
+        const taker = ep.effectivePrice != null ? Number(ep.effectivePrice).toFixed(3) : '-';
         const buyAt = ep.buyLimitPrice != null ? Number(ep.buyLimitPrice).toFixed(3) : '-';
         const tp1 = ep.takeProfit1 != null ? Number(ep.takeProfit1).toFixed(3) : '-';
         const stake = ep.stakeUSDC != null ? ep.stakeUSDC : '-';
-        const edge = he.afterCostEdgePp != null ? (Number(he.afterCostEdgePp).toFixed(1) + 'pp') : '-';
+        const effEdge = he.effectiveEdgePp != null ? (Number(he.effectiveEdgePp).toFixed(1) + 'pp') : '-';
+        const patEdge = he.patientEdgePp != null ? (Number(he.patientEdgePp).toFixed(1) + 'pp') : '-';
         const days = t.daysToEnd != null ? (Number(t.daysToEnd).toFixed(0) + 'd') : '-';
         const url = t.polymarketUrl || ('https://polymarket.com/event/' + t.slug);
         const q = (t.question || t.slug || '').replace(/</g,'&lt;');
         html += '<tr style="border-top:1px solid #e0e0e0;">';
-        html += '<td style="padding:6px;">' + (i+1) + '</td>';
-        html += '<td style="padding:6px;font-weight:600;">' + t.candidateScore + '</td>';
-        html += '<td style="padding:6px;max-width:340px;">' + q + '</td>';
-        html += '<td style="padding:6px;">' + (t.family || '-') + '</td>';
-        html += '<td style="padding:6px;">' + (t.finalDecision || '-') + '</td>';
-        html += '<td style="padding:6px;">' + price + '</td>';
-        html += '<td style="padding:6px;">' + edge + '</td>';
-        html += '<td style="padding:6px;">' + buyAt + '</td>';
-        html += '<td style="padding:6px;">' + tp1 + '</td>';
-        html += '<td style="padding:6px;">' + stake + ' USDC</td>';
-        html += '<td style="padding:6px;">' + days + '</td>';
-        html += '<td style="padding:6px;">' + (t.category || '-') + '</td>';
-        html += '<td style="padding:6px;"><a href="' + url + '" target="_blank" rel="noopener">otvoriť</a></td>';
+        html += '<td style="padding:5px;">' + (i+1) + '</td>';
+        html += '<td style="padding:5px;font-weight:600;">' + t.candidateScore + '</td>';
+        html += '<td style="padding:5px;max-width:300px;">' + q + '</td>';
+        html += '<td style="padding:5px;">' + (t.family || '-') + '</td>';
+        html += '<td style="padding:5px;">' + (t.finalDecision || '-') + '</td>';
+        html += '<td style="padding:5px;color:#888;">' + mid + '</td>';
+        html += '<td style="padding:5px;font-weight:600;">' + taker + '</td>';
+        html += '<td style="padding:5px;">' + effEdge + '</td>';
+        html += '<td style="padding:5px;color:#1a4d8c;">' + patEdge + '</td>';
+        html += '<td style="padding:5px;font-weight:600;color:#0a6;">' + buyAt + '</td>';
+        html += '<td style="padding:5px;">' + tp1 + '</td>';
+        html += '<td style="padding:5px;">' + stake + ' USDC</td>';
+        html += '<td style="padding:5px;">' + days + '</td>';
+        html += '<td style="padding:5px;"><a href="' + url + '" target="_blank" rel="noopener">link</a></td>';
         html += '</tr>';
       }});
       html += '</tbody></table>';
@@ -4507,7 +4621,11 @@ def dashboard():
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const d = await res.json();
         coreBox.innerHTML = v9RenderTable(d.core || [], 'CORE') + '<div class="small" style="margin-top:6px;color:#666;">Total CORE: ' + (d.totalCore||0) + ' · prah ≥ ' + (d.thresholds||{{}}).core_momentum_pp + 'pp / Dispute ≥ ' + (d.thresholds||{{}}).core_resolution_pp + 'pp</div>';
-        sbBox.innerHTML = v9RenderTable(d.sandbox || [], 'SANDBOX') + '<div class="small" style="margin-top:6px;color:#666;">Total SANDBOX: ' + (d.totalSandbox||0) + ' · prah ≥ ' + (d.thresholds||{{}}).sandbox_pp + 'pp · max 15 USDC/trade · generated ' + (d.generatedAt || '').slice(0,19) + 'Z</div>';
+        sbBox.innerHTML = v9RenderTable(d.sandbox || [], 'SANDBOX') + '<div class="small" style="margin-top:6px;color:#666;">Total SANDBOX: ' + (d.totalSandbox||0) + ' · prah ≥ ' + (d.thresholds||{{}}).sandbox_pp + 'pp · max 15 USDC/trade</div>';
+        const waitBox = document.getElementById('v9WaitBox');
+        if (waitBox) {{
+          waitBox.innerHTML = v9RenderTable(d.wait || [], 'WAIT') + '<div class="small" style="margin-top:6px;color:#666;">Total WAIT: ' + (d.totalWait||0) + ' · zadaj limit @ „BUY limit“ a počkaj na fill · generated ' + (d.generatedAt || '').slice(0,19) + 'Z</div>';
+        }}
       }} catch (err) {{
         coreBox.innerHTML = '<div class="small">Nepodarilo sa načítať v9 kandidátov: ' + err.message + '</div>';
         sbBox.innerHTML = '';
