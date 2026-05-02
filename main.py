@@ -4006,10 +4006,7 @@ def dashboard():
     </div>
   </div>
 
-  <div class="section" id="riskManagerSection">
-    <h2>v9 Risk Manager <span class="small" style="font-weight:400;">— CORE 350 / SANDBOX 150 / Global cap 200 USDC</span></h2>
-    <div id="riskManager" class="risk-grid">Načítava sa risk overview...</div>
-  </div>
+
 
   <div class="section" id="v9Section">
     <h2>Sniper v9.0 — CORE + SANDBOX kandidáti</h2>
@@ -5455,7 +5452,7 @@ def dashboard():
     }}
 
     async function loadAll() {{
-      await Promise.all([loadMarkets(), loadGlobalWhaleFlow(), loadRiskStatus(), loadV9(), loadKpiBar(), loadPositions(), loadCatalystCalendar(), loadNarrativeMap()]);
+      await Promise.all([loadMarkets(), loadGlobalWhaleFlow(), loadV9(), loadKpiBar(), loadPositions(), loadCatalystCalendar(), loadNarrativeMap()]);
     }}
 
     document.getElementById('refreshBtn')?.addEventListener('click', loadAll);
