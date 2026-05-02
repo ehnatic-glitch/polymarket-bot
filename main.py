@@ -3620,144 +3620,6 @@ def candidates_v9():
     })
 
 
-@app.route("/candidates/non-sports")
-def candidates_non_sports():
-    """Sniper v7 non-sports kandidáti, prefiltrovaní podľa užívateľa-defined kriterií.
-
-    Filters:
-      — ne-sport kategória (Sports = vyhodené)
-      — expiry 2–60 dňí
-      — spread ≤ 6pp
-      — likvidita ≥ 50k USDC
-      — BUY YES/NO decision + hardAllOk
-
-    Vráti top 5 zoradených podľa candidate_score_v7.
-    """
-    try:
-        # Relaxed liquidity to catch resolution markets
-        min_liq = float(request.args.get("min_liquidity", "50000"))
-        limit = int(request.args.get("limit", "5"))
-    except Exception:
-        min_liq = 50000.0
-        limit = 5
-
-    # Fetch markets via Gamma API (same pattern ako /markets endpoint)
-    cache_key_gamma = ("gamma_markets", False)
-    data = cache_get("gamma", cache_key_gamma)
-    if data is None:
-        try:
-            r = requests.get(
-                f"{GAMMA_BASE}/markets",
-                params={"limit": 400, "active": "true", "closed": "false"},
-                timeout=20,
-            )
-            r.raise_for_status()
-            data = r.json()
-            cache_set("gamma", cache_key_gamma, data, ttl=60)
-        except Exception as exc:
-            return jsonify({"error": f"Gamma fetch failed: {exc}", "top": []}), 502
-
-    rows = []
-    for m in (data or []):
-        if m.get("active") is not True or m.get("closed") is True:
-            continue
-        try:
-            row = build_market_row(m, strict_mode=False)
-        except Exception:
-            continue
-        if not row:
-            continue
-        if to_float(row.get("liquidity")) < min_liq:
-            continue
-        rows.append(row)
-
-    qualified = []
-    for row in rows:
-        # 1) Vyhoď šport
-        if row.get("category") == "Sports":
-            continue
-
-        # 2) Expiry 2–60 dňí
-        days = row.get("daysToEnd")
-        if not isinstance(days, (int, float)) or days < 2 or days > 60:
-            continue
-
-        # 3) Spread ≤ 6pp
-        ep = row.get("executionPlan") or {}
-        spread = ep.get("spreadPct")
-        if isinstance(spread, (int, float)) and spread > 6.0:
-            continue
-
-        # 4) BUY decision + hardOK
-        auto = row.get("autoDraft") or {}
-        if not auto.get("finalDecision", "").startswith("BUY"):
-            continue
-        cv7 = row.get("checklistV7") or {}
-        if not (cv7.get("summary") or {}).get("hardAllOk", False):
-            continue
-
-        score = candidate_score_v7(row)
-        if score <= 0:
-            continue
-
-        qualified.append((score, row))
-
-    qualified.sort(key=lambda x: -x[0])
-    top = qualified[:limit]
-
-    out = []
-    for score, row in top:
-        ep = row.get("executionPlan") or {}
-        cv7 = row.get("checklistV7") or {}
-        edge = cv7.get("hard", {}).get("edge", {})
-        out.append({
-            "candidateScore": score,
-            "slug": row.get("slug"),
-            "question": row.get("question"),
-            "category": row.get("category"),
-            "tradeType": row.get("tradeType"),
-            "finalDecision": (row.get("autoDraft") or {}).get("finalDecision"),
-            "yesPrice": row.get("yesPrice"),
-            "noPrice": row.get("noPrice"),
-            "liquidity": row.get("liquidity"),
-            "volume24hr": row.get("volume24hr"),
-            "daysToEnd": row.get("daysToEnd"),
-            "endDate": row.get("endDate"),
-            "oracleRisk": row.get("oracleRisk"),
-            "resolutionSource": row.get("resolutionSource"),
-            "executionPlan": {
-                "entrySide": ep.get("entrySide"),
-                "buyLimitPrice": ep.get("buyLimitPrice"),
-                "sellLimitPrice": ep.get("sellLimitPrice"),
-                "bestBid": ep.get("bestBid"),
-                "bestAsk": ep.get("bestAsk"),
-                "spreadPct": ep.get("spreadPct"),
-                "stakeUSDC": ep.get("stakeUSDC"),
-                "takeProfit1": ep.get("takeProfit1"),
-                "takeProfit2": ep.get("takeProfit2"),
-            },
-            "hardEdge": {
-                "thresholdPp": edge.get("thresholdPp"),
-                "frictionPp": edge.get("frictionPp"),
-                "afterCostEdgePp": edge.get("afterCostEdgePp"),
-                "note": edge.get("note"),
-            },
-            "polymarketUrl": f"https://polymarket.com/event/{row.get('slug')}" if row.get("slug") else None,
-        })
-
-    return jsonify({
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "filters": {
-            "min_liquidity": min_liq,
-            "expiry_days": [2, 60],
-            "max_spread_pp": 6.0,
-            "non_sports_only": True,
-            "hard_ok_required": True,
-        },
-        "totalQualified": len(qualified),
-        "top": out,
-    })
-
 
 @app.route("/analyze-market", methods=["POST"])
 def analyze_market():
@@ -3995,10 +3857,10 @@ def dashboard():
     </div>
   </div>
 
-  <div class="section">
-    <h2>Top kandidáti</h2>
+  <details class="section" id="explorerSection">
+    <summary style="cursor:pointer;font-size:1.05em;font-weight:700;padding:6px 0;">Prieskumník — Top kandidáti <span class="small" style="font-weight:400;color:#666;">(klikni pre rozbalenie)</span></summary>
 
-    <div class="controls">
+    <div class="controls" style="margin-top:10px;">
       <div class="control">
         <label for="category">Kategória</label>
         <select id="category">
@@ -4038,23 +3900,8 @@ def dashboard():
       </div>
 
       <div class="checkbox-wrap">
-        <input type="checkbox" id="diversify" checked />
-        <label for="diversify">Diverzifikovať feed</label>
-      </div>
-
-      <div class="checkbox-wrap">
         <input type="checkbox" id="watchlistOnly" />
         <label for="watchlistOnly">Len watchlist</label>
-      </div>
-
-      <div class="checkbox-wrap">
-        <input type="checkbox" id="buyOnly" />
-        <label for="buyOnly">Len BUY signály</label>
-      </div>
-
-      <div class="checkbox-wrap">
-        <input type="checkbox" id="strictMode" />
-        <label for="strictMode">Strict v6 mode</label>
       </div>
 
       <div class="control">
@@ -4090,7 +3937,7 @@ def dashboard():
         <tbody></tbody>
       </table>
     </div>
-  </div>
+  </details>
 
   <div id="detailPanel">
     <div class="section">
@@ -4102,12 +3949,15 @@ def dashboard():
   <div class="top-strip">
     <div class="top-left-stack">
       <div class="section compact-section">
-        <h2>Na sledovanie</h2>
-        <div id="watchlistBox" class="panel-muted compact-box">Načítavam watchlist...</div>
-      </div>
-      <div class="section compact-section">
-        <h2>Alerty</h2>
-        <div id="alertsBox" class="panel-muted compact-box">Zatiaľ bez alertov.</div>
+        <h2>Watchlist &amp; Alerty <span class="small" style="font-weight:400;color:#666;">— alerty sú trigger nad watchlistom</span></h2>
+        <div style="margin-bottom:8px;">
+          <div class="small" style="color:#666;font-weight:600;margin-bottom:4px;">Alerty</div>
+          <div id="alertsBox" class="panel-muted compact-box">Zatiaľ bez alertov.</div>
+        </div>
+        <div>
+          <div class="small" style="color:#666;font-weight:600;margin-bottom:4px;">Watchlist</div>
+          <div id="watchlistBox" class="panel-muted compact-box">Načítavam watchlist...</div>
+        </div>
       </div>
     </div>
     <div class="section compact-section">
@@ -4267,7 +4117,6 @@ def dashboard():
       const info = getScheduleInfo(now);
       const lastText = lastRefreshAt ? fmtDateTime(lastRefreshAt) : 'ešte neprebehla';
       const nextText = fmtDateTime(info.nextRefresh);
-      const strictValue = document.getElementById('strictMode')?.checked ? 'ON' : 'OFF';
       const whaleMin = getWhaleMin().toLocaleString('sk-SK');
       const windowText = info.inWindow
         ? 'Sme v aktívnom okne 07:00–21:00.'
@@ -4277,7 +4126,6 @@ def dashboard():
         '<strong>Dashboard aktuálny k:</strong> ' + lastText + '<br>' +
         '<strong>Aktuálny dátum a čas:</strong> ' + fmtDateTime(now) + '<br>' +
         '<strong>Plán refreshu:</strong> 07:00, 09:00, 11:00, 13:00, 15:00, 17:00, 19:00, 21:00<br>' +
-        '<strong>Strict v6 mode:</strong> ' + strictValue + '<br>' +
         '<strong>Whale filter:</strong> iba cash pohyby nad ' + whaleMin + '<br>' +
         windowText + ' <strong>Ďalší plánovaný refresh:</strong> ' + nextText;
     }}
@@ -4964,19 +4812,13 @@ def dashboard():
       const category = document.getElementById('category')?.value || '';
       const minLiquidity = document.getElementById('minLiquidity')?.value || '';
       const hidePass = document.getElementById('hidePass')?.checked || false;
-      const diversify = document.getElementById('diversify')?.checked || false;
       const watchlistOnly = document.getElementById('watchlistOnly')?.checked || false;
-      const buyOnly = document.getElementById('buyOnly')?.checked || false;
-      const strictMode = document.getElementById('strictMode')?.checked || false;
       updateStatusLine();
       const params = new URLSearchParams({{
         limit: '80',
         min_liquidity: minLiquidity,
         hide_pass: hidePass ? 'true' : 'false',
-        diversify: diversify ? 'true' : 'false',
-        watchlist_only: watchlistOnly ? 'true' : 'false',
-        buy_only: buyOnly ? 'true' : 'false',
-        strict_mode: strictMode ? 'true' : 'false'
+        watchlist_only: watchlistOnly ? 'true' : 'false'
       }});
       if (category) params.set('category', category);
       try {{
@@ -5423,8 +5265,6 @@ def dashboard():
     }}
 
     document.getElementById('refreshBtn')?.addEventListener('click', loadAll);
-    document.getElementById('strictMode')?.addEventListener('change', function() {{ updateStatusLine(); }});
-    document.getElementById('buyOnly')?.addEventListener('change', loadMarkets);
     document.getElementById('whaleMinAmount')?.addEventListener('change', loadGlobalWhaleFlow);
     document.getElementById('includeSettles')?.addEventListener('change', loadGlobalWhaleFlow);
     document.getElementById('includeClosed')?.addEventListener('change', loadGlobalWhaleFlow);
