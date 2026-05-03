@@ -121,11 +121,18 @@ def read_pnl_log(limit=100):
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 DATA_API_BASE = "https://data-api.polymarket.com"
 
-# === v9.0 SNIPER CONFIG (CORE + SANDBOX) ===
+# === v10.0 SNIPER CONFIG (CORE + SANDBOX + Free-Roll exit modul) ===
 APP_CONFIG = {
-    "dashboard_title": "Polymarket Sniper v9.0",
+    "dashboard_title": "Polymarket Sniper v10.0",
     "default_min_liquidity": 100000.0,
-    "system_version": "v9.0",
+    "system_version": "v10.0",
+    # v10 Free-Roll exit modul (PDF v10 sekčia 7) — default exit stratégia
+    "free_roll_default": True,
+    "free_roll_default_multiplier": 2.0,   # p_target = 2 × p_in
+    "free_roll_max_entry_price": 0.20,     # PDF v10 7.1: typicky lacné kontrakty 1–20 c
+    # v10 sekcia 9 — dodatočné guardraily (existujú v risk-manageri, len kodifikácia)
+    "core_drawdown_tighten_pct": 0.15,     # core book −15% → sprisni edge prahy na v8
+    "sandbox_loss_streak_penalty": 3,      # 3 stratové sandbox tradov za sebou → −50% sizing
     # Bankroll a risk limity (v9 – PDF sekcia 0+2)
     "bankroll_total": 500.0,
     # CORE BOOK (350 USDC)
@@ -1087,6 +1094,62 @@ def round_usdc(x):
     return int(round(x))
 
 
+def compute_free_roll(entry_price, stake_usdc, target_multiplier=None, p_target=None):
+    """v10 Free-Roll exit modul (PDF v10, sekcia 7).
+
+    Vráti plán: pri akej cene p_target predať N_sell akcií, aby sa vrátilo 100%
+    nákladov späť, a koľko shares ostane bežať ako free-roll (cost = 0).
+
+    Matematika:
+        N      = stake_usdc / p_in           (počet kúpených akcií)
+        N_sell = (p_in / p_target) * N        (predaj na p_target = 100% nákladov)
+        N_left = N − N_sell                  (free-roll)
+
+    Vstup:
+        entry_price: cena v rozsahu (0,1) napr. 0.12
+        stake_usdc:  USDC vložený vstup
+        target_multiplier: koef. (default 2.0 → p_target = 2 × p_in)
+        p_target: alternatívne priamo cieľová cena (override)
+
+    Vracia None ak nemá zmysel počítať (chybé vstupy, p_target >= 1, atd.).
+    """
+    if not isinstance(entry_price, (int, float)) or entry_price <= 0 or entry_price >= 1:
+        return None
+    if not isinstance(stake_usdc, (int, float)) or stake_usdc <= 0:
+        return None
+
+    if p_target is None:
+        mult = target_multiplier if target_multiplier else APP_CONFIG.get("free_roll_default_multiplier", 2.0)
+        p_target = entry_price * mult
+
+    # clamp na zmysluplny rozsah
+    if p_target <= entry_price or p_target >= 1.0:
+        return None
+
+    n_total = stake_usdc / entry_price
+    n_sell = (entry_price / p_target) * n_total
+    n_left = n_total - n_sell
+    recover_usdc = n_sell * p_target  # idealne == stake_usdc
+
+    return {
+        "entryPrice": round(entry_price, 4),
+        "pTarget": round(p_target, 4),
+        "multiplier": round(p_target / entry_price, 3),
+        "nTotal": round(n_total, 2),
+        "nSell": round(n_sell, 2),
+        "nLeft": round(n_left, 2),
+        "stakeUSDC": round(stake_usdc, 2),
+        "recoverUSDC": round(recover_usdc, 2),
+        "freeRollShares": round(n_left, 2),
+        "effectiveCostAfter": 0.0,
+        "narrative": (
+            f"Po vstupe ihneď nastav LIMIT SELL na {round(n_sell, 2)} shares na cene "
+            f"{round(p_target, 3):.3f}. Po fillnutí máš 100% vkladu späť "
+            f"({round(recover_usdc, 2)} USDC) a {round(n_left, 2)} shares beží ako free-roll."
+        ),
+    }
+
+
 def compute_exit_targets(entry_side, entry_price, trade_type):
     if not isinstance(entry_price, (int, float)):
         return None, None
@@ -1155,6 +1218,7 @@ def build_execution_plan(flag, trade_type, final_decision, yes_price, no_price, 
             "runnerRule": "No trade.",
             "timeStop": "No trade.",
             "fullExitTrigger": "No trade.",
+            "freeRoll": None,
         }
 
     if trade_type == "Centovka":
@@ -1269,6 +1333,16 @@ def build_execution_plan(flag, trade_type, final_decision, yes_price, no_price, 
         "runnerRule": runner_rule,
         "timeStop": time_stop,
         "fullExitTrigger": full_exit,
+        # v10 Free-Roll exit modul (PDF v10 sekcia 7) — default ak entry <= max_entry_price
+        "freeRoll": (
+            compute_free_roll(target_anchor, stake)
+            if (
+                APP_CONFIG.get("free_roll_default", True)
+                and isinstance(target_anchor, (int, float))
+                and target_anchor <= APP_CONFIG.get("free_roll_max_entry_price", 0.20)
+            )
+            else None
+        ),
     }
 
 
@@ -3564,6 +3638,18 @@ def candidates_v9():
                 "stakeUSDC_v7": ep.get("stakeUSDC"),
                 "takeProfit1": ep.get("takeProfit1"),
                 "takeProfit2": ep.get("takeProfit2"),
+                # v10 Free-Roll — prepočítaj na patientLimit + suggested size (lepšie než legacy stake)
+                "freeRoll": (
+                    compute_free_roll(entry["patient_limit"], suggested_size)
+                    if (
+                        APP_CONFIG.get("free_roll_default", True)
+                        and isinstance(entry.get("patient_limit"), (int, float))
+                        and entry["patient_limit"] <= APP_CONFIG.get("free_roll_max_entry_price", 0.20)
+                        and isinstance(suggested_size, (int, float))
+                        and suggested_size > 0
+                    )
+                    else ep.get("freeRoll")
+                ),
             },
             "hardEdge": {
                 "thresholdPp": edge_obj.get("thresholdPp"),
@@ -3641,7 +3727,7 @@ def dashboard():
 <html lang="sk">
 <head>
   <meta charset="utf-8">
-  <title>{title} v6.2</title>
+  <title>{title}</title>
   <style>
     body {{ font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 16px; background: #f5f5f5; color: #222; }}
     h1, h2, h3 {{ margin-bottom: 0.3rem; }}
@@ -3838,7 +3924,7 @@ def dashboard():
 
 
   <div class="section" id="v9Section">
-    <h2>Sniper v9.0 — CORE + SANDBOX kandidáti</h2>
+    <h2>Sniper v10.0 — CORE + SANDBOX kandidáti <span class="small" style="font-weight:400;color:#666;">· Free-Roll exit modul aktívny</span></h2>
     <div class="small" style="margin-bottom:8px;color:#666;">
       <b>CORE BOOK</b> (350 USDC, prahy: Politics/Macro/Time-Decay ≥ 9pp, Resolution/Dispute ≥ 12pp, oracle silne/stredne) ·
       <b>SANDBOX BOOK</b> (150 USDC, prah ≥ 6pp, max 15 USDC/trade). Vyhodené: šport, expiry 2–365d, spread ≤ 6pp, likv ≥ 50k.
@@ -4650,6 +4736,11 @@ def dashboard():
       const items = [];
       if (ep.buyLimitPrice != null) {{
         items.push('<li><b>VSTUP</b> @ ' + Number(ep.buyLimitPrice).toFixed(3) + ' · stake ' + (ep.stakeUSDC || 0) + ' USDC · ' + (ep.entrySide || '?') + (ep.spreadPct != null ? ' · spread ' + ep.spreadPct + 'pp' : '') + '</li>');
+      }}
+      // v10 Free-Roll exit modul (default pre lacné kontrakty 1–20 c)
+      if (ep.freeRoll && ep.freeRoll.pTarget != null) {{
+        const fr = ep.freeRoll;
+        items.push('<li class="freeroll" style="background:#fff8e6;border-left:3px solid #d4a017;padding:4px 6px;"><b>FREE-ROLL (default v10)</b> @ ' + Number(fr.pTarget).toFixed(3) + ' · predaj ' + fr.nSell + ' shares (z ' + fr.nTotal + ') → 100% nákladov späť (' + fr.recoverUSDC + ' USDC) · ' + fr.nLeft + ' shares ako free-roll</li>');
       }}
       if (ep.takeProfit1 != null) {{
         items.push('<li class="tp1"><b>TP1</b> @ ' + Number(ep.takeProfit1).toFixed(3) + ' · ' + (ep.tp1Pct ? 'predaj ' + ep.tp1Pct + '%' : 'predaj 40%') + (ep.tranche2USDC ? ' (' + ep.tranche2USDC + ' USDC)' : '') + (ep.tp1Action ? ' — ' + ep.tp1Action : '') + '</li>');
