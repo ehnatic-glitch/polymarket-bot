@@ -121,15 +121,17 @@ def read_pnl_log(limit=100):
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 DATA_API_BASE = "https://data-api.polymarket.com"
 
-# === v10.0 SNIPER CONFIG (CORE + SANDBOX + Free-Roll exit modul) ===
+# === v10.1 SNIPER CONFIG (CORE + SANDBOX + Free-Roll exit modul) ===
 APP_CONFIG = {
-    "dashboard_title": "Polymarket Sniper v10.0",
+    "dashboard_title": "Polymarket Sniper v10.1",
     "default_min_liquidity": 100000.0,
-    "system_version": "v10.0",
-    # v10 Free-Roll exit modul (PDF v10 sekčia 7) — default exit stratégia
+    "system_version": "v10.1",
+    # v10.1 Free-Roll exit modul (PDF v10.1 sekcia 6) — default exit stratégia
     "free_roll_default": True,
-    "free_roll_default_multiplier": 2.0,   # p_target = 2 × p_in
-    "free_roll_max_entry_price": 0.20,     # PDF v10 7.1: typicky lacné kontrakty 1–20 c
+    "free_roll_default_multiplier": 2.0,        # p_target = 2.0 × p_in (štandard)
+    "free_roll_multiplier_strong": 2.5,         # silny catalyst → 2.5 ×
+    "free_roll_multiplier_weak": 1.8,           # slabší catalyst / dlhší horizont → 1.8 ×
+    "free_roll_max_entry_price": 0.25,          # PDF v10.1 sek 6: lacné kontrakty 1–25 ¢
     # v10 sekcia 9 — dodatočné guardraily (existujú v risk-manageri, len kodifikácia)
     "core_drawdown_tighten_pct": 0.15,     # core book −15% → sprisni edge prahy na v8
     "sandbox_loss_streak_penalty": 3,      # 3 stratové sandbox tradov za sebou → −50% sizing
@@ -161,7 +163,7 @@ APP_CONFIG = {
     "edge_pp_core_momentum": 9.0,         # politics/macro/elections HARD
     "edge_pp_core_momentum_soft": 8.0,    # mantinel pre core
     "edge_pp_core_time_decay": 9.0,
-    "edge_pp_core_resolution": 12.0,      # resolution/dispute HARD
+    "edge_pp_core_resolution": 12.5,      # PDF v10.1 sek 3: ≥ 12–13 pp (stred)
     "edge_pp_sandbox": 6.0,               # sandbox HARD prah
     "edge_pp_sandbox_soft": 5.0,
     "edge_pp_min_after_friction": 4.0,
@@ -169,7 +171,7 @@ APP_CONFIG = {
     "edge_pp_momentum": 9.0,
     "edge_pp_momentum_soft": 8.0,
     "edge_pp_time_decay": 9.0,
-    "edge_pp_resolution": 12.0,
+    "edge_pp_resolution": 12.5,
     # Sizing tiery v9 (USDC) — PDF sekcia 5
     # CORE
     "sizing_core_weak":   (10, 15),       # 8–9 pp edge
@@ -987,9 +989,27 @@ def build_hard_soft_checklist_v7(
                    else "stredne" if oracle_risk == "Medium"
                    else "slabo")
 
+    # v10.1 sekcia 4: Časový horizont ako samostatný SOFT (kratší = lepší pre Free-Roll/catalyst)
+    if isinstance(days_to_end, (int, float)):
+        if 2 <= days_to_end <= 14:
+            soft_time_horizon = "silne"
+            time_horizon_note = f"Blízky horizont ({int(days_to_end)} dní) — priaznivý pre catalyst/Free-Roll."
+        elif days_to_end <= 30:
+            soft_time_horizon = "stredne"
+            time_horizon_note = f"Stredný horizont ({int(days_to_end)} dní) — OK, ale nech catalyst nie je rozmazaný."
+        elif days_to_end <= 90:
+            soft_time_horizon = "slabo"
+            time_horizon_note = f"Dlhší horizont ({int(days_to_end)} dní) — viac priestoru pre noise; slíbi vyššie náklady drift."
+        else:
+            soft_time_horizon = "slabo"
+            time_horizon_note = f"Veľmi dlhý horizont ({int(days_to_end)} dní) — capital lock-up + drift risk."
+    else:
+        soft_time_horizon = "slabo"
+        time_horizon_note = "Horizont neznámy."
+
     hard_all_ok = (hard_resolutability_ok and hard_edge_ok
                    and hard_cash_reserve_ok and hard_correlation_ok)
-    soft_weak_count = sum(1 for s in (soft_friction, soft_exit, soft_catalyst, soft_oracle)
+    soft_weak_count = sum(1 for s in (soft_friction, soft_exit, soft_catalyst, soft_oracle, soft_time_horizon)
                           if s == "slabo")
 
     return {
@@ -1020,6 +1040,9 @@ def build_hard_soft_checklist_v7(
                 "note": f"{sk_catalyst_type(catalyst_type)} ({sk_oracle_risk(catalyst_confidence)})."},
             "oracleTrap": {"grade": soft_oracle,
                 "note": f"Oracle riziko: {sk_oracle_risk(oracle_risk)}."},
+            "timeHorizon": {"grade": soft_time_horizon,
+                "daysToEnd": days_to_end,
+                "note": time_horizon_note},
         },
         "summary": {
             "hardAllOk": hard_all_ok,
@@ -1094,8 +1117,9 @@ def round_usdc(x):
     return int(round(x))
 
 
-def compute_free_roll(entry_price, stake_usdc, target_multiplier=None, p_target=None):
-    """v10 Free-Roll exit modul (PDF v10, sekcia 7).
+def compute_free_roll(entry_price, stake_usdc, target_multiplier=None, p_target=None,
+                      catalyst_confidence=None, days_to_end=None):
+    """v10.1 Free-Roll exit modul (PDF v10.1, sekcia 6).
 
     Vráti plán: pri akej cene p_target predať N_sell akcií, aby sa vrátilo 100%
     nákladov späť, a koľko shares ostane bežať ako free-roll (cost = 0).
@@ -1105,21 +1129,44 @@ def compute_free_roll(entry_price, stake_usdc, target_multiplier=None, p_target=
         N_sell = (p_in / p_target) * N        (predaj na p_target = 100% nákladov)
         N_left = N − N_sell                  (free-roll)
 
+    Tier-aware multiplier (PDF v10.1 sek 6: 1.8–2.5×):
+        catalyst_confidence == 'High'  → 2.5×
+        catalyst_confidence == 'Medium' alebo dlhší horizont → 1.8× (slabší)
+        inak → 2.0× (štandard)
+        explicitný target_multiplier alebo p_target prepíše všetko.
+
     Vstup:
         entry_price: cena v rozsahu (0,1) napr. 0.12
         stake_usdc:  USDC vložený vstup
-        target_multiplier: koef. (default 2.0 → p_target = 2 × p_in)
+        target_multiplier: koef. (override)
         p_target: alternatívne priamo cieľová cena (override)
+        catalyst_confidence: 'High' / 'Medium' / 'Low' (z detect_catalyst)
+        days_to_end: dni do rozhodnutia (slabší multiplier ak > 30)
 
-    Vracia None ak nemá zmysel počítať (chybé vstupy, p_target >= 1, atd.).
+    Vracia None ak nemá zmysel počítať (chybné vstupy, p_target >= 1, atd.).
     """
     if not isinstance(entry_price, (int, float)) or entry_price <= 0 or entry_price >= 1:
         return None
     if not isinstance(stake_usdc, (int, float)) or stake_usdc <= 0:
         return None
 
+    tier_label = "štandard"
     if p_target is None:
-        mult = target_multiplier if target_multiplier else APP_CONFIG.get("free_roll_default_multiplier", 2.0)
+        if target_multiplier:
+            mult = target_multiplier
+            tier_label = "vlastný"
+        elif catalyst_confidence == "High":
+            mult = APP_CONFIG.get("free_roll_multiplier_strong", 2.5)
+            tier_label = "silný catalyst (2.5×)"
+        elif (
+            catalyst_confidence == "Low"
+            or (isinstance(days_to_end, (int, float)) and days_to_end > 30)
+        ):
+            mult = APP_CONFIG.get("free_roll_multiplier_weak", 1.8)
+            tier_label = "slabší catalyst / dlhší horizont (1.8×)"
+        else:
+            mult = APP_CONFIG.get("free_roll_default_multiplier", 2.0)
+            tier_label = "štandard (2.0×)"
         p_target = entry_price * mult
 
     # clamp na zmysluplny rozsah
@@ -1135,6 +1182,7 @@ def compute_free_roll(entry_price, stake_usdc, target_multiplier=None, p_target=
         "entryPrice": round(entry_price, 4),
         "pTarget": round(p_target, 4),
         "multiplier": round(p_target / entry_price, 3),
+        "tier": tier_label,
         "nTotal": round(n_total, 2),
         "nSell": round(n_sell, 2),
         "nLeft": round(n_left, 2),
@@ -1188,7 +1236,7 @@ def exit_split_for_trade(trade_type):
 
 
 def build_execution_plan(flag, trade_type, final_decision, yes_price, no_price, liquidity, volume24hr, days_to_end,
-                        best_bid=None, best_ask=None):
+                        best_bid=None, best_ask=None, catalyst_confidence=None):
     """v7 execution plan + live bid/ask z Polymarket order book.
 
     bestBid/bestAsk pochádzaju z Gamma API a vzťahujú sa na YES stranu. Pre BUY NO
@@ -1333,13 +1381,17 @@ def build_execution_plan(flag, trade_type, final_decision, yes_price, no_price, 
         "runnerRule": runner_rule,
         "timeStop": time_stop,
         "fullExitTrigger": full_exit,
-        # v10 Free-Roll exit modul (PDF v10 sekcia 7) — default ak entry <= max_entry_price
+        # v10.1 Free-Roll exit modul (PDF v10.1 sekcia 6) — tier-aware (1.8–2.5×)
         "freeRoll": (
-            compute_free_roll(target_anchor, stake)
+            compute_free_roll(
+                target_anchor, stake,
+                catalyst_confidence=catalyst_confidence,
+                days_to_end=days_to_end,
+            )
             if (
                 APP_CONFIG.get("free_roll_default", True)
                 and isinstance(target_anchor, (int, float))
-                and target_anchor <= APP_CONFIG.get("free_roll_max_entry_price", 0.20)
+                and target_anchor <= APP_CONFIG.get("free_roll_max_entry_price", 0.25)
             )
             else None
         ),
@@ -1796,6 +1848,7 @@ def score_market(m, strict_mode=False):
         days_to_end=days_to_end,
         best_bid=best_bid_val,
         best_ask=best_ask_val,
+        catalyst_confidence=catalyst_confidence,
     )
 
     fail = fail_point(checklist, oracle_risk, notes)
@@ -3638,13 +3691,17 @@ def candidates_v9():
                 "stakeUSDC_v7": ep.get("stakeUSDC"),
                 "takeProfit1": ep.get("takeProfit1"),
                 "takeProfit2": ep.get("takeProfit2"),
-                # v10 Free-Roll — prepočítaj na patientLimit + suggested size (lepšie než legacy stake)
+                # v10.1 Free-Roll — tier-aware (catalyst confidence + days_to_end)
                 "freeRoll": (
-                    compute_free_roll(entry["patient_limit"], suggested_size)
+                    compute_free_roll(
+                        entry["patient_limit"], suggested_size,
+                        catalyst_confidence=row.get("catalystConfidence"),
+                        days_to_end=row.get("daysToEnd"),
+                    )
                     if (
                         APP_CONFIG.get("free_roll_default", True)
                         and isinstance(entry.get("patient_limit"), (int, float))
-                        and entry["patient_limit"] <= APP_CONFIG.get("free_roll_max_entry_price", 0.20)
+                        and entry["patient_limit"] <= APP_CONFIG.get("free_roll_max_entry_price", 0.25)
                         and isinstance(suggested_size, (int, float))
                         and suggested_size > 0
                     )
@@ -3914,7 +3971,7 @@ def dashboard():
   <div class="header-strip">
     <div class="header-left">
       <h1>{title}</h1>
-      <p class="small">v7.0: HARD/SOFT checklist, edge prahy 8–15pp, sizing 5–60 USDC, daily DD 15%, max 3–4 pozície.</p>
+      <p class="small">v10.1: Default = PASS · CORE 350 / SANDBOX 150 · Free-Roll exit (1.8–2.5×) · HARD: Resolutability · Edge · Bankroll · Korelácia.</p>
     </div>
     <div class="header-right">
       <div class="status-card" id="statusLine">Dashboard sa inicializuje...</div>
@@ -3924,10 +3981,10 @@ def dashboard():
 
 
   <div class="section" id="v9Section">
-    <h2>Sniper v10.0 — CORE + SANDBOX kandidáti <span class="small" style="font-weight:400;color:#666;">· Free-Roll exit modul aktívny</span></h2>
+    <h2>Sniper v10.1 — CORE + SANDBOX kandidáti <span class="small" style="font-weight:400;color:#666;">· Free-Roll exit (tier-aware 1.8–2.5×)</span></h2>
     <div class="small" style="margin-bottom:8px;color:#666;">
-      <b>CORE BOOK</b> (350 USDC, prahy: Politics/Macro/Time-Decay ≥ 9pp, Resolution/Dispute ≥ 12pp, oracle silne/stredne) ·
-      <b>SANDBOX BOOK</b> (150 USDC, prah ≥ 6pp, max 15 USDC/trade). Vyhodené: šport, expiry 2–365d, spread ≤ 6pp, likv ≥ 50k.
+      <b>CORE</b> (350 USDC · prahy: Politics/Macro/Time-Decay ≥ 9pp, Resolution/Dispute/Oracle ≥ 12.5pp) ·
+      <b>SANDBOX</b> (150 USDC · prah ≥ 6pp · max 15/trade). Vyhodené: šport, lotérie bez text edge, subjektívne celebrity trhy.
     </div>
     <div style="margin-bottom:14px;">
       <h3 style="margin:6px 0;color:#1a4d8c;">CORE BOOK <span class="small" style="font-weight:400;">— jasné pravidlá + edge ≥ core prah</span></h3>
@@ -4312,9 +4369,10 @@ def dashboard():
       ];
       const softOrder = [
         ['friction', 'Frikcia (SOFT)'],
-        ['exit', 'Exit (SOFT)'],
+        ['exit', 'Exit · free-roll (SOFT)'],
         ['catalyst', 'Catalyst (SOFT)'],
-        ['oracleTrap', 'Oracle Trap (SOFT)']
+        ['oracleTrap', 'Oracle Trap (SOFT)'],
+        ['timeHorizon', 'Časový horizont (SOFT)']
       ];
       let html = '';
       hardOrder.forEach(function(pair) {{
@@ -4740,7 +4798,8 @@ def dashboard():
       // v10 Free-Roll exit modul (default pre lacné kontrakty 1–20 c)
       if (ep.freeRoll && ep.freeRoll.pTarget != null) {{
         const fr = ep.freeRoll;
-        items.push('<li class="freeroll" style="background:#fff8e6;border-left:3px solid #d4a017;padding:4px 6px;"><b>FREE-ROLL (default v10)</b> @ ' + Number(fr.pTarget).toFixed(3) + ' · predaj ' + fr.nSell + ' shares (z ' + fr.nTotal + ') → 100% nákladov späť (' + fr.recoverUSDC + ' USDC) · ' + fr.nLeft + ' shares ako free-roll</li>');
+        const tierTxt = fr.tier ? ' · ' + fr.tier : '';
+        items.push('<li class="freeroll" style="background:#fff8e6;border-left:3px solid #d4a017;padding:4px 6px;"><b>FREE-ROLL (default v10.1)</b> @ ' + Number(fr.pTarget).toFixed(3) + tierTxt + ' · predaj ' + fr.nSell + ' shares (z ' + fr.nTotal + ') → 100% nákladov späť (' + fr.recoverUSDC + ' USDC) · ' + fr.nLeft + ' shares ako free-roll</li>');
       }}
       if (ep.takeProfit1 != null) {{
         items.push('<li class="tp1"><b>TP1</b> @ ' + Number(ep.takeProfit1).toFixed(3) + ' · ' + (ep.tp1Pct ? 'predaj ' + ep.tp1Pct + '%' : 'predaj 40%') + (ep.tranche2USDC ? ' (' + ep.tranche2USDC + ' USDC)' : '') + (ep.tp1Action ? ' — ' + ep.tp1Action : '') + '</li>');
