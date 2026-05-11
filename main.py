@@ -121,11 +121,29 @@ def read_pnl_log(limit=100):
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 DATA_API_BASE = "https://data-api.polymarket.com"
 
-# === v10.1 SNIPER CONFIG (CORE + SANDBOX + Free-Roll exit modul) ===
+# === v11.0 SNIPER CONFIG (Hybrid AI Agent — PDF v01 = C1-2 + S1-4 + CH-5) ===
 APP_CONFIG = {
-    "dashboard_title": "Polymarket Sniper v10.1",
+    "dashboard_title": "Polymarket Sniper v11.0",  # Hybrid AI Agent (Quality Score + Tier + Edge Tagging)
     "default_min_liquidity": 100000.0,
-    "system_version": "v10.1",
+    "system_version": "v11.0",
+    # v11 Quality Score thresholdy (PDF v01 sek 6: bodovanie 0–5 za 6 faktorov, spolu 0–30)
+    "qs_tier_a_min": 24,        # ≥ 24 → Tier A (agresívny sizing)
+    "qs_tier_b_min": 18,        # 18–23 → Tier B (normálny sizing)
+    # pod 18 → PASS
+    # v11 Tier base sizing (PDF v01 sek 7)
+    "tier_a_core_min": 25, "tier_a_core_max": 35,
+    "tier_a_sandbox_min": 10, "tier_a_sandbox_max": 15,
+    "tier_b_core_min": 10, "tier_b_core_max": 22,
+    "tier_b_sandbox_min": 5, "tier_b_sandbox_max": 10,
+    "tier_c_sandbox_min": 3, "tier_c_sandbox_max": 15,  # 3–8 default, silnejší 8–12, max 15
+    # v11 Catalyst multiplier (PDF v01 sek 7)
+    "catalyst_mult_strong": 1.00,
+    "catalyst_mult_medium": 0.70,
+    "catalyst_mult_weak":   0.40,
+    # v11 Liquidity adjustment (PDF v01 sek 7)
+    "liq_adj_a": 1.00,
+    "liq_adj_b": 0.85,
+    "liq_adj_c": 0.50,          # max 50% tier sizing, nikdy nie Tier A max
     # v10.1 Free-Roll exit modul (PDF v10.1 sekcia 6) — default exit stratégia
     "free_roll_default": True,
     "free_roll_default_multiplier": 2.0,        # p_target = 2.0 × p_in (štandard)
@@ -1196,6 +1214,240 @@ def compute_free_roll(entry_price, stake_usdc, target_multiplier=None, p_target=
             f"({round(recover_usdc, 2)} USDC) a {round(n_left, 2)} shares beží ako free-roll."
         ),
     }
+
+
+# ============================================================================
+# v11.0 — Hybrid AI Agent helpers (PDF v01 = C1-2 + S1-4 + CH-5)
+# ============================================================================
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def compute_quality_score_v11(
+    text_edge_quality=None,
+    resolution_clarity=None,
+    catalyst_strength=None,        # 'High' | 'Medium' | 'Low'
+    liquidity_score=None,          # 'A' | 'B' | 'C'
+    oracle_risk=None,              # 'Low' | 'Medium' | 'High' (invertované)
+    behavioral_distortion=None,    # 'High' | 'Medium' | 'Low' | None
+    checklist_v7=None,             # fallback — ak chybú explicit skore, odvodíme
+    catalyst_type=None,            # 'textual' / 'time' / 'numeric_event' — hint
+):
+    """Quality Score 0–30 (PDF v01 sek 6).
+
+    6 faktorov × 0–5:
+      1) Text edge quality
+      2) Resolution clarity
+      3) Catalyst
+      4) Liquidity
+      5) Oracle risk (invertované — vyššie riziko = menej bodov)
+      6) Behavioral distortion quality
+
+    Pre spätnu kompatibilitu: ak nemáme explicitne 0–5 vstupy, odvodíme ich
+    z existujúcich v7 checklist grades (silne=4, stredne=3, slabo=1).
+    """
+    def _from_grade(g):
+        return {"silne": 4, "stredne": 3, "slabo": 1}.get(g, 2)
+
+    hard = (checklist_v7 or {}).get("hard", {}) or {}
+    soft = (checklist_v7 or {}).get("soft", {}) or {}
+
+    # 1) Text edge quality — pre textual catalysts/resolution trhy vyššie
+    if text_edge_quality is None:
+        base = _from_grade((hard.get("edgeAfterCost") or {}).get("grade"))
+        if catalyst_type in ("textual",):
+            base = min(5, base + 1)
+        text_edge_quality = _clamp(base, 0, 5)
+
+    # 2) Resolution clarity — z resolutability
+    if resolution_clarity is None:
+        resolution_clarity = _clamp(_from_grade((hard.get("resolutability") or {}).get("grade")), 0, 5)
+
+    # 3) Catalyst — z catalyst_strength
+    if catalyst_strength is None:
+        catalyst_strength = (soft.get("catalyst") or {}).get("grade")
+    cat_pts = {"silne": 5, "High": 5, "stredne": 3, "Medium": 3, "slabo": 1, "Low": 1}.get(catalyst_strength, 2)
+
+    # 4) Liquidity
+    if liquidity_score in ("A",):
+        liq_pts = 5
+    elif liquidity_score in ("B",):
+        liq_pts = 3
+    elif liquidity_score in ("C",):
+        liq_pts = 1
+    else:
+        liq_pts = _clamp(_from_grade((soft.get("friction") or {}).get("grade")), 0, 5)
+
+    # 5) Oracle risk (invertované)
+    if oracle_risk is None:
+        oracle_risk_grade = (soft.get("oracleTrap") or {}).get("grade")
+        oracle_pts = _from_grade(oracle_risk_grade)
+    else:
+        oracle_pts = {"Low": 5, "Medium": 3, "High": 1}.get(oracle_risk, 2)
+
+    # 6) Behavioral distortion quality
+    if behavioral_distortion in ("High",):
+        beh_pts = 5
+    elif behavioral_distortion in ("Medium",):
+        beh_pts = 3
+    elif behavioral_distortion in ("Low", None):
+        beh_pts = 1
+    else:
+        beh_pts = 2
+
+    components = {
+        "text_edge": int(text_edge_quality),
+        "resolution_clarity": int(resolution_clarity),
+        "catalyst": int(cat_pts),
+        "liquidity": int(liq_pts),
+        "oracle_risk_inverse": int(oracle_pts),
+        "behavioral_distortion": int(beh_pts),
+    }
+    total = sum(components.values())
+    return {"total": total, **components}
+
+
+def compute_tier_v11(quality_score_total, hard_all_ok=True):
+    """Tier A/B/C/PASS podla quality score (PDF v01 sek 6 + 7).
+
+    ≥ qs_tier_a_min (24) → A
+    ≥ qs_tier_b_min (18) → B
+    inak → PASS (alebo C pre SANDBOX experimenty)
+
+    Ak hard filter zlyhá → vždy PASS bez ohľadu na score.
+    """
+    if not hard_all_ok:
+        return "PASS"
+    if quality_score_total >= APP_CONFIG.get("qs_tier_a_min", 24):
+        return "A"
+    if quality_score_total >= APP_CONFIG.get("qs_tier_b_min", 18):
+        return "B"
+    return "PASS"
+
+
+def compute_sizing_v11(tier, book, catalyst_strength=None, liquidity_score=None,
+                        strong_setup=False):
+    """Finálny sizing = Tier base × Catalyst multiplier × Liquidity adjustment
+    (PDF v01 sek 7). Vždy clampovat na tier min/max.
+
+    tier: 'A' | 'B' | 'C' | 'PASS'
+    book: 'CORE' | 'SANDBOX'
+    catalyst_strength: 'High' | 'Medium' | 'Low'
+    liquidity_score: 'A' | 'B' | 'C'
+    strong_setup: pre Tier C SANDBOX (8–12 namiesto 3–8)
+    """
+    if tier == "PASS":
+        return {"final": 0.0, "tierBase": 0.0, "tierMin": 0, "tierMax": 0,
+                "catalystMult": 0.0, "liqAdj": 0.0, "narrative": "PASS — žiadny sizing."}
+
+    cfg = APP_CONFIG
+    if tier == "A" and book == "CORE":
+        lo, hi = cfg["tier_a_core_min"], cfg["tier_a_core_max"]
+    elif tier == "A" and book == "SANDBOX":
+        lo, hi = cfg["tier_a_sandbox_min"], cfg["tier_a_sandbox_max"]
+    elif tier == "B" and book == "CORE":
+        lo, hi = cfg["tier_b_core_min"], cfg["tier_b_core_max"]
+    elif tier == "B" and book == "SANDBOX":
+        lo, hi = cfg["tier_b_sandbox_min"], cfg["tier_b_sandbox_max"]
+    elif tier == "C" and book == "SANDBOX":
+        if strong_setup:
+            lo, hi = 8, 12
+        else:
+            lo, hi = cfg["tier_c_sandbox_min"], 8
+    elif tier == "C" and book == "CORE":
+        return {"final": 0.0, "tierBase": 0.0, "tierMin": 0, "tierMax": 0,
+                "catalystMult": 0.0, "liqAdj": 0.0,
+                "narrative": "Tier C je vždy len SANDBOX (0 USDC v CORE)."}
+    else:
+        return {"final": 0.0, "tierBase": 0.0, "tierMin": 0, "tierMax": 0,
+                "catalystMult": 0.0, "liqAdj": 0.0, "narrative": "Neznámy tier/book."}
+
+    tier_base = (lo + hi) / 2.0
+
+    cat_mult = {
+        "High": cfg["catalyst_mult_strong"],
+        "Medium": cfg["catalyst_mult_medium"],
+        "Low": cfg["catalyst_mult_weak"],
+    }.get(catalyst_strength, cfg["catalyst_mult_medium"])
+
+    liq_adj = {
+        "A": cfg["liq_adj_a"],
+        "B": cfg["liq_adj_b"],
+        "C": cfg["liq_adj_c"],
+    }.get(liquidity_score, cfg["liq_adj_b"])
+
+    final = tier_base * cat_mult * liq_adj
+
+    # PDF v01 sek 7: Liquidity C → nikdy Tier A max
+    if liquidity_score == "C" and tier == "A":
+        final = min(final, hi * 0.5)
+
+    final = _clamp(final, lo * 0.4, hi)  # floor na 40% lo, cap na tier max
+
+    return {
+        "final": round(final, 2),
+        "tierBase": round(tier_base, 2),
+        "tierMin": lo,
+        "tierMax": hi,
+        "catalystMult": round(cat_mult, 2),
+        "liqAdj": round(liq_adj, 2),
+        "narrative": (
+            f"Tier {tier} base {tier_base:.1f} USDC × catalyst {int(cat_mult*100)}% × "
+            f"liquidity {int(liq_adj*100)}% = {round(final, 2)} USDC "
+            f"(clamp {lo}–{hi})."
+        ),
+    }
+
+
+def derive_edge_tags_v11(catalyst_type=None, oracle_risk=None, trade_type=None,
+                         catalyst_confidence=None):
+    """Primary + secondary edge tag (PDF v01 sek 4). Max 2 tagy na trade.
+    Priorita: TextRules > OracleResolution > TimeRepricing > Behavioral.
+    Behavioral nikdy nie ako primary (nie standalone).
+    """
+    tags = []
+    ct = (catalyst_type or "").lower()
+    tt = (trade_type or "").lower()
+
+    if "textual" in ct or "text" in ct or "rules" in ct:
+        tags.append("TextRules")
+    if oracle_risk in ("Medium", "High") or "resolution" in ct or "dispute" in ct or "oracle" in ct:
+        tags.append("OracleResolution")
+    if "time" in ct or "decay" in tt or "time" in tt:
+        tags.append("TimeRepricing")
+    # Behavioral — len ako sekundárny, keď je niekto z ostatných primárnych
+    has_primary = any(t in ("TextRules", "OracleResolution", "TimeRepricing") for t in tags)
+    if catalyst_confidence and has_primary and len(tags) < 2:
+        tags.append("Behavioral")
+
+    # Deduplicate + orezat na max 2
+    seen = []
+    for t in tags:
+        if t not in seen:
+            seen.append(t)
+    seen = seen[:2]
+
+    return {
+        "primary": seen[0] if seen else None,
+        "secondary": seen[1] if len(seen) > 1 else None,
+        "all": seen,
+    }
+
+
+def compute_ev_density_v11(edge_pp, days_to_end, stake_usdc):
+    """EV density rating high/medium/low (PDF v01 sek 8).
+    heuristika: EV_pp / dni — kratsi + vyssi edge = hustejsie.
+    """
+    if not isinstance(edge_pp, (int, float)) or not isinstance(days_to_end, (int, float)) or days_to_end <= 0:
+        return "medium"
+    # pp / den
+    density = edge_pp / max(days_to_end, 1)
+    if density >= 1.5:
+        return "high"
+    if density >= 0.4:
+        return "medium"
+    return "low"
 
 
 def compute_exit_targets(entry_side, entry_price, trade_type):
@@ -3658,6 +3910,42 @@ def candidates_v9():
         ep = row.get("executionPlan") or {}
         cv7 = row.get("checklistV7") or {}
         edge_obj = (cv7.get("hard", {}) or {}).get("edge", {}) or {}
+
+        # ---- v11 Hybrid AI Agent layer (PDF v01) ----
+        hard_all_ok = bool(((cv7.get("summary") or {}).get("hardAllOk")))
+        qs = compute_quality_score_v11(
+            checklist_v7=cv7,
+            catalyst_strength=row.get("catalystConfidence"),
+            oracle_risk=row.get("oracleRisk"),
+            catalyst_type=(row.get("catalyst") or {}).get("type") if isinstance(row.get("catalyst"), dict) else None,
+        )
+        v11_tier = compute_tier_v11(qs["total"], hard_all_ok=hard_all_ok)
+        # Ak legacy route dá PASS ale tier by bol A/B, rešpektuj legacy gate (PASS ostáva)
+        if book == "PASS" and not patient_book:
+            v11_tier = "PASS"
+        # Liquidity score — z frikcie + vol24h
+        liq_q = (((cv7.get("soft") or {}).get("friction") or {}).get("grade"))
+        liq_tier = "A" if liq_q == "silne" else ("B" if liq_q == "stredne" else "C")
+        v11_sizing = compute_sizing_v11(
+            v11_tier,
+            book if book != "PASS" else (patient_book or "SANDBOX"),
+            catalyst_strength=row.get("catalystConfidence"),
+            liquidity_score=liq_tier,
+        )
+        edge_tags = derive_edge_tags_v11(
+            catalyst_type=(row.get("catalyst") or {}).get("type") if isinstance(row.get("catalyst"), dict) else None,
+            oracle_risk=row.get("oracleRisk"),
+            trade_type=row.get("tradeType"),
+            catalyst_confidence=row.get("catalystConfidence"),
+        )
+        ev_density = compute_ev_density_v11(
+            edge_pp=eff_edge if isinstance(eff_edge, (int, float)) else edge_obj.get("afterCostEdgePp"),
+            days_to_end=row.get("daysToEnd"),
+            stake_usdc=suggested_size,
+        )
+        # Ak v11 tier vygeneroval vyssi sizing ako legacy — prefer v11; inak nechávame legacy
+        if v11_sizing["final"] > 0 and v11_tier in ("A", "B", "C"):
+            suggested_size = v11_sizing["final"]
         record = {
             "book": book if book != "PASS" else f"WAIT → {patient_book}",
             "bookReason": reason,
@@ -3714,6 +4002,15 @@ def candidates_v9():
                 "afterCostEdgePp": edge_obj.get("afterCostEdgePp"),  # mid-based (legacy)
                 "effectiveEdgePp": eff_edge,                          # v9 taker
                 "patientEdgePp": patient_edge,                        # v9 limit
+            },
+            # v11 Hybrid AI Agent (PDF v01)
+            "hybridV11": {
+                "tier": v11_tier,
+                "qualityScore": qs,
+                "sizing": v11_sizing,
+                "edgeTags": edge_tags,
+                "evDensity": ev_density,
+                "liquidityScore": liq_tier,
             },
             "polymarketUrl": f"https://polymarket.com/event/{row.get('slug')}" if row.get("slug") else None,
         }
@@ -3971,7 +4268,7 @@ def dashboard():
   <div class="header-strip">
     <div class="header-left">
       <h1>{title}</h1>
-      <p class="small">v10.1: Default = PASS · CORE 350 / SANDBOX 150 · Free-Roll exit (1.8–2.5×) · HARD: Resolutability · Edge · Bankroll · Korelácia.</p>
+      <p class="small">v11.0 (Hybrid AI Agent): Default = PASS · CORE 350 / SANDBOX 150 · Quality Score 0–30 · Tier A/B/C · Edge tags · Free-Roll exit.</p>
     </div>
     <div class="header-right">
       <div class="status-card" id="statusLine">Dashboard sa inicializuje...</div>
@@ -3981,10 +4278,10 @@ def dashboard():
 
 
   <div class="section" id="v9Section">
-    <h2>Sniper v10.1 — CORE + SANDBOX kandidáti <span class="small" style="font-weight:400;color:#666;">· Free-Roll exit (tier-aware 1.8–2.5×)</span></h2>
+    <h2>Sniper v11.0 — CORE + SANDBOX kandidáti <span class="small" style="font-weight:400;color:#666;">· Hybrid AI Agent (Quality Score + Tier + Edge tags)</span></h2>
     <div class="small" style="margin-bottom:8px;color:#666;">
-      <b>CORE</b> (350 USDC · prahy: Politics/Macro/Time-Decay ≥ 9pp, Resolution/Dispute/Oracle ≥ 12.5pp) ·
-      <b>SANDBOX</b> (150 USDC · prah ≥ 6pp · max 15/trade). Vyhodené: šport, lotérie bez text edge, subjektívne celebrity trhy.
+      <b>CORE</b> (350 USDC · prahy: Politics/Macro/Time-Decay ≥ 9pp, Resolution/Dispute/Oracle ≥ 12.5pp) · <b>SANDBOX</b> (150 USDC · prah ≥ 6pp).<br>
+      <b>Sizing</b> = Tier base × Catalyst (100/70/40%) × Liquidity (100/85/50%). <b>Tier</b>: ≥24 = A · 18–23 = B · &lt;18 = PASS. Edge tags: TextRules · OracleResolution · TimeRepricing · Behavioral (nie standalone).
     </div>
     <div style="margin-bottom:14px;">
       <h3 style="margin:6px 0;color:#1a4d8c;">CORE BOOK <span class="small" style="font-weight:400;">— jasné pravidlá + edge ≥ core prah</span></h3>
@@ -5123,38 +5420,82 @@ def dashboard():
       }}
     }}
 
+    function v11TierBadge(tier) {{
+      const colors = {{
+        'A': {{bg:'#0a6f3d', fg:'#fff'}},
+        'B': {{bg:'#1a4d8c', fg:'#fff'}},
+        'C': {{bg:'#a88010', fg:'#fff'}},
+        'PASS': {{bg:'#888', fg:'#fff'}}
+      }};
+      const c = colors[tier] || colors.PASS;
+      return '<span style="display:inline-block;padding:2px 8px;border-radius:10px;background:' + c.bg + ';color:' + c.fg + ';font-weight:700;font-size:11px;">' + (tier || '-') + '</span>';
+    }}
+    function v11QSBar(qs) {{
+      if (!qs || qs.total == null) return '-';
+      const total = qs.total;
+      const color = total >= 24 ? '#0a6f3d' : (total >= 18 ? '#1a4d8c' : '#a0431a');
+      return '<span style="font-weight:700;color:' + color + ';">' + total + '/30</span>';
+    }}
+    function v11EdgeTagsChips(tags) {{
+      if (!tags || !tags.all || tags.all.length === 0) return '-';
+      const colorMap = {{
+        'TextRules': '#0a6f3d',
+        'OracleResolution': '#6b2c91',
+        'TimeRepricing': '#1a4d8c',
+        'Behavioral': '#888'
+      }};
+      return tags.all.map(function(t) {{
+        const c = colorMap[t] || '#555';
+        return '<span style="display:inline-block;padding:1px 6px;margin-right:3px;border-radius:8px;background:' + c + ';color:#fff;font-size:10px;font-weight:600;">' + t + '</span>';
+      }}).join('');
+    }}
+
     function v9RenderTable(rows, book) {{
       if (!rows || rows.length === 0) {{
         return '<div class="small">Žiadny kandidát pre ' + book + ' BOOK (default = PASS).</div>';
       }}
       let html = '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
-      html += '<thead><tr style="background:#f0f0f0;text-align:left;"><th style="padding:5px;">#</th><th style="padding:5px;">Score</th><th style="padding:5px;">Market</th><th style="padding:5px;">Family</th><th style="padding:5px;">Smer</th><th style="padding:5px;">Mid</th><th style="padding:5px;">Taker</th><th style="padding:5px;">Eff. Edge</th><th style="padding:5px;">Patient Edge</th><th style="padding:5px;">BUY limit</th><th style="padding:5px;">TP1</th><th style="padding:5px;">Stake</th><th style="padding:5px;">Expiry</th><th style="padding:5px;">Link</th></tr></thead><tbody>';
+      html += '<thead><tr style="background:#f0f0f0;text-align:left;">'
+        + '<th style="padding:5px;">#</th>'
+        + '<th style="padding:5px;">Tier</th>'
+        + '<th style="padding:5px;">QS</th>'
+        + '<th style="padding:5px;">Score</th>'
+        + '<th style="padding:5px;">Market</th>'
+        + '<th style="padding:5px;">Edge tags</th>'
+        + '<th style="padding:5px;">Smer</th>'
+        + '<th style="padding:5px;">Taker</th>'
+        + '<th style="padding:5px;">Eff. Edge</th>'
+        + '<th style="padding:5px;">BUY limit</th>'
+        + '<th style="padding:5px;">Stake</th>'
+        + '<th style="padding:5px;">EV den.</th>'
+        + '<th style="padding:5px;">Dni</th>'
+        + '<th style="padding:5px;">Link</th></tr></thead><tbody>';
       rows.forEach(function(t, i) {{
         const ep = t.executionPlan || {{}};
         const he = t.hardEdge || {{}};
-        const mid = ep.midPrice != null ? Number(ep.midPrice).toFixed(3) : '-';
+        const v11 = t.hybridV11 || {{}};
         const taker = ep.effectivePrice != null ? Number(ep.effectivePrice).toFixed(3) : '-';
         const buyAt = ep.buyLimitPrice != null ? Number(ep.buyLimitPrice).toFixed(3) : '-';
-        const tp1 = ep.takeProfit1 != null ? Number(ep.takeProfit1).toFixed(3) : '-';
         const stake = ep.stakeUSDC != null ? ep.stakeUSDC : '-';
         const effEdge = he.effectiveEdgePp != null ? (Number(he.effectiveEdgePp).toFixed(1) + 'pp') : '-';
-        const patEdge = he.patientEdgePp != null ? (Number(he.patientEdgePp).toFixed(1) + 'pp') : '-';
         const days = t.daysToEnd != null ? (Number(t.daysToEnd).toFixed(0) + 'd') : '-';
         const url = t.polymarketUrl || ('https://polymarket.com/event/' + t.slug);
         const q = (t.question || t.slug || '').replace(/</g,'&lt;');
+        const evd = v11.evDensity || '-';
+        const evColor = evd === 'high' ? '#0a6f3d' : (evd === 'medium' ? '#1a4d8c' : '#a0431a');
         html += '<tr style="border-top:1px solid #e0e0e0;">';
         html += '<td style="padding:5px;">' + (i+1) + '</td>';
+        html += '<td style="padding:5px;">' + v11TierBadge(v11.tier) + '</td>';
+        html += '<td style="padding:5px;">' + v11QSBar(v11.qualityScore) + '</td>';
         html += '<td style="padding:5px;font-weight:600;">' + t.candidateScore + '</td>';
-        html += '<td style="padding:5px;max-width:300px;">' + q + '</td>';
-        html += '<td style="padding:5px;">' + (t.family || '-') + '</td>';
+        html += '<td style="padding:5px;max-width:280px;">' + q + '</td>';
+        html += '<td style="padding:5px;">' + v11EdgeTagsChips(v11.edgeTags) + '</td>';
         html += '<td style="padding:5px;">' + (t.finalDecision || '-') + '</td>';
-        html += '<td style="padding:5px;color:#888;">' + mid + '</td>';
         html += '<td style="padding:5px;font-weight:600;">' + taker + '</td>';
         html += '<td style="padding:5px;">' + effEdge + '</td>';
-        html += '<td style="padding:5px;color:#1a4d8c;">' + patEdge + '</td>';
         html += '<td style="padding:5px;font-weight:600;color:#0a6;">' + buyAt + '</td>';
-        html += '<td style="padding:5px;">' + tp1 + '</td>';
         html += '<td style="padding:5px;">' + stake + ' USDC</td>';
+        html += '<td style="padding:5px;color:' + evColor + ';font-weight:600;">' + evd + '</td>';
         html += '<td style="padding:5px;">' + days + '</td>';
         html += '<td style="padding:5px;"><a href="' + url + '" target="_blank" rel="noopener">link</a></td>';
         html += '</tr>';
