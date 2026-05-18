@@ -123,13 +123,21 @@ DATA_API_BASE = "https://data-api.polymarket.com"
 
 # === v11.0 SNIPER CONFIG (Hybrid AI Agent — PDF v01 = C1-2 + S1-4 + CH-5) ===
 APP_CONFIG = {
-    "dashboard_title": "Polymarket Sniper v11.0",  # Hybrid AI Agent (Quality Score + Tier + Edge Tagging)
+    "dashboard_title": "Polymarket Sniper v11.1",  # Hybrid AI Agent + Discovery / Near-miss vrstva
     "default_min_liquidity": 100000.0,
-    "system_version": "v11.0",
+    "system_version": "v11.1",
     # v11 Quality Score thresholdy (PDF v01 sek 6: bodovanie 0–5 za 6 faktorov, spolu 0–30)
     "qs_tier_a_min": 24,        # ≥ 24 → Tier A (agresívny sizing)
-    "qs_tier_b_min": 18,        # 18–23 → Tier B (normálny sizing)
-    # pod 18 → PASS
+    "qs_tier_b_min": 17,        # 17–23 → Tier B (v11.1 relax z 18→17 pre viac príležitostí, PDF tolerancia)
+    # pod 17 → PASS
+    # v11.1 NEAR-MISS discovery vrstva — markety ktoré tesne minuli hard gate
+    "near_miss_edge_tolerance_pp": 1.5,   # do 1.5pp pod edge prahom = near-miss
+    "near_miss_qs_min": 14,                # QS aspoň 14 (jeden krok pod B)
+    "near_miss_max_rows": 8,               # max 8 near-miss riadkov
+    # v11.1 Price band labeling (PDF v01: 1-25¢ centovky, 25-50¢ stred, 50¢+ drahé)
+    "price_band_low_max": 0.25,            # 1-25 ¢ centovky
+    "price_band_mid_max": 0.50,            # 25-50 ¢ stred
+    # nad 0.50 = HIGH (drahé)
     # v11 Tier base sizing (PDF v01 sek 7)
     "tier_a_core_min": 25, "tier_a_core_max": 35,
     "tier_a_sandbox_min": 10, "tier_a_sandbox_max": 15,
@@ -1312,7 +1320,7 @@ def compute_tier_v11(quality_score_total, hard_all_ok=True):
     """Tier A/B/C/PASS podla quality score (PDF v01 sek 6 + 7).
 
     ≥ qs_tier_a_min (24) → A
-    ≥ qs_tier_b_min (18) → B
+    ≥ qs_tier_b_min (17, v11.1) → B
     inak → PASS (alebo C pre SANDBOX experimenty)
 
     Ak hard filter zlyhá → vždy PASS bez ohľadu na score.
@@ -1321,7 +1329,7 @@ def compute_tier_v11(quality_score_total, hard_all_ok=True):
         return "PASS"
     if quality_score_total >= APP_CONFIG.get("qs_tier_a_min", 24):
         return "A"
-    if quality_score_total >= APP_CONFIG.get("qs_tier_b_min", 18):
+    if quality_score_total >= APP_CONFIG.get("qs_tier_b_min", 17):
         return "B"
     return "PASS"
 
@@ -1448,6 +1456,197 @@ def compute_ev_density_v11(edge_pp, days_to_end, stake_usdc):
     if density >= 0.4:
         return "medium"
     return "low"
+
+
+# === v11.1 NEW HELPERS — Discovery / Near-miss / Agent output ===
+
+def compute_price_band_v11(yes_price):
+    """v11.1: oznac cenove pasmo trhu (PDF v01: 1-25¢ centovky, 25-50¢ stred, 50¢+ drahe).
+
+    Vracia dict {label, code, color} pre frontend.
+    LOW = jasne asymetrie / free-roll friendly. HIGH = drahe — free-roll vypnuty.
+    """
+    if not isinstance(yes_price, (int, float)):
+        return {"label": "-", "code": "UNK", "color": "#888"}
+    low_max = APP_CONFIG.get("price_band_low_max", 0.25)
+    mid_max = APP_CONFIG.get("price_band_mid_max", 0.50)
+    # Pre dva-stranne trhy zoberme stranu blizsie k mid, tj. min(yes, 1-yes)
+    # — dashboard ale zobrazuje cenu strany ktora sa nakupuje; pouzijeme yes_price priamo
+    p = float(yes_price)
+    if p <= low_max:
+        return {"label": f"≤ {int(low_max*100)}¢ (LOW)", "code": "LOW", "color": "#0a6f3d"}
+    if p <= mid_max:
+        return {"label": f"{int(low_max*100)+1}-{int(mid_max*100)}¢ (MID)", "code": "MID", "color": "#1a4d8c"}
+    return {"label": f"> {int(mid_max*100)}¢ (HIGH)", "code": "HIGH", "color": "#a0431a"}
+
+
+def _v11_market_type_label(row, trade_type=None):
+    """Mapuje row category + trade_type na povolene market_type z PDF v01 sek 12.
+    Politics | Macro | Elections | Resolution | Dispute | TimeDecay | Behavioral | Other.
+    """
+    cat = (row.get("category") or "").strip()
+    tt = trade_type or row.get("tradeType") or ""
+    q = (row.get("question") or "").lower()
+    if tt == "Resolution":
+        return "Resolution"
+    if tt == "Trap":
+        return "Dispute"
+    if tt == "Time Decay":
+        return "TimeDecay"
+    if cat == "Politics":
+        if any(k in q for k in ("elect", "voli", "president", "prezident", "senate", "vyhraj")):
+            return "Elections"
+        return "Politics"
+    if cat == "Macro":
+        return "Macro"
+    if cat == "Narrative":
+        return "Behavioral"
+    return "Other"
+
+
+def build_agent_output_v11(row, book, tier, qs, edge_tags, ev_density, liq_tier,
+                            entry, eff_edge, suggested_size, sizing_v11, free_roll_obj,
+                            hard_filter_obj):
+    """v11.1: zostavi POVINNY OUTPUT FORMAT z PDF v01 sek. 12 — agent JSON.
+
+    Vracia dict v presnej strukture aku agent musi vraciat pri kazdom market evaluate request.
+    Pouzivany v dashboarde ako "agent view" pri kliknuti na riadok.
+    """
+    auto = row.get("autoDraft") or {}
+    side = (auto.get("finalDecision") or "").replace("BUY ", "BUY ")
+    if side.startswith("BUY YES"):
+        side_short = "BUY YES"
+    elif side.startswith("BUY NO"):
+        side_short = "BUY NO"
+    else:
+        side_short = "PASS"
+
+    if tier == "PASS" or book == "PASS" or side_short == "PASS":
+        decision = "PASS"
+    elif book == "CORE":
+        decision = f"CORE {side_short}"
+    elif book == "SANDBOX":
+        decision = f"SANDBOX {side_short}"
+    elif isinstance(book, str) and book.startswith("WAIT"):
+        # WAIT → PASS pre agent output (cakame na fill)
+        decision = "PASS"
+    else:
+        decision = "PASS"
+
+    market_type = _v11_market_type_label(row)
+    tags_all = (edge_tags or {}).get("all") or []
+    primary = tags_all[0] if len(tags_all) >= 1 else "Behavioral"
+    secondary = tags_all[1] if len(tags_all) >= 2 else "None"
+
+    cs = row.get("catalystConfidence") or ""
+    if cs.lower() in ("high", "silne", "silny"):
+        catalyst_label = "strong"
+    elif cs.lower() in ("medium", "stredne", "stredny"):
+        catalyst_label = "medium"
+    else:
+        catalyst_label = "weak"
+
+    oracle_risk_raw = (row.get("oracleRisk") or "").lower()
+    if oracle_risk_raw in ("high", "vysoke", "vysoky"):
+        oracle_trap = "high"
+    elif oracle_risk_raw in ("medium", "stredne", "stredny"):
+        oracle_trap = "medium"
+    else:
+        oracle_trap = "low"
+
+    entry_price = entry.get("patient_limit") if isinstance(entry, dict) else None
+    if not isinstance(entry_price, (int, float)):
+        entry_price = (entry or {}).get("effective") if isinstance(entry, dict) else None
+
+    fr = free_roll_obj or {}
+    fr_enabled = bool(fr.get("enabled")) if isinstance(fr, dict) else False
+
+    # invalidacia / time-stop — derivovane z endDate + catalyst
+    end_date = row.get("endDate") or ""
+    time_stop = end_date  # ISO datetime
+
+    invalidation_bits = []
+    if oracle_trap == "high":
+        invalidation_bits.append("oracle/wording zmena resolve interpretacie")
+    if catalyst_label == "strong":
+        invalidation_bits.append("catalyst neprejde alebo sa odlozi")
+    invalidation_bits.append("effective edge klesne pod sandbox prah")
+    invalidation = "; ".join(invalidation_bits)
+
+    final_exit_bits = []
+    if fr_enabled and isinstance(fr.get("target_price"), (int, float)):
+        final_exit_bits.append(f"free-roll @ {fr.get('target_price'):.2f}, zvysok bezi do resolve alebo TP2")
+    if isinstance((row.get("executionPlan") or {}).get("takeProfit2"), (int, float)):
+        final_exit_bits.append(f"TP2 @ {(row.get('executionPlan') or {}).get('takeProfit2'):.2f}")
+    if not final_exit_bits:
+        final_exit_bits.append("resolve alebo time-stop")
+    final_exit = "; ".join(final_exit_bits)
+
+    thesis_bits = []
+    if primary == "TextRules":
+        thesis_bits.append("trh zle chape wording/pravidla")
+    elif primary == "OracleResolution":
+        thesis_bits.append("oracle/UMA interpretacia je v nas prospech")
+    elif primary == "TimeRepricing":
+        thesis_bits.append("trh podcenuje plynutie casu/catalyst")
+    else:
+        thesis_bits.append("behavioral distortion + sekundarny edge")
+    if isinstance(eff_edge, (int, float)):
+        thesis_bits.append(f"effective edge {eff_edge:.1f}pp")
+    thesis = "; ".join(thesis_bits)
+
+    guardrails = []
+    cv7 = row.get("checklistV7") or {}
+    summary = cv7.get("summary") or {}
+    if not summary.get("hardAllOk"):
+        guardrails.append("HARD filter zlyhal — default PASS")
+    if oracle_trap == "high":
+        guardrails.append("high oracle trap risk — over wording precedent")
+    if liq_tier == "C":
+        guardrails.append("liquidity C — max 50% tier sizing, ghost-liquidity risk")
+    days = row.get("daysToEnd") or 0
+    if isinstance(days, (int, float)) and days > 60:
+        guardrails.append("dlhy horizont (>60d) — EV density nizka")
+    if isinstance(entry_price, (int, float)) and entry_price >= 0.4:
+        guardrails.append("drahy kontrakt — free-roll vypnuty (PDF v01 sek 9)")
+
+    return {
+        "market": row.get("question") or row.get("slug"),
+        "book": book if book in ("CORE", "SANDBOX") else "PASS",
+        "decision": decision,
+        "tier": tier,
+        "market_type": market_type,
+        "primary_edge": primary,
+        "secondary_edge": secondary,
+        "hard_filter": hard_filter_obj or {
+            "resolutability": True,
+            "edge_after_cost": True,
+            "bankroll_fit": True,
+            "correlation_ok": True,
+        },
+        "quality_score": qs,
+        "edge_estimate_pp": round(float(eff_edge), 2) if isinstance(eff_edge, (int, float)) else 0,
+        "ev_density": ev_density,
+        "catalyst_strength": catalyst_label,
+        "liquidity_score": liq_tier,
+        "oracle_trap_risk": oracle_trap,
+        "entry": {
+            "side": side_short,
+            "max_price": round(float(entry_price), 4) if isinstance(entry_price, (int, float)) else 0.0,
+            "size_usdc": float(suggested_size) if isinstance(suggested_size, (int, float)) else 0.0,
+        },
+        "exit_plan": {
+            "free_roll": fr_enabled,
+            "free_roll_target_price": round(float(fr.get("target_price")), 4) if isinstance(fr.get("target_price"), (int, float)) else 0.0,
+            "free_roll_sell_shares_formula": "recover 100% initial stake",
+            "time_stop": time_stop,
+            "final_exit_condition": final_exit,
+            "invalidation": invalidation,
+        },
+        "thesis": thesis,
+        "resolution_audit": (row.get("resolutionRules") or "")[:300],
+        "guardrail_notes": guardrails,
+    }
 
 
 def compute_exit_targets(entry_side, entry_price, trade_type):
@@ -3881,6 +4080,9 @@ def candidates_v9():
     core_list = []
     sandbox_list = []
     wait_list = []
+    near_miss_list = []   # v11.1 — markety ktoré tesne minuli prah (discovery)
+    near_miss_tol = float(APP_CONFIG.get("near_miss_edge_tolerance_pp", 1.5))
+    near_miss_qs_min = int(APP_CONFIG.get("near_miss_qs_min", 14))
     for row in rows:
         # v9 sekcia 3: použi taker stranu orderbooku, nie mid
         entry = _v9_effective_entry(row)
@@ -3894,7 +4096,52 @@ def candidates_v9():
         book, reason = _v9_classify_book(row, effective_edge=eff_edge)
         patient_book = _v9_patient_book(row, patient_edge) if book == "PASS" else None
 
+        # v11.1 NEAR-MISS — nech́aj presḱočiť do nového zoznamu (discovery)
         if book == "PASS" and not patient_book:
+            try:
+                _family_nm = _v9_trade_family(row)
+                _sb_prah_nm = _v9_edge_threshold(_family_nm, "SANDBOX")
+                _cv7_nm = row.get("checklistV7") or {}
+                _qs_nm = compute_quality_score_v11(
+                    checklist_v7=_cv7_nm,
+                    catalyst_strength=row.get("catalystConfidence"),
+                    oracle_risk=row.get("oracleRisk"),
+                    catalyst_type=(row.get("catalyst") or {}).get("type") if isinstance(row.get("catalyst"), dict) else None,
+                )
+                _eff_nm = eff_edge if isinstance(eff_edge, (int, float)) else (mid_edge if isinstance(mid_edge, (int, float)) else None)
+                _miss_edge = (
+                    isinstance(_eff_nm, (int, float))
+                    and _eff_nm >= (_sb_prah_nm - near_miss_tol)
+                )
+                _miss_qs = _qs_nm["total"] >= near_miss_qs_min
+                if _miss_edge or _miss_qs:
+                    near_miss_list.append((
+                        _qs_nm["total"],
+                        {
+                            "slug": row.get("slug"),
+                            "question": row.get("question"),
+                            "category": row.get("category"),
+                            "family": _family_nm,
+                            "yesPrice": row.get("yesPrice"),
+                            "noPrice": row.get("noPrice"),
+                            "liquidity": row.get("liquidity"),
+                            "daysToEnd": row.get("daysToEnd"),
+                            "finalDecision": (row.get("autoDraft") or {}).get("finalDecision"),
+                            "sandboxPrahPp": _sb_prah_nm,
+                            "effectiveEdgePp": _eff_nm,
+                            "missEdgePp": round(_sb_prah_nm - _eff_nm, 2) if isinstance(_eff_nm, (int, float)) else None,
+                            "qualityScoreTotal": _qs_nm["total"],
+                            "priceBand": compute_price_band_v11(row.get("yesPrice")),
+                            "marketType": _v11_market_type_label(row),
+                            "polymarketUrl": f"https://polymarket.com/event/{row.get('slug')}" if row.get("slug") else None,
+                            "missReason": (
+                                "edge tesne pod sandbox prahom" if _miss_edge and not _miss_qs
+                                else ("QS dostatočný, ale edge nestal" if _miss_qs and not _miss_edge else "edge aj QS tesne pod prahom")
+                            ),
+                        },
+                    ))
+            except Exception:
+                pass
             continue
 
         # ak prechádza len na patient_limit — do WAIT zoznamu
@@ -4012,8 +4259,35 @@ def candidates_v9():
                 "evDensity": ev_density,
                 "liquidityScore": liq_tier,
             },
+            # v11.1 Discovery vrstva — cenové pásmo + market_type + povinný agent JSON output
+            "priceBand": compute_price_band_v11(row.get("yesPrice")),
+            "marketType": _v11_market_type_label(row),
             "polymarketUrl": f"https://polymarket.com/event/{row.get('slug')}" if row.get("slug") else None,
         }
+        # v11.1: agent output (PDF v01 sek. 12) — priklada sa az po zostavi recordu
+        try:
+            record["agentOutput"] = build_agent_output_v11(
+                row=row,
+                book=book if book in ("CORE", "SANDBOX") else "PASS",
+                tier=v11_tier,
+                qs=qs,
+                edge_tags=edge_tags,
+                ev_density=ev_density,
+                liq_tier=liq_tier,
+                entry=entry,
+                eff_edge=eff_edge,
+                suggested_size=suggested_size,
+                sizing_v11=v11_sizing,
+                free_roll_obj=record["executionPlan"].get("freeRoll"),
+                hard_filter_obj={
+                    "resolutability": bool(((cv7.get("hard") or {}).get("resolutability") or {}).get("ok", True)),
+                    "edge_after_cost": bool(((cv7.get("hard") or {}).get("edge") or {}).get("ok", True)),
+                    "bankroll_fit": True,
+                    "correlation_ok": True,
+                },
+            )
+        except Exception:
+            record["agentOutput"] = None
         if book == "CORE":
             core_list.append((score, record))
         elif book == "SANDBOX":
@@ -4024,6 +4298,8 @@ def candidates_v9():
     core_list.sort(key=lambda x: -x[0])
     sandbox_list.sort(key=lambda x: -x[0])
     wait_list.sort(key=lambda x: -x[0])
+    near_miss_list.sort(key=lambda x: -x[0])
+    near_miss_max = int(APP_CONFIG.get("near_miss_max_rows", 8))
 
     return jsonify({
         "systemVersion": APP_CONFIG["system_version"],
@@ -4054,9 +4330,16 @@ def candidates_v9():
         "core": [r for _, r in core_list[:limit_core]],
         "sandbox": [r for _, r in sandbox_list[:limit_sandbox]],
         "wait": [r for _, r in wait_list[:limit_sandbox]],
+        "nearMiss": [r for _, r in near_miss_list[:near_miss_max]],
         "totalCore": len(core_list),
         "totalSandbox": len(sandbox_list),
         "totalWait": len(wait_list),
+        "totalNearMiss": len(near_miss_list),
+        "nearMissConfig": {
+            "edgeTolerancePp": near_miss_tol,
+            "qsMin": near_miss_qs_min,
+            "maxRows": near_miss_max,
+        },
     })
 
 
@@ -4100,6 +4383,15 @@ def dashboard():
     label {{ font-size: 12px; color: #555; font-weight: 600; }}
     input, select {{ padding: 7px 9px; border: 1px solid #ddd; border-radius: 6px; font: inherit; background: #fff; }}
     .checkbox-wrap {{ display: flex; align-items: center; gap: 7px; padding-top: 20px; }}
+    /* v11.1 — filter chips + agent detail expand */
+    .v11-chip {{ background:#fff; border:1px solid #ccc; border-radius:14px; padding:4px 11px; font-size:11.5px; cursor:pointer; color:#444; font-weight:600; }}
+    .v11-chip:hover {{ background:#f0f0f0; }}
+    .v11-chip.v11-chip-on {{ background:#1a4d8c; color:#fff; border-color:#1a4d8c; }}
+    .v11-row {{ cursor:pointer; }}
+    .v11-row:hover {{ background:#fafcff; }}
+    .v11-agent-panel {{ background:#f8f9fb; border-left:3px solid #6b2c91; padding:10px 14px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11.5px; white-space:pre; overflow-x:auto; line-height:1.45; }}
+    .v11-agent-row {{ background:#f8f9fb; }}
+    .v11-band {{ display:inline-block; padding:1px 6px; border-radius:8px; font-size:10.5px; font-weight:700; color:#fff; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 12.5px; table-layout: fixed; }}
     th, td {{ padding: 5px 6px; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }}
     th {{ background: #fafafa; font-weight: 700; position: sticky; top: 0; z-index: 1; }}
@@ -4268,7 +4560,7 @@ def dashboard():
   <div class="header-strip">
     <div class="header-left">
       <h1>{title}</h1>
-      <p class="small">v11.0 (Hybrid AI Agent): Default = PASS · CORE 350 / SANDBOX 150 · Quality Score 0–30 · Tier A/B/C · Edge tags · Free-Roll exit.</p>
+      <p class="small">v11.1 (Hybrid AI Agent + Discovery): Default = PASS · CORE 350 / SANDBOX 150 · Quality Score 0–30 · Tier A/B/C · Edge tags · Free-Roll · Cenové pásma + Near-miss vrstva.</p>
     </div>
     <div class="header-right">
       <div class="status-card" id="statusLine">Dashboard sa inicializuje...</div>
@@ -4278,11 +4570,30 @@ def dashboard():
 
 
   <div class="section" id="v9Section">
-    <h2>Sniper v11.0 — CORE + SANDBOX kandidáti <span class="small" style="font-weight:400;color:#666;">· Hybrid AI Agent (Quality Score + Tier + Edge tags)</span></h2>
+    <h2>Sniper v11.1 — CORE + SANDBOX kandidáti <span class="small" style="font-weight:400;color:#666;">· Hybrid AI Agent + Discovery</span></h2>
     <div class="small" style="margin-bottom:8px;color:#666;">
-      <b>CORE</b> (350 USDC · prahy: Politics/Macro/Time-Decay ≥ 9pp, Resolution/Dispute/Oracle ≥ 12.5pp) · <b>SANDBOX</b> (150 USDC · prah ≥ 6pp).<br>
-      <b>Sizing</b> = Tier base × Catalyst (100/70/40%) × Liquidity (100/85/50%). <b>Tier</b>: ≥24 = A · 18–23 = B · &lt;18 = PASS. Edge tags: TextRules · OracleResolution · TimeRepricing · Behavioral (nie standalone).
+      <b>CORE</b> (350 USDC · prahy: Politics/Macro/Time-Decay ≥ 9pp, Resolution/Dispute/Oracle ≥ 12.5pp) · <b>SANDBOX</b> (150 USDC · prah ≥ 6pp) · <b>NEAR-MISS</b> (do 1.5pp pod prahom alebo QS ≥ 14).<br>
+      <b>Sizing</b> = Tier base × Catalyst (100/70/40%) × Liquidity (100/85/50%). <b>Tier</b>: ≥24 = A · 17–23 = B · &lt;17 = PASS. Edge tags: TextRules · OracleResolution · TimeRepricing · Behavioral.
+      <b>Cenové pásma</b>: LOW (≤ 25¢) · MID (26–50¢) · HIGH (&gt; 50¢). Klikni na riadok pre <b>full agent output</b> (PDF v01 sek. 12).
     </div>
+
+    <div class="controls" style="margin:8px 0 14px 0;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+      <span class="small" style="color:#555;font-weight:600;">Filtre:</span>
+      <button class="v11-chip v11-chip-on" data-band-filter="ALL">Všetky pásma</button>
+      <button class="v11-chip" data-band-filter="LOW">LOW ≤ 25¢</button>
+      <button class="v11-chip" data-band-filter="MID">MID 26–50¢</button>
+      <button class="v11-chip" data-band-filter="HIGH">HIGH &gt; 50¢</button>
+      <span style="width:14px;"></span>
+      <button class="v11-chip v11-chip-on" data-type-filter="ALL">Všetky typy</button>
+      <button class="v11-chip" data-type-filter="Politics">Politics</button>
+      <button class="v11-chip" data-type-filter="Elections">Elections</button>
+      <button class="v11-chip" data-type-filter="Macro">Macro</button>
+      <button class="v11-chip" data-type-filter="Resolution">Resolution</button>
+      <button class="v11-chip" data-type-filter="Dispute">Dispute</button>
+      <button class="v11-chip" data-type-filter="TimeDecay">TimeDecay</button>
+      <button class="v11-chip" data-type-filter="Behavioral">Behavioral</button>
+    </div>
+
     <div style="margin-bottom:14px;">
       <h3 style="margin:6px 0;color:#1a4d8c;">CORE BOOK <span class="small" style="font-weight:400;">— jasné pravidlá + edge ≥ core prah</span></h3>
       <div id="v9CoreBox">Načítava sa...</div>
@@ -4291,9 +4602,13 @@ def dashboard():
       <h3 style="margin:6px 0;color:#8c6a1a;">SANDBOX BOOK <span class="small" style="font-weight:400;">— learning, menší sizing, kratsi leash</span></h3>
       <div id="v9SandboxBox">Načítava sa...</div>
     </div>
-    <div>
+    <div style="margin-bottom:14px;">
       <h3 style="margin:6px 0;color:#666;">WAIT — zadaj limit a počkaj <span class="small" style="font-weight:400;">— taker cena nestačí, ale na bid stacku by edge prehnal prah</span></h3>
       <div id="v9WaitBox">Načítava sa...</div>
+    </div>
+    <div>
+      <h3 style="margin:6px 0;color:#6b2c91;">NEAR-MISS / Discovery <span class="small" style="font-weight:400;">— markety ktoré tesne minuli hard gate (default = PASS, ale môžu nájdené byť ručné setupy)</span></h3>
+      <div id="v9NearMissBox">Načítava sa...</div>
     </div>
   </div>
 
@@ -5433,7 +5748,7 @@ def dashboard():
     function v11QSBar(qs) {{
       if (!qs || qs.total == null) return '-';
       const total = qs.total;
-      const color = total >= 24 ? '#0a6f3d' : (total >= 18 ? '#1a4d8c' : '#a0431a');
+      const color = total >= 24 ? '#0a6f3d' : (total >= 17 ? '#1a4d8c' : '#a0431a');
       return '<span style="font-weight:700;color:' + color + ';">' + total + '/30</span>';
     }}
     function v11EdgeTagsChips(tags) {{
@@ -5450,16 +5765,57 @@ def dashboard():
       }}).join('');
     }}
 
+    function v11PriceBandBadge(pb) {{
+      if (!pb) return '-';
+      const color = pb.color || '#888';
+      return '<span class="v11-band" style="background:' + color + ';">' + (pb.label || '-') + '</span>';
+    }}
+    function v11MarketTypeChip(mt) {{
+      if (!mt) return '-';
+      const map = {{ 'Politics':'#1a4d8c', 'Elections':'#0a6f3d', 'Macro':'#6b2c91', 'Resolution':'#a88010', 'Dispute':'#a0431a', 'TimeDecay':'#666', 'Behavioral':'#888', 'Other':'#999' }};
+      const c = map[mt] || '#666';
+      return '<span class="v11-band" style="background:' + c + ';">' + mt + '</span>';
+    }}
+    function v11AgentOutputPanel(ao) {{
+      if (!ao) return '<div class="small">Agent output nedostupný.</div>';
+      try {{
+        const json = JSON.stringify(ao, null, 2);
+        return '<div class="v11-agent-panel">' + json.replace(/</g,'&lt;') + '</div>';
+      }} catch (e) {{
+        return '<div class="small">Chyba pri rendrovani agent output: ' + e.message + '</div>';
+      }}
+    }}
+
+    // Global filter state (band + market type) — ovlada v9 sekcie
+    window.v11Filter = window.v11Filter || {{ band: 'ALL', type: 'ALL' }};
+    window.v11Cache = window.v11Cache || {{ core: [], sandbox: [], wait: [], nearMiss: [] }};
+
+    function v11RowPassesFilter(t) {{
+      const f = window.v11Filter;
+      if (f.band !== 'ALL') {{
+        const code = (t.priceBand && t.priceBand.code) || 'UNK';
+        if (code !== f.band) return false;
+      }}
+      if (f.type !== 'ALL') {{
+        const mt = t.marketType || 'Other';
+        if (mt !== f.type) return false;
+      }}
+      return true;
+    }}
+
     function v9RenderTable(rows, book) {{
-      if (!rows || rows.length === 0) {{
-        return '<div class="small">Žiadny kandidát pre ' + book + ' BOOK (default = PASS).</div>';
+      const filtered = (rows || []).filter(v11RowPassesFilter);
+      if (filtered.length === 0) {{
+        if (!rows || rows.length === 0) return '<div class="small">Žiadny kandidát pre ' + book + ' BOOK (default = PASS).</div>';
+        return '<div class="small">Žiadny kandidát neprechádza aktívnymi filtrami (z ' + rows.length + ' celkovo). Skus zmenit pásmo alebo typ.</div>';
       }}
       let html = '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
       html += '<thead><tr style="background:#f0f0f0;text-align:left;">'
         + '<th style="padding:5px;">#</th>'
         + '<th style="padding:5px;">Tier</th>'
         + '<th style="padding:5px;">QS</th>'
-        + '<th style="padding:5px;">Score</th>'
+        + '<th style="padding:5px;">Typ</th>'
+        + '<th style="padding:5px;">Pásmo</th>'
         + '<th style="padding:5px;">Market</th>'
         + '<th style="padding:5px;">Edge tags</th>'
         + '<th style="padding:5px;">Smer</th>'
@@ -5470,7 +5826,7 @@ def dashboard():
         + '<th style="padding:5px;">EV den.</th>'
         + '<th style="padding:5px;">Dni</th>'
         + '<th style="padding:5px;">Link</th></tr></thead><tbody>';
-      rows.forEach(function(t, i) {{
+      filtered.forEach(function(t, i) {{
         const ep = t.executionPlan || {{}};
         const he = t.hardEdge || {{}};
         const v11 = t.hybridV11 || {{}};
@@ -5483,11 +5839,13 @@ def dashboard():
         const q = (t.question || t.slug || '').replace(/</g,'&lt;');
         const evd = v11.evDensity || '-';
         const evColor = evd === 'high' ? '#0a6f3d' : (evd === 'medium' ? '#1a4d8c' : '#a0431a');
-        html += '<tr style="border-top:1px solid #e0e0e0;">';
+        const rowId = 'v11row-' + book + '-' + i;
+        html += '<tr class="v11-row" data-row-id="' + rowId + '" data-slug="' + (t.slug||'') + '">';
         html += '<td style="padding:5px;">' + (i+1) + '</td>';
         html += '<td style="padding:5px;">' + v11TierBadge(v11.tier) + '</td>';
         html += '<td style="padding:5px;">' + v11QSBar(v11.qualityScore) + '</td>';
-        html += '<td style="padding:5px;font-weight:600;">' + t.candidateScore + '</td>';
+        html += '<td style="padding:5px;">' + v11MarketTypeChip(t.marketType) + '</td>';
+        html += '<td style="padding:5px;">' + v11PriceBandBadge(t.priceBand) + '</td>';
         html += '<td style="padding:5px;max-width:280px;">' + q + '</td>';
         html += '<td style="padding:5px;">' + v11EdgeTagsChips(v11.edgeTags) + '</td>';
         html += '<td style="padding:5px;">' + (t.finalDecision || '-') + '</td>';
@@ -5497,6 +5855,61 @@ def dashboard():
         html += '<td style="padding:5px;">' + stake + ' USDC</td>';
         html += '<td style="padding:5px;color:' + evColor + ';font-weight:600;">' + evd + '</td>';
         html += '<td style="padding:5px;">' + days + '</td>';
+        html += '<td style="padding:5px;"><a href="' + url + '" target="_blank" rel="noopener" onclick="event.stopPropagation();">link</a></td>';
+        html += '</tr>';
+        // hidden expand row with agent output
+        html += '<tr id="' + rowId + '-expand" style="display:none;" class="v11-agent-row"><td colspan="15" style="padding:0;">' + v11AgentOutputPanel(t.agentOutput) + '</td></tr>';
+      }});
+      html += '</tbody></table>';
+      return html;
+    }}
+
+    function v9RenderNearMissTable(rows) {{
+      const filtered = (rows || []).filter(v11RowPassesFilter);
+      if (filtered.length === 0) {{
+        if (!rows || rows.length === 0) return '<div class="small">Žiadne near-miss markety. Všetky PASS markety boli mimo discovery tolerancie.</div>';
+        return '<div class="small">Aktivny filter skryl všetky near-miss kandidatov (' + rows.length + ' celkovo).</div>';
+      }}
+      let html = '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+      html += '<thead><tr style="background:#f5ecfb;text-align:left;">'
+        + '<th style="padding:5px;">#</th>'
+        + '<th style="padding:5px;">QS</th>'
+        + '<th style="padding:5px;">Typ</th>'
+        + '<th style="padding:5px;">Pásmo</th>'
+        + '<th style="padding:5px;">Market</th>'
+        + '<th style="padding:5px;">Smer</th>'
+        + '<th style="padding:5px;">Yes</th>'
+        + '<th style="padding:5px;">Eff. Edge</th>'
+        + '<th style="padding:5px;">Sand. prah</th>'
+        + '<th style="padding:5px;">Miss</th>'
+        + '<th style="padding:5px;">Likv.</th>'
+        + '<th style="padding:5px;">Dni</th>'
+        + '<th style="padding:5px;">Dôvod</th>'
+        + '<th style="padding:5px;">Link</th></tr></thead><tbody>';
+      filtered.forEach(function(t, i) {{
+        const url = t.polymarketUrl || ('https://polymarket.com/event/' + t.slug);
+        const q = (t.question || t.slug || '').replace(/</g,'&lt;');
+        const yes = t.yesPrice != null ? Number(t.yesPrice).toFixed(3) : '-';
+        const eff = t.effectiveEdgePp != null ? (Number(t.effectiveEdgePp).toFixed(1) + 'pp') : '-';
+        const sprah = t.sandboxPrahPp != null ? (Number(t.sandboxPrahPp).toFixed(1) + 'pp') : '-';
+        const miss = t.missEdgePp != null ? (Number(t.missEdgePp).toFixed(1) + 'pp') : '-';
+        const liq = t.liquidity != null ? Math.round(t.liquidity/1000) + 'k' : '-';
+        const days = t.daysToEnd != null ? (Number(t.daysToEnd).toFixed(0) + 'd') : '-';
+        const qsColor = t.qualityScoreTotal >= 17 ? '#1a4d8c' : '#6b2c91';
+        html += '<tr>';
+        html += '<td style="padding:5px;">' + (i+1) + '</td>';
+        html += '<td style="padding:5px;font-weight:700;color:' + qsColor + ';">' + (t.qualityScoreTotal||0) + '/30</td>';
+        html += '<td style="padding:5px;">' + v11MarketTypeChip(t.marketType) + '</td>';
+        html += '<td style="padding:5px;">' + v11PriceBandBadge(t.priceBand) + '</td>';
+        html += '<td style="padding:5px;max-width:260px;">' + q + '</td>';
+        html += '<td style="padding:5px;">' + (t.finalDecision || '-') + '</td>';
+        html += '<td style="padding:5px;font-weight:600;">' + yes + '</td>';
+        html += '<td style="padding:5px;">' + eff + '</td>';
+        html += '<td style="padding:5px;color:#666;">' + sprah + '</td>';
+        html += '<td style="padding:5px;color:#a0431a;font-weight:600;">-' + miss + '</td>';
+        html += '<td style="padding:5px;">' + liq + '</td>';
+        html += '<td style="padding:5px;">' + days + '</td>';
+        html += '<td style="padding:5px;font-size:11px;color:#555;">' + (t.missReason || '-') + '</td>';
         html += '<td style="padding:5px;"><a href="' + url + '" target="_blank" rel="noopener">link</a></td>';
         html += '</tr>';
       }});
@@ -5504,20 +5917,62 @@ def dashboard():
       return html;
     }}
 
+    function v11RenderAllSections() {{
+      const coreBox = document.getElementById('v9CoreBox');
+      const sbBox = document.getElementById('v9SandboxBox');
+      const waitBox = document.getElementById('v9WaitBox');
+      const nmBox = document.getElementById('v9NearMissBox');
+      const c = window.v11Cache || {{}};
+      const meta = window.v11Meta || {{}};
+      const th = meta.thresholds || {{}};
+      if (coreBox) coreBox.innerHTML = v9RenderTable(c.core || [], 'CORE') + '<div class="small" style="margin-top:6px;color:#666;">Total CORE: ' + (meta.totalCore||0) + ' · prah ≥ ' + th.core_momentum_pp + 'pp / Dispute ≥ ' + th.core_resolution_pp + 'pp · klik na riadok = full agent output</div>';
+      if (sbBox) sbBox.innerHTML = v9RenderTable(c.sandbox || [], 'SANDBOX') + '<div class="small" style="margin-top:6px;color:#666;">Total SANDBOX: ' + (meta.totalSandbox||0) + ' · prah ≥ ' + th.sandbox_pp + 'pp · max 15 USDC/trade</div>';
+      if (waitBox) waitBox.innerHTML = v9RenderTable(c.wait || [], 'WAIT') + '<div class="small" style="margin-top:6px;color:#666;">Total WAIT: ' + (meta.totalWait||0) + ' · zadaj limit @ „BUY limit“ a počkaj na fill</div>';
+      if (nmBox) {{
+        const cfg = meta.nearMissConfig || {{}};
+        nmBox.innerHTML = v9RenderNearMissTable(c.nearMiss || []) + '<div class="small" style="margin-top:6px;color:#666;">Total NEAR-MISS: ' + (meta.totalNearMiss||0) + ' · tolerancia: do ' + (cfg.edgeTolerancePp||0) + 'pp pod sandbox prahom alebo QS ≥ ' + (cfg.qsMin||0) + ' · max zobrazene: ' + (cfg.maxRows||0) + ' · generated ' + ((meta.generatedAt||'').slice(0,19)) + 'Z</div>';
+      }}
+      // Wire-up row click expand
+      document.querySelectorAll('.v11-row').forEach(function(tr) {{
+        tr.addEventListener('click', function() {{
+          const rid = tr.getAttribute('data-row-id');
+          const ex = document.getElementById(rid + '-expand');
+          if (ex) ex.style.display = (ex.style.display === 'none' ? 'table-row' : 'none');
+        }});
+      }});
+    }}
+
+    function v11WireFilterChips() {{
+      document.querySelectorAll('[data-band-filter]').forEach(function(btn) {{
+        btn.addEventListener('click', function() {{
+          const v = btn.getAttribute('data-band-filter');
+          window.v11Filter.band = v;
+          document.querySelectorAll('[data-band-filter]').forEach(function(b) {{ b.classList.toggle('v11-chip-on', b.getAttribute('data-band-filter') === v); }});
+          v11RenderAllSections();
+        }});
+      }});
+      document.querySelectorAll('[data-type-filter]').forEach(function(btn) {{
+        btn.addEventListener('click', function() {{
+          const v = btn.getAttribute('data-type-filter');
+          window.v11Filter.type = v;
+          document.querySelectorAll('[data-type-filter]').forEach(function(b) {{ b.classList.toggle('v11-chip-on', b.getAttribute('data-type-filter') === v); }});
+          v11RenderAllSections();
+        }});
+      }});
+    }}
+
     async function loadV9() {{
       const coreBox = document.getElementById('v9CoreBox');
       const sbBox = document.getElementById('v9SandboxBox');
       if (!coreBox || !sbBox) return;
       try {{
-        const res = await fetch('/candidates/v9?limit_core=5&limit_sandbox=5');
+        const res = await fetch('/candidates/v9?limit_core=8&limit_sandbox=8');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const d = await res.json();
-        coreBox.innerHTML = v9RenderTable(d.core || [], 'CORE') + '<div class="small" style="margin-top:6px;color:#666;">Total CORE: ' + (d.totalCore||0) + ' · prah ≥ ' + (d.thresholds||{{}}).core_momentum_pp + 'pp / Dispute ≥ ' + (d.thresholds||{{}}).core_resolution_pp + 'pp</div>';
-        sbBox.innerHTML = v9RenderTable(d.sandbox || [], 'SANDBOX') + '<div class="small" style="margin-top:6px;color:#666;">Total SANDBOX: ' + (d.totalSandbox||0) + ' · prah ≥ ' + (d.thresholds||{{}}).sandbox_pp + 'pp · max 15 USDC/trade</div>';
-        const waitBox = document.getElementById('v9WaitBox');
-        if (waitBox) {{
-          waitBox.innerHTML = v9RenderTable(d.wait || [], 'WAIT') + '<div class="small" style="margin-top:6px;color:#666;">Total WAIT: ' + (d.totalWait||0) + ' · zadaj limit @ „BUY limit“ a počkaj na fill · generated ' + (d.generatedAt || '').slice(0,19) + 'Z</div>';
-        }}
+        window.v11Cache = {{ core: d.core || [], sandbox: d.sandbox || [], wait: d.wait || [], nearMiss: d.nearMiss || [] }};
+        window.v11Meta = {{ totalCore: d.totalCore, totalSandbox: d.totalSandbox, totalWait: d.totalWait, totalNearMiss: d.totalNearMiss, thresholds: d.thresholds || {{}}, nearMissConfig: d.nearMissConfig || {{}}, generatedAt: d.generatedAt || '' }};
+        v11RenderAllSections();
+        if (!window.v11ChipsWired) {{ v11WireFilterChips(); window.v11ChipsWired = true; }}
       }} catch (err) {{
         coreBox.innerHTML = '<div class="small">Nepodarilo sa načítať v9 kandidátov: ' + err.message + '</div>';
         sbBox.innerHTML = '';
