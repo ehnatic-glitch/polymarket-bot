@@ -123,9 +123,9 @@ DATA_API_BASE = "https://data-api.polymarket.com"
 
 # === v11.0 SNIPER CONFIG (Hybrid AI Agent — PDF v01 = C1-2 + S1-4 + CH-5) ===
 APP_CONFIG = {
-    "dashboard_title": "Polymarket Sniper v11.1",  # Hybrid AI Agent + Discovery / Near-miss vrstva
+    "dashboard_title": "Polymarket Sniper v11.2",  # Lean UI: 1 tabulka s tabmi + 7 stlpcov
     "default_min_liquidity": 100000.0,
-    "system_version": "v11.1",
+    "system_version": "v11.2",
     # v11 Quality Score thresholdy (PDF v01 sek 6: bodovanie 0–5 za 6 faktorov, spolu 0–30)
     "qs_tier_a_min": 24,        # ≥ 24 → Tier A (agresívny sizing)
     "qs_tier_b_min": 17,        # 17–23 → Tier B (v11.1 relax z 18→17 pre viac príležitostí, PDF tolerancia)
@@ -4392,6 +4392,12 @@ def dashboard():
     .v11-agent-panel {{ background:#f8f9fb; border-left:3px solid #6b2c91; padding:10px 14px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11.5px; white-space:pre; overflow-x:auto; line-height:1.45; }}
     .v11-agent-row {{ background:#f8f9fb; }}
     .v11-band {{ display:inline-block; padding:1px 6px; border-radius:8px; font-size:10.5px; font-weight:700; color:#fff; }}
+    .v11-tab {{ background:transparent; border:0; border-bottom:3px solid transparent; padding:8px 14px; cursor:pointer; font-size:13px; font-weight:600; color:#666; margin-right:4px; }}
+    .v11-tab:hover {{ color:#1a4d8c; }}
+    .v11-tab.v11-tab-on {{ color:#1a4d8c; border-bottom-color:#1a4d8c; }}
+    .v11-tab-count {{ display:inline-block; background:#e8eef5; color:#1a4d8c; font-size:10.5px; font-weight:700; padding:1px 6px; border-radius:8px; margin-left:5px; }}
+    .v11-tab.v11-tab-on .v11-tab-count {{ background:#1a4d8c; color:#fff; }}
+    .v11-mini-line {{ font-size:10.5px; color:#888; margin-top:1px; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 12.5px; table-layout: fixed; }}
     th, td {{ padding: 5px 6px; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }}
     th {{ background: #fafafa; font-weight: 700; position: sticky; top: 0; z-index: 1; }}
@@ -4560,7 +4566,7 @@ def dashboard():
   <div class="header-strip">
     <div class="header-left">
       <h1>{title}</h1>
-      <p class="small">v11.1 (Hybrid AI Agent + Discovery): Default = PASS · CORE 350 / SANDBOX 150 · Quality Score 0–30 · Tier A/B/C · Edge tags · Free-Roll · Cenové pásma + Near-miss vrstva.</p>
+      <p class="small">v11.2 Lean · CORE 350 / SANDBOX 150 · default = PASS · klik na riadok = full agent output.</p>
     </div>
     <div class="header-right">
       <div class="status-card" id="statusLine">Dashboard sa inicializuje...</div>
@@ -4570,129 +4576,53 @@ def dashboard():
 
 
   <div class="section" id="v9Section">
-    <h2>Sniper v11.1 — CORE + SANDBOX kandidáti <span class="small" style="font-weight:400;color:#666;">· Hybrid AI Agent + Discovery</span></h2>
-    <div class="small" style="margin-bottom:8px;color:#666;">
-      <b>CORE</b> (350 USDC · prahy: Politics/Macro/Time-Decay ≥ 9pp, Resolution/Dispute/Oracle ≥ 12.5pp) · <b>SANDBOX</b> (150 USDC · prah ≥ 6pp) · <b>NEAR-MISS</b> (do 1.5pp pod prahom alebo QS ≥ 14).<br>
-      <b>Sizing</b> = Tier base × Catalyst (100/70/40%) × Liquidity (100/85/50%). <b>Tier</b>: ≥24 = A · 17–23 = B · &lt;17 = PASS. Edge tags: TextRules · OracleResolution · TimeRepricing · Behavioral.
-      <b>Cenové pásma</b>: LOW (≤ 25¢) · MID (26–50¢) · HIGH (&gt; 50¢). Klikni na riadok pre <b>full agent output</b> (PDF v01 sek. 12).
+    <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:10px;margin-bottom:10px;">
+      <h2 style="margin:0;">Sniper v11.2 — Kandidáti</h2>
+      <details class="small" style="color:#666;"><summary style="cursor:pointer;font-weight:600;">Pravidlá a prahy</summary>
+        <div style="margin-top:6px;line-height:1.55;">
+          <b>CORE</b> 350 USDC · Politics/Macro/Time-Decay ≥ 9pp, Resolution/Dispute/Oracle ≥ 12.5pp · max 70/trade · max 3 poz. · max 2 nové/deň.<br>
+          <b>SANDBOX</b> 150 USDC · prah ≥ 6pp · max 15/trade · max 4 poz.<br>
+          <b>NEAR-MISS</b> discovery: do 1.5pp pod prahom alebo QS ≥ 14 — default PASS, viditeľné ako kandidáti.<br>
+          <b>Sizing</b> = Tier base × Catalyst (100/70/40%) × Liquidity (100/85/50%). <b>Tier</b>: QS ≥ 24 = A · 17–23 = B · &lt;17 = PASS.<br>
+          <b>Edge tags</b>: TextRules · OracleResolution · TimeRepricing · Behavioral (max 2). <b>Pásma</b>: LOW ≤ 25¢ · MID 26–50¢ · HIGH &gt; 50¢.<br>
+          Klik na riadok = <b>full agent output JSON</b> (PDF v01 sek. 12) v expand panely.
+        </div>
+      </details>
     </div>
 
-    <div class="controls" style="margin:8px 0 14px 0;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
-      <span class="small" style="color:#555;font-weight:600;">Filtre:</span>
-      <button class="v11-chip v11-chip-on" data-band-filter="ALL">Všetky pásma</button>
-      <button class="v11-chip" data-band-filter="LOW">LOW ≤ 25¢</button>
-      <button class="v11-chip" data-band-filter="MID">MID 26–50¢</button>
-      <button class="v11-chip" data-band-filter="HIGH">HIGH &gt; 50¢</button>
-      <span style="width:14px;"></span>
-      <button class="v11-chip v11-chip-on" data-type-filter="ALL">Všetky typy</button>
-      <button class="v11-chip" data-type-filter="Politics">Politics</button>
-      <button class="v11-chip" data-type-filter="Elections">Elections</button>
-      <button class="v11-chip" data-type-filter="Macro">Macro</button>
-      <button class="v11-chip" data-type-filter="Resolution">Resolution</button>
-      <button class="v11-chip" data-type-filter="Dispute">Dispute</button>
-      <button class="v11-chip" data-type-filter="TimeDecay">TimeDecay</button>
-      <button class="v11-chip" data-type-filter="Behavioral">Behavioral</button>
+    <div class="controls" style="margin:0 0 12px 0;display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end;">
+      <div class="control" style="min-width:0;">
+        <label>Pásmo</label>
+        <select id="v11BandSelect">
+          <option value="ALL" selected>Všetky pásma</option>
+          <option value="LOW">LOW ≤ 25¢</option>
+          <option value="MID">MID 26–50¢</option>
+          <option value="HIGH">HIGH &gt; 50¢</option>
+        </select>
+      </div>
+      <div class="control" style="min-width:0;">
+        <label>Typ trhu</label>
+        <select id="v11TypeSelect">
+          <option value="ALL" selected>Všetky typy</option>
+          <option value="Politics">Politics</option>
+          <option value="Elections">Elections</option>
+          <option value="Macro">Macro</option>
+          <option value="Resolution">Resolution</option>
+          <option value="Dispute">Dispute</option>
+          <option value="TimeDecay">TimeDecay</option>
+          <option value="Behavioral">Behavioral</option>
+        </select>
+      </div>
     </div>
 
-    <div style="margin-bottom:14px;">
-      <h3 style="margin:6px 0;color:#1a4d8c;">CORE BOOK <span class="small" style="font-weight:400;">— jasné pravidlá + edge ≥ core prah</span></h3>
-      <div id="v9CoreBox">Načítava sa...</div>
+    <div class="v11-tabs" id="v11Tabs" style="display:flex;gap:0;border-bottom:2px solid #e0e3e7;margin-bottom:10px;">
+      <button class="v11-tab v11-tab-on" data-tab="core">CORE <span class="v11-tab-count" id="v11TabCountCore">0</span></button>
+      <button class="v11-tab" data-tab="sandbox">SANDBOX <span class="v11-tab-count" id="v11TabCountSandbox">0</span></button>
+      <button class="v11-tab" data-tab="wait">WAIT <span class="v11-tab-count" id="v11TabCountWait">0</span></button>
+      <button class="v11-tab" data-tab="nearmiss">NEAR-MISS <span class="v11-tab-count" id="v11TabCountNm">0</span></button>
     </div>
-    <div style="margin-bottom:14px;">
-      <h3 style="margin:6px 0;color:#8c6a1a;">SANDBOX BOOK <span class="small" style="font-weight:400;">— learning, menší sizing, kratsi leash</span></h3>
-      <div id="v9SandboxBox">Načítava sa...</div>
-    </div>
-    <div style="margin-bottom:14px;">
-      <h3 style="margin:6px 0;color:#666;">WAIT — zadaj limit a počkaj <span class="small" style="font-weight:400;">— taker cena nestačí, ale na bid stacku by edge prehnal prah</span></h3>
-      <div id="v9WaitBox">Načítava sa...</div>
-    </div>
-    <div>
-      <h3 style="margin:6px 0;color:#6b2c91;">NEAR-MISS / Discovery <span class="small" style="font-weight:400;">— markety ktoré tesne minuli hard gate (default = PASS, ale môžu nájdené byť ručné setupy)</span></h3>
-      <div id="v9NearMissBox">Načítava sa...</div>
-    </div>
+    <div id="v11TabBox">Načítava sa...</div>
   </div>
-
-  <details class="section" id="explorerSection">
-    <summary style="cursor:pointer;font-size:1.05em;font-weight:700;padding:6px 0;">Prieskumník — Top kandidáti <span class="small" style="font-weight:400;color:#666;">(klikni pre rozbalenie)</span></summary>
-
-    <div class="controls" style="margin-top:10px;">
-      <div class="control">
-        <label for="category">Kategória</label>
-        <select id="category">
-          <option value="">Všetko</option>
-          <option value="Sports">Šport</option>
-          <option value="Politics">Politika</option>
-          <option value="Crypto">Krypto</option>
-          <option value="Geopolitics">Geopolitika</option>
-          <option value="Narrative">Naratív</option>
-          <option value="Other">Ostatné</option>
-        </select>
-      </div>
-
-      <div class="control">
-        <label for="minLiquidity">Min likvidita</label>
-        <select id="minLiquidity">
-          <option value="50000">50 000</option>
-          <option value="100000" {"selected" if default_min_liquidity == 100000 else ""}>100 000</option>
-          <option value="150000">150 000</option>
-          <option value="250000">250 000</option>
-        </select>
-      </div>
-
-      <div class="control">
-        <label for="whaleMin">Whale min cash</label>
-        <select id="whaleMin">
-          <option value="100000">100 000</option>
-          <option value="200000" selected>200 000</option>
-          <option value="300000">300 000</option>
-          <option value="500000">500 000</option>
-        </select>
-      </div>
-
-      <div class="checkbox-wrap">
-        <input type="checkbox" id="hidePass" checked />
-        <label for="hidePass">Skryť PASS</label>
-      </div>
-
-      <div class="checkbox-wrap">
-        <input type="checkbox" id="watchlistOnly" />
-        <label for="watchlistOnly">Len watchlist</label>
-      </div>
-
-      <div class="control">
-        <button id="refreshBtn">Obnoviť</button>
-      </div>
-    </div>
-
-    <div class="count" id="countBox"></div>
-    <div id="markets-error" class="error" style="display:none;"></div>
-
-    <div class="table-wrap">
-      <table id="markets-table">
-        <thead>
-          <tr>
-            <th>Kandidát</th>
-            <th>Rozhod.</th>
-            <th>Entry zóna</th>
-            <th>Gate</th>
-            <th>Skóre</th>
-            <th>Frikcia</th>
-            <th>Exit</th>
-            <th>Typ</th>
-            <th>Kat.</th>
-            <th>Oracle</th>
-            <th>Otázka</th>
-            <th>Yes</th>
-            <th>No</th>
-            <th>24h</th>
-            <th>Likv.</th>
-            <th>Dni</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-    </div>
-  </details>
 
   <div id="detailPanel">
     <div class="section">
@@ -4701,28 +4631,31 @@ def dashboard():
     </div>
   </div>
 
-  <div class="top-strip">
-    <div class="top-left-stack">
-      <div class="section compact-section">
-        <h2>Watchlist &amp; Alerty <span class="small" style="font-weight:400;color:#666;">— alerty sú trigger nad watchlistom</span></h2>
-        <div style="margin-bottom:8px;">
-          <div class="small" style="color:#666;font-weight:600;margin-bottom:4px;">Alerty</div>
-          <div id="alertsBox" class="panel-muted compact-box">Zatiaľ bez alertov.</div>
-        </div>
-        <div>
-          <div class="small" style="color:#666;font-weight:600;margin-bottom:4px;">Watchlist</div>
-          <div id="watchlistBox" class="panel-muted compact-box">Načítavam watchlist...</div>
+  <details class="section" id="sidePanelsSection">
+    <summary style="cursor:pointer;font-size:1.05em;font-weight:700;padding:6px 0;">Watchlist, Alerty &amp; Whale signal <span class="small" style="font-weight:400;color:#666;">(klikni pre rozbalenie)</span></summary>
+    <div class="top-strip" style="margin-top:10px;">
+      <div class="top-left-stack">
+        <div class="section compact-section" style="margin:0;">
+          <h3 style="margin:0 0 8px 0;">Watchlist &amp; Alerty <span class="small" style="font-weight:400;color:#666;">— alerty sú trigger nad watchlistom</span></h3>
+          <div style="margin-bottom:8px;">
+            <div class="small" style="color:#666;font-weight:600;margin-bottom:4px;">Alerty</div>
+            <div id="alertsBox" class="panel-muted compact-box">Zatiaľ bez alertov.</div>
+          </div>
+          <div>
+            <div class="small" style="color:#666;font-weight:600;margin-bottom:4px;">Watchlist</div>
+            <div id="watchlistBox" class="panel-muted compact-box">Načítavam watchlist...</div>
+          </div>
         </div>
       </div>
+      <div class="section compact-section" style="margin:0;">
+        <h3 style="margin:0 0 8px 0;">Whale / Flow signal <span class="small" style="font-weight:400;">— vybraný market</span></h3>
+        <div id="whaleSignalBox" class="panel-muted compact-box">Vyber market v tabuľke pre zobrazenie whale obchodov.</div>
+      </div>
     </div>
-    <div class="section compact-section">
-      <h2>Whale / Flow signal <span class="small" style="font-weight:400;">— vybraný market</span></h2>
-      <div id="whaleSignalBox" class="panel-muted compact-box">Vyber market v tabuľke pre zobrazenie whale obchodov.</div>
-    </div>
-  </div>
+  </details>
 
-  <div class="section">
-    <h2>Globálny whale flow <span class="small" style="font-weight:400;">— top obchody naprieč Polymarket, len prebiehajúce trhy</span></h2>
+  <details class="section" id="globalWhaleSection">
+    <summary style="cursor:pointer;font-size:1.05em;font-weight:700;padding:6px 0;">Globálny whale flow <span class="small" style="font-weight:400;color:#666;">— top obchody naprieč Polymarket (klikni pre rozbalenie)</span></summary>
     <div class="controls" style="margin-bottom:8px;">
       <div class="control">
         <label for="whaleMinAmount">Min USDC</label>
@@ -4744,7 +4677,7 @@ def dashboard():
       </div>
     </div>
     <div id="globalWhaleBox" class="panel-muted compact-box">Načítavam globálny whale flow...</div>
-  </div>
+  </details>
 
 
   <script>
@@ -5803,137 +5736,142 @@ def dashboard():
       return true;
     }}
 
-    function v9RenderTable(rows, book) {{
+    // === v11.2 Lean: 1 tabulka s tabmi (CORE/SANDBOX/WAIT/NEAR-MISS) + 7 stlpcov ===
+
+    function v11ShortText(s, n) {{
+      if (!s) return '';
+      const t = String(s).replace(/</g,'&lt;');
+      return t.length <= n ? t : (t.slice(0, n-1) + '…');
+    }}
+
+    function v11RenderRowsTable(rows, book) {{
+      // book ∈ {{ 'core', 'sandbox', 'wait', 'nearmiss' }}
       const filtered = (rows || []).filter(v11RowPassesFilter);
       if (filtered.length === 0) {{
-        if (!rows || rows.length === 0) return '<div class="small">Žiadny kandidát pre ' + book + ' BOOK (default = PASS).</div>';
-        return '<div class="small">Žiadny kandidát neprechádza aktívnymi filtrami (z ' + rows.length + ' celkovo). Skus zmenit pásmo alebo typ.</div>';
+        if (!rows || rows.length === 0) {{
+          return '<div class="small" style="padding:14px 4px;">Žiadny kandidát v tomto tabe (default = PASS).</div>';
+        }}
+        return '<div class="small" style="padding:14px 4px;">Filtre skryli všetkých kandidátov (z ' + rows.length + ' celkovo). Skús zmeniť pásmo alebo typ.</div>';
       }}
-      let html = '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
-      html += '<thead><tr style="background:#f0f0f0;text-align:left;">'
-        + '<th style="padding:5px;">#</th>'
-        + '<th style="padding:5px;">Tier</th>'
-        + '<th style="padding:5px;">QS</th>'
-        + '<th style="padding:5px;">Typ</th>'
-        + '<th style="padding:5px;">Pásmo</th>'
-        + '<th style="padding:5px;">Market</th>'
-        + '<th style="padding:5px;">Edge tags</th>'
-        + '<th style="padding:5px;">Smer</th>'
-        + '<th style="padding:5px;">Taker</th>'
-        + '<th style="padding:5px;">Eff. Edge</th>'
-        + '<th style="padding:5px;">BUY limit</th>'
-        + '<th style="padding:5px;">Stake</th>'
-        + '<th style="padding:5px;">EV den.</th>'
-        + '<th style="padding:5px;">Dni</th>'
-        + '<th style="padding:5px;">Link</th></tr></thead><tbody>';
+      const isNm = (book === 'nearmiss');
+      let html = '<table style="width:100%;border-collapse:collapse;font-size:12.5px;">';
+      html += '<thead><tr style="background:#fafafa;text-align:left;border-bottom:2px solid #e0e3e7;">'
+        + '<th style="padding:7px 6px;width:38%;">Trh</th>'
+        + '<th style="padding:7px 6px;width:14%;">Smer · Edge</th>'
+        + '<th style="padding:7px 6px;width:14%;">' + (isNm ? 'Yes · Miss' : 'Limit · Stake') + '</th>'
+        + '<th style="padding:7px 6px;width:16%;">QS · Tier · Pásmo</th>'
+        + '<th style="padding:7px 6px;width:8%;">Dni</th>'
+        + '<th style="padding:7px 6px;width:6%;">↗</th></tr></thead><tbody>';
       filtered.forEach(function(t, i) {{
         const ep = t.executionPlan || {{}};
         const he = t.hardEdge || {{}};
         const v11 = t.hybridV11 || {{}};
-        const taker = ep.effectivePrice != null ? Number(ep.effectivePrice).toFixed(3) : '-';
-        const buyAt = ep.buyLimitPrice != null ? Number(ep.buyLimitPrice).toFixed(3) : '-';
-        const stake = ep.stakeUSDC != null ? ep.stakeUSDC : '-';
-        const effEdge = he.effectiveEdgePp != null ? (Number(he.effectiveEdgePp).toFixed(1) + 'pp') : '-';
-        const days = t.daysToEnd != null ? (Number(t.daysToEnd).toFixed(0) + 'd') : '-';
         const url = t.polymarketUrl || ('https://polymarket.com/event/' + t.slug);
-        const q = (t.question || t.slug || '').replace(/</g,'&lt;');
-        const evd = v11.evDensity || '-';
-        const evColor = evd === 'high' ? '#0a6f3d' : (evd === 'medium' ? '#1a4d8c' : '#a0431a');
+        const q = v11ShortText(t.question || t.slug || '', 120);
+        const days = t.daysToEnd != null ? (Number(t.daysToEnd).toFixed(0) + 'd') : '-';
         const rowId = 'v11row-' + book + '-' + i;
-        html += '<tr class="v11-row" data-row-id="' + rowId + '" data-slug="' + (t.slug||'') + '">';
-        html += '<td style="padding:5px;">' + (i+1) + '</td>';
-        html += '<td style="padding:5px;">' + v11TierBadge(v11.tier) + '</td>';
-        html += '<td style="padding:5px;">' + v11QSBar(v11.qualityScore) + '</td>';
-        html += '<td style="padding:5px;">' + v11MarketTypeChip(t.marketType) + '</td>';
-        html += '<td style="padding:5px;">' + v11PriceBandBadge(t.priceBand) + '</td>';
-        html += '<td style="padding:5px;max-width:280px;">' + q + '</td>';
-        html += '<td style="padding:5px;">' + v11EdgeTagsChips(v11.edgeTags) + '</td>';
-        html += '<td style="padding:5px;">' + (t.finalDecision || '-') + '</td>';
-        html += '<td style="padding:5px;font-weight:600;">' + taker + '</td>';
-        html += '<td style="padding:5px;">' + effEdge + '</td>';
-        html += '<td style="padding:5px;font-weight:600;color:#0a6;">' + buyAt + '</td>';
-        html += '<td style="padding:5px;">' + stake + ' USDC</td>';
-        html += '<td style="padding:5px;color:' + evColor + ';font-weight:600;">' + evd + '</td>';
-        html += '<td style="padding:5px;">' + days + '</td>';
-        html += '<td style="padding:5px;"><a href="' + url + '" target="_blank" rel="noopener" onclick="event.stopPropagation();">link</a></td>';
+        const direction = (isNm ? (t.finalDecision || '-') : (t.finalDecision || '-'));
+        let edgeText, edgeColor;
+        if (isNm) {{
+          const eff = t.effectiveEdgePp != null ? Number(t.effectiveEdgePp).toFixed(1) : null;
+          edgeText = eff != null ? (eff + 'pp') : '-';
+          edgeColor = '#a0431a';
+        }} else {{
+          const eff = he.effectiveEdgePp != null ? Number(he.effectiveEdgePp).toFixed(1) : null;
+          edgeText = eff != null ? ('+' + eff + 'pp') : '-';
+          edgeColor = (eff != null && parseFloat(eff) >= 0) ? '#0a6f3d' : '#a0431a';
+        }}
+        let priceCellHtml;
+        if (isNm) {{
+          const yes = t.yesPrice != null ? Number(t.yesPrice).toFixed(2) : '-';
+          const miss = t.missEdgePp != null ? Number(t.missEdgePp).toFixed(1) : null;
+          priceCellHtml = '<div style="font-weight:600;">' + yes + '</div><div class="v11-mini-line">miss ' + (miss != null ? '-' + miss + 'pp' : '-') + '</div>';
+        }} else {{
+          const buyAt = ep.buyLimitPrice != null ? Number(ep.buyLimitPrice).toFixed(2) : '-';
+          const stake = ep.stakeUSDC != null ? ep.stakeUSDC : '-';
+          priceCellHtml = '<div style="font-weight:600;color:#0a6;">@ ' + buyAt + '</div><div class="v11-mini-line">' + stake + ' USDC</div>';
+        }}
+        // QS / Tier / Pasmo combined
+        const qsTotal = (v11.qualityScore && v11.qualityScore.total != null) ? v11.qualityScore.total : (t.qualityScoreTotal || '-');
+        const tier = v11.tier || (isNm ? 'PASS' : '-');
+        const tierBadgeHtml = v11TierBadge(tier);
+        const bandHtml = v11PriceBandBadge(t.priceBand);
+        const qsHtml = '<span style="font-weight:700;color:#1a4d8c;">' + qsTotal + '/30</span>';
+        const qsCellHtml = '<div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;">' + qsHtml + tierBadgeHtml + '</div><div style="margin-top:3px;">' + bandHtml + '</div>';
+        const trhCellHtml = '<div style="font-weight:600;line-height:1.3;">' + q + '</div><div style="margin-top:2px;">' + v11MarketTypeChip(t.marketType) + '</div>';
+        const dirCellHtml = '<div style="font-weight:600;font-size:11.5px;">' + direction + '</div><div style="color:' + edgeColor + ';font-weight:700;">' + edgeText + '</div>';
+        html += '<tr class="v11-row" data-row-id="' + rowId + '">';
+        html += '<td style="padding:7px 6px;">' + trhCellHtml + '</td>';
+        html += '<td style="padding:7px 6px;">' + dirCellHtml + '</td>';
+        html += '<td style="padding:7px 6px;">' + priceCellHtml + '</td>';
+        html += '<td style="padding:7px 6px;">' + qsCellHtml + '</td>';
+        html += '<td style="padding:7px 6px;">' + days + '</td>';
+        html += '<td style="padding:7px 6px;"><a href="' + url + '" target="_blank" rel="noopener" onclick="event.stopPropagation();" style="text-decoration:none;font-size:14px;">↗</a></td>';
         html += '</tr>';
-        // hidden expand row with agent output
-        html += '<tr id="' + rowId + '-expand" style="display:none;" class="v11-agent-row"><td colspan="15" style="padding:0;">' + v11AgentOutputPanel(t.agentOutput) + '</td></tr>';
+        // Expand row with agent output + extra detaily
+        const ao = t.agentOutput || null;
+        const taker = ep.effectivePrice != null ? Number(ep.effectivePrice).toFixed(3) : '-';
+        const evd = v11.evDensity || '-';
+        const tags = v11.edgeTags ? v11EdgeTagsChips(v11.edgeTags) : '-';
+        const extraHtml = '<div style="padding:8px 14px;background:#fff;border-bottom:1px solid #eee;font-size:11.5px;color:#555;">'
+          + '<b>Taker cena:</b> ' + taker + ' · <b>EV density:</b> <span style="color:' + (evd === 'high' ? '#0a6f3d' : evd === 'medium' ? '#1a4d8c' : '#a0431a') + ';font-weight:600;">' + evd + '</span> · <b>Edge tags:</b> ' + tags
+          + (isNm && t.missReason ? ' · <b>Dôvod miss:</b> ' + t.missReason : '')
+          + '</div>';
+        html += '<tr id="' + rowId + '-expand" style="display:none;" class="v11-agent-row"><td colspan="6" style="padding:0;">' + extraHtml + v11AgentOutputPanel(ao) + '</td></tr>';
       }});
       html += '</tbody></table>';
       return html;
     }}
 
-    function v9RenderNearMissTable(rows) {{
-      const filtered = (rows || []).filter(v11RowPassesFilter);
-      if (filtered.length === 0) {{
-        if (!rows || rows.length === 0) return '<div class="small">Žiadne near-miss markety. Všetky PASS markety boli mimo discovery tolerancie.</div>';
-        return '<div class="small">Aktivny filter skryl všetky near-miss kandidatov (' + rows.length + ' celkovo).</div>';
-      }}
-      let html = '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
-      html += '<thead><tr style="background:#f5ecfb;text-align:left;">'
-        + '<th style="padding:5px;">#</th>'
-        + '<th style="padding:5px;">QS</th>'
-        + '<th style="padding:5px;">Typ</th>'
-        + '<th style="padding:5px;">Pásmo</th>'
-        + '<th style="padding:5px;">Market</th>'
-        + '<th style="padding:5px;">Smer</th>'
-        + '<th style="padding:5px;">Yes</th>'
-        + '<th style="padding:5px;">Eff. Edge</th>'
-        + '<th style="padding:5px;">Sand. prah</th>'
-        + '<th style="padding:5px;">Miss</th>'
-        + '<th style="padding:5px;">Likv.</th>'
-        + '<th style="padding:5px;">Dni</th>'
-        + '<th style="padding:5px;">Dôvod</th>'
-        + '<th style="padding:5px;">Link</th></tr></thead><tbody>';
-      filtered.forEach(function(t, i) {{
-        const url = t.polymarketUrl || ('https://polymarket.com/event/' + t.slug);
-        const q = (t.question || t.slug || '').replace(/</g,'&lt;');
-        const yes = t.yesPrice != null ? Number(t.yesPrice).toFixed(3) : '-';
-        const eff = t.effectiveEdgePp != null ? (Number(t.effectiveEdgePp).toFixed(1) + 'pp') : '-';
-        const sprah = t.sandboxPrahPp != null ? (Number(t.sandboxPrahPp).toFixed(1) + 'pp') : '-';
-        const miss = t.missEdgePp != null ? (Number(t.missEdgePp).toFixed(1) + 'pp') : '-';
-        const liq = t.liquidity != null ? Math.round(t.liquidity/1000) + 'k' : '-';
-        const days = t.daysToEnd != null ? (Number(t.daysToEnd).toFixed(0) + 'd') : '-';
-        const qsColor = t.qualityScoreTotal >= 17 ? '#1a4d8c' : '#6b2c91';
-        html += '<tr>';
-        html += '<td style="padding:5px;">' + (i+1) + '</td>';
-        html += '<td style="padding:5px;font-weight:700;color:' + qsColor + ';">' + (t.qualityScoreTotal||0) + '/30</td>';
-        html += '<td style="padding:5px;">' + v11MarketTypeChip(t.marketType) + '</td>';
-        html += '<td style="padding:5px;">' + v11PriceBandBadge(t.priceBand) + '</td>';
-        html += '<td style="padding:5px;max-width:260px;">' + q + '</td>';
-        html += '<td style="padding:5px;">' + (t.finalDecision || '-') + '</td>';
-        html += '<td style="padding:5px;font-weight:600;">' + yes + '</td>';
-        html += '<td style="padding:5px;">' + eff + '</td>';
-        html += '<td style="padding:5px;color:#666;">' + sprah + '</td>';
-        html += '<td style="padding:5px;color:#a0431a;font-weight:600;">-' + miss + '</td>';
-        html += '<td style="padding:5px;">' + liq + '</td>';
-        html += '<td style="padding:5px;">' + days + '</td>';
-        html += '<td style="padding:5px;font-size:11px;color:#555;">' + (t.missReason || '-') + '</td>';
-        html += '<td style="padding:5px;"><a href="' + url + '" target="_blank" rel="noopener">link</a></td>';
-        html += '</tr>';
-      }});
-      html += '</tbody></table>';
-      return html;
+    // Active tab state
+    window.v11ActiveTab = window.v11ActiveTab || 'core';
+
+    function v11UpdateTabCounts() {{
+      const meta = window.v11Meta || {{}};
+      const c = window.v11Cache || {{}};
+      const totalFiltered = function(arr) {{ return (arr || []).filter(v11RowPassesFilter).length; }};
+      const counts = {{
+        core: totalFiltered(c.core),
+        sandbox: totalFiltered(c.sandbox),
+        wait: totalFiltered(c.wait),
+        nearmiss: totalFiltered(c.nearMiss),
+      }};
+      const setCount = function(id, v) {{ const el = document.getElementById(id); if (el) el.textContent = v; }};
+      setCount('v11TabCountCore', counts.core);
+      setCount('v11TabCountSandbox', counts.sandbox);
+      setCount('v11TabCountWait', counts.wait);
+      setCount('v11TabCountNm', counts.nearmiss);
     }}
 
-    function v11RenderAllSections() {{
-      const coreBox = document.getElementById('v9CoreBox');
-      const sbBox = document.getElementById('v9SandboxBox');
-      const waitBox = document.getElementById('v9WaitBox');
-      const nmBox = document.getElementById('v9NearMissBox');
+    function v11RenderActiveTab() {{
+      const box = document.getElementById('v11TabBox');
+      if (!box) return;
       const c = window.v11Cache || {{}};
       const meta = window.v11Meta || {{}};
       const th = meta.thresholds || {{}};
-      if (coreBox) coreBox.innerHTML = v9RenderTable(c.core || [], 'CORE') + '<div class="small" style="margin-top:6px;color:#666;">Total CORE: ' + (meta.totalCore||0) + ' · prah ≥ ' + th.core_momentum_pp + 'pp / Dispute ≥ ' + th.core_resolution_pp + 'pp · klik na riadok = full agent output</div>';
-      if (sbBox) sbBox.innerHTML = v9RenderTable(c.sandbox || [], 'SANDBOX') + '<div class="small" style="margin-top:6px;color:#666;">Total SANDBOX: ' + (meta.totalSandbox||0) + ' · prah ≥ ' + th.sandbox_pp + 'pp · max 15 USDC/trade</div>';
-      if (waitBox) waitBox.innerHTML = v9RenderTable(c.wait || [], 'WAIT') + '<div class="small" style="margin-top:6px;color:#666;">Total WAIT: ' + (meta.totalWait||0) + ' · zadaj limit @ „BUY limit“ a počkaj na fill</div>';
-      if (nmBox) {{
-        const cfg = meta.nearMissConfig || {{}};
-        nmBox.innerHTML = v9RenderNearMissTable(c.nearMiss || []) + '<div class="small" style="margin-top:6px;color:#666;">Total NEAR-MISS: ' + (meta.totalNearMiss||0) + ' · tolerancia: do ' + (cfg.edgeTolerancePp||0) + 'pp pod sandbox prahom alebo QS ≥ ' + (cfg.qsMin||0) + ' · max zobrazene: ' + (cfg.maxRows||0) + ' · generated ' + ((meta.generatedAt||'').slice(0,19)) + 'Z</div>';
+      const cfg = meta.nearMissConfig || {{}};
+      let rows, book, footer;
+      switch (window.v11ActiveTab) {{
+        case 'sandbox':
+          rows = c.sandbox || []; book = 'sandbox';
+          footer = 'Total SANDBOX: ' + (meta.totalSandbox || 0) + ' · prah ≥ ' + (th.sandbox_pp || '?') + 'pp · max 15 USDC/trade';
+          break;
+        case 'wait':
+          rows = c.wait || []; book = 'wait';
+          footer = 'Total WAIT: ' + (meta.totalWait || 0) + ' · zadaj limit @ „BUY limit" a počkaj na fill';
+          break;
+        case 'nearmiss':
+          rows = c.nearMiss || []; book = 'nearmiss';
+          footer = 'Total NEAR-MISS: ' + (meta.totalNearMiss || 0) + ' · tolerancia: do ' + (cfg.edgeTolerancePp || 0) + 'pp pod prahom alebo QS ≥ ' + (cfg.qsMin || 0) + ' · max ' + (cfg.maxRows || 0) + ' riadkov';
+          break;
+        default:
+          rows = c.core || []; book = 'core';
+          footer = 'Total CORE: ' + (meta.totalCore || 0) + ' · prah ≥ ' + (th.core_momentum_pp || '?') + 'pp (Politics/Macro/TimeDecay) / ≥ ' + (th.core_resolution_pp || '?') + 'pp (Resolution/Dispute/Oracle)';
       }}
+      box.innerHTML = v11RenderRowsTable(rows, book) + '<div class="small" style="margin-top:8px;color:#888;">' + footer + ' · generated ' + ((meta.generatedAt || '').slice(0, 19)) + 'Z</div>';
+      v11UpdateTabCounts();
       // Wire-up row click expand
-      document.querySelectorAll('.v11-row').forEach(function(tr) {{
+      box.querySelectorAll('.v11-row').forEach(function(tr) {{
         tr.addEventListener('click', function() {{
           const rid = tr.getAttribute('data-row-id');
           const ex = document.getElementById(rid + '-expand');
@@ -5943,39 +5881,36 @@ def dashboard():
     }}
 
     function v11WireFilterChips() {{
-      document.querySelectorAll('[data-band-filter]').forEach(function(btn) {{
+      // Tabs
+      document.querySelectorAll('.v11-tab').forEach(function(btn) {{
         btn.addEventListener('click', function() {{
-          const v = btn.getAttribute('data-band-filter');
-          window.v11Filter.band = v;
-          document.querySelectorAll('[data-band-filter]').forEach(function(b) {{ b.classList.toggle('v11-chip-on', b.getAttribute('data-band-filter') === v); }});
-          v11RenderAllSections();
+          const v = btn.getAttribute('data-tab');
+          if (!v) return;
+          window.v11ActiveTab = v;
+          document.querySelectorAll('.v11-tab').forEach(function(b) {{ b.classList.toggle('v11-tab-on', b.getAttribute('data-tab') === v); }});
+          v11RenderActiveTab();
         }});
       }});
-      document.querySelectorAll('[data-type-filter]').forEach(function(btn) {{
-        btn.addEventListener('click', function() {{
-          const v = btn.getAttribute('data-type-filter');
-          window.v11Filter.type = v;
-          document.querySelectorAll('[data-type-filter]').forEach(function(b) {{ b.classList.toggle('v11-chip-on', b.getAttribute('data-type-filter') === v); }});
-          v11RenderAllSections();
-        }});
-      }});
+      // Dropdowns
+      const bandSel = document.getElementById('v11BandSelect');
+      if (bandSel) bandSel.addEventListener('change', function() {{ window.v11Filter.band = bandSel.value; v11RenderActiveTab(); }});
+      const typeSel = document.getElementById('v11TypeSelect');
+      if (typeSel) typeSel.addEventListener('change', function() {{ window.v11Filter.type = typeSel.value; v11RenderActiveTab(); }});
     }}
 
     async function loadV9() {{
-      const coreBox = document.getElementById('v9CoreBox');
-      const sbBox = document.getElementById('v9SandboxBox');
-      if (!coreBox || !sbBox) return;
+      const box = document.getElementById('v11TabBox');
+      if (!box) return;
       try {{
-        const res = await fetch('/candidates/v9?limit_core=8&limit_sandbox=8');
+        const res = await fetch('/candidates/v9?limit_core=10&limit_sandbox=10');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const d = await res.json();
         window.v11Cache = {{ core: d.core || [], sandbox: d.sandbox || [], wait: d.wait || [], nearMiss: d.nearMiss || [] }};
         window.v11Meta = {{ totalCore: d.totalCore, totalSandbox: d.totalSandbox, totalWait: d.totalWait, totalNearMiss: d.totalNearMiss, thresholds: d.thresholds || {{}}, nearMissConfig: d.nearMissConfig || {{}}, generatedAt: d.generatedAt || '' }};
-        v11RenderAllSections();
+        v11RenderActiveTab();
         if (!window.v11ChipsWired) {{ v11WireFilterChips(); window.v11ChipsWired = true; }}
       }} catch (err) {{
-        coreBox.innerHTML = '<div class="small">Nepodarilo sa načítať v9 kandidátov: ' + err.message + '</div>';
-        sbBox.innerHTML = '';
+        box.innerHTML = '<div class="small" style="padding:14px 4px;">Nepodarilo sa načítať kandidátov: ' + err.message + '</div>';
       }}
     }}
 
@@ -6024,17 +5959,18 @@ def dashboard():
         const worstDd = ddCore < ddSb ? ddCore : ddSb;
         const streak = sb.lossStreak || 0;
 
+        // v11.2 Lean: 3 karty (CORE + drawdown sub, SANDBOX + loss streak sub, Global)
         const cards = [];
         const coreCls = kpiSeverityForPositions(core.openCount || 0, core.maxPositions || 3) || 'kpi-core';
-        cards.push('<div class="kpi-card ' + coreCls + '"><div class="kpi-label">CORE</div><div class="kpi-value">' + (core.openCount||0) + '/' + (core.maxPositions||3) + '</div><div class="kpi-sub">' + (core.exposureUsed||0) + ' / ' + (core.exposureMax||140) + ' USDC</div></div>');
-        const sbCls = kpiSeverityForPositions(sb.openCount || 0, sb.maxPositions || 4) || 'kpi-sandbox';
-        cards.push('<div class="kpi-card ' + sbCls + '"><div class="kpi-label">SANDBOX</div><div class="kpi-value">' + (sb.openCount||0) + '/' + (sb.maxPositions||4) + '</div><div class="kpi-sub">' + (sb.exposureUsed||0) + ' / ' + (sb.exposureMax||60) + ' USDC</div></div>');
-        const expCls = kpiSeverityForExposure(gl.exposureUsed || 0, gl.exposureMax || 200);
-        cards.push('<div class="kpi-card ' + expCls + '"><div class="kpi-label">Global Exposure</div><div class="kpi-value">' + (gl.exposureUsed||0) + ' / ' + (gl.exposureMax||200) + '</div><div class="kpi-sub">USDC nasadené v risku</div></div>');
         const ddCls = kpiSeverityForDrawdown(worstDd);
-        cards.push('<div class="kpi-card ' + ddCls + '"><div class="kpi-label">Drawdown</div><div class="kpi-value">' + ddCore.toFixed(1) + '%</div><div class="kpi-sub">CORE · SANDBOX ' + ddSb.toFixed(1) + '%</div></div>');
+        const coreFinalCls = (ddCls === 'kpi-alert' || ddCls === 'kpi-warn') ? ddCls : coreCls;
+        cards.push('<div class="kpi-card ' + coreFinalCls + '"><div class="kpi-label">CORE</div><div class="kpi-value">' + (core.openCount||0) + '/' + (core.maxPositions||3) + '</div><div class="kpi-sub">' + (core.exposureUsed||0) + ' / ' + (core.exposureMax||140) + ' USDC · DD ' + ddCore.toFixed(1) + '%</div></div>');
+        const sbCls = kpiSeverityForPositions(sb.openCount || 0, sb.maxPositions || 4) || 'kpi-sandbox';
         const lsCls = kpiSeverityForStreak(streak);
-        cards.push('<div class="kpi-card ' + lsCls + '"><div class="kpi-label">Sandbox loss streak</div><div class="kpi-value">' + streak + '</div><div class="kpi-sub">' + (streak >= 3 ? 'sizing ×0.5' : 'limit 3 = sizing penalty') + '</div></div>');
+        const sbFinalCls = (lsCls === 'kpi-alert' || lsCls === 'kpi-warn') ? lsCls : sbCls;
+        cards.push('<div class="kpi-card ' + sbFinalCls + '"><div class="kpi-label">SANDBOX</div><div class="kpi-value">' + (sb.openCount||0) + '/' + (sb.maxPositions||4) + '</div><div class="kpi-sub">' + (sb.exposureUsed||0) + ' / ' + (sb.exposureMax||60) + ' USDC · loss streak ' + streak + (streak>=3?' ⚠':'') + '</div></div>');
+        const expCls = kpiSeverityForExposure(gl.exposureUsed || 0, gl.exposureMax || 200);
+        cards.push('<div class="kpi-card ' + expCls + '"><div class="kpi-label">Global risk</div><div class="kpi-value">' + (gl.exposureUsed||0) + ' / ' + (gl.exposureMax||200) + '</div><div class="kpi-sub">USDC nasadené (max 200)</div></div>');
         bar.innerHTML = cards.join('');
 
         // Guard banners
