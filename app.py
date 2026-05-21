@@ -345,19 +345,27 @@ def categorize_market(question):
 
 def detect_edge_type(question, days_to_end, yes_price):
     """
-    v2.0 Edge Check — detekuje 1 z 3 typov edge:
+    v2.0 Edge Check — detekuje edge typy:
     - text: slovíčkarenie v rules, specific entity required
     - oracle: ambiguous resolution rules s interpretation gap
     - time_decay: tight deadline + procedural inertia + milestone
+    - structural: market s endDate do 90 dní kde čas pracuje proti jednej strane
+    - asymmetric: centovky < 5¢
     Vracia (edge_type, edge_description) alebo (None, reason).
     """
     q = (question or "").lower()
 
     # Pure directional lottery indicators → no edge
     directional_kw = ["up or down", "5 minutes", "hourly", "daily", "minute",
-                      "this week", "today", "winner of", "win eurovision"]
+                      "this week", "today"]
     if any(k in q for k in directional_kw):
         return None, "Smerová lotéria — žiadny edge"
+
+    # Sports directional — "Will X win Y?" bez time/oracle edge
+    # (centovky na šport sú OK cez asymmetric nižšie)
+    sports_directional = ["win the 2026 fifa", "win the world cup", "win the nba",
+                          "win the stanley", "win the super bowl", "wins the"]
+    is_sports_directional = any(k in q for k in sports_directional)
 
     # Oracle edge — wording quirks v rules suggesting interpretation room
     oracle_words = ["good faith", "sole discretion", "official sources only",
@@ -365,28 +373,64 @@ def detect_edge_type(question, days_to_end, yes_price):
     if any(k in q for k in oracle_words):
         return "oracle", "Oracle wording umožňuje interpretačnú diskusiu"
 
-    # Text edge — specific named entity must match exactly (e.g., specific bill number)
-    if re.search(r"h\.?r\.\s*\d+|s\.\s*\d+", q):  # specific bill numbers
+    # Text edge — specific named entity must match exactly
+    if re.search(r"h\.?r\.\s*\d+|s\.\s*\d+", q):
         return "text", "Špecifické bill number — text edge ak Senate prepíše"
+    # Specific named acts/bills
+    if re.search(r"(clarity act|genius act|stable act|save act|defiance act)", q):
+        return "text", "Named legislation — text edge na špecifický zákon"
 
-    # Time decay — tight deadline + milestone language
-    milestone_kw = ["agreement", "deal", "signed", "ceasefire", "summit",
-                    "meeting", "announcement", "vote", "resolution", "treaty",
-                    "deliver", "sign into law"]
+    # ----- TIME DECAY (explicit) -----
+    # Milestone language in question
+    milestone_kw = ["agreement", "deal", "signed", "ceasefire", "summit", "meeting",
+                    "announcement", "vote", "resolution", "treaty", "deliver",
+                    "sign into law", "approve", "pass ", "ratif", "deploy",
+                    "withdraw", "return to normal", "restore", "launch", "IPO",
+                    "resign", "fired", "removed", "appointed", "confirmed"]
     has_milestone = any(k in q for k in milestone_kw)
-    has_deadline = bool(re.search(r"by (january|february|march|april|may|june|july|"
-                                  r"august|september|october|november|december|"
-                                  r"\d|end of)", q))
 
-    if has_milestone and has_deadline and days_to_end is not None and days_to_end <= 90:
-        return "time_decay", f"Milestone + tight deadline ({int(days_to_end)} dní) → procedurálna inertia"
+    # Explicit deadline in text
+    has_text_deadline = bool(re.search(
+        r"by (january|february|march|april|may|june|july|august|september|"
+        r"october|november|december|\d|end of|q[1-4])", q))
+
+    if has_milestone and has_text_deadline and days_to_end is not None and days_to_end <= 120:
+        return "time_decay", f"Milestone + explicit deadline ({int(days_to_end)} dní)"
 
     # Out-by markets (politician/leader out by date)
-    if "out by" in q and days_to_end is not None and days_to_end <= 90:
+    if "out by" in q and days_to_end is not None and days_to_end <= 120:
         return "time_decay", f"Out-by deadline ({int(days_to_end)} dní) → status quo bias"
 
-    # Asymmetric centovka — explicitly recognized as Tier C edge per v2.0 PDF
-    # ("asymetrické centovky < 5¢, experimenty, špecifické hypotézy")
+    # ----- STRUCTURAL TIME DECAY (implicit from endDate) -----
+    # Market má endDate do 90 dní + milestone keyword (aj bez "by Month" v texte)
+    if has_milestone and days_to_end is not None and days_to_end <= 90:
+        return "time_decay", f"Milestone + implicit deadline ({int(days_to_end)} dní od endDate)"
+
+    # Market s krátkym endDate (<=60 dní) + event-driven category
+    # Nie sports directional (to je lotéria), ale geopolitics, politics, crypto — tu čas
+    # pracuje proti YES outcomes (veci sa väčšinou nestihnú)
+    event_categories_kw = ["ceasefire", "iran", "israel", "ukraine", "russia", "china",
+                           "taiwan", "nato", "election", "nomination", "impeach",
+                           "resign", "tariff", "sanction", "ban", "law", "act",
+                           "regulation", "rate cut", "rate hike", "recession",
+                           "diplomatic", "invasion", "annex"]
+    has_event = any(k in q for k in event_categories_kw)
+    if has_event and days_to_end is not None and days_to_end <= 90:
+        return "time_decay", f"Event-driven + {int(days_to_end)} dní deadline → time works against YES"
+
+    # General "by" deadline with endDate
+    if has_text_deadline and days_to_end is not None and days_to_end <= 60:
+        return "time_decay", f"Explicit deadline + {int(days_to_end)} dní do resolution"
+
+    # ----- STRUCTURAL (non-time-decay) -----
+    # Any market with endDate <=45 dní that is NOT a pure sports directional
+    # At this point, short-dated markets have structural theta on NO side
+    if (days_to_end is not None and days_to_end <= 45
+            and not is_sports_directional
+            and isinstance(yes_price, (int, float)) and 0.10 <= yes_price <= 0.90):
+        return "structural", f"Krátky deadline ({int(days_to_end)} dní) → štrukturálna theta pre NO"
+
+    # ----- ASYMMETRIC CENTOVKA -----
     if isinstance(yes_price, (int, float)) and 0.01 <= yes_price <= 0.05:
         return "asymmetric", f"Centovka @ {yes_price:.3f} = max risk 1, asymmetric payoff"
 
@@ -529,12 +573,23 @@ def classify_tier(edge_type, oracle_risk, liquidity, volume24, catalyst_confiden
             "reason": "Text/Oracle edge + strong catalyst + excellent liquidity"
         }
 
-    # Tier B — time-decay or weaker but valid edge
-    if edge_type in ("text", "oracle", "time_decay") and good_liq:
+    # Tier A fallback — time_decay + strong catalyst + excellent liquidity
+    if (edge_type == "time_decay"
+            and catalyst_confidence == "High"
+            and excellent_liq
+            and oracle_risk == "Low"):
+        return {
+            "tier": "A",
+            "stake": APP_CONFIG["tier_a_stake"],
+            "reason": "Time-decay edge + strong catalyst + excellent liquidity"
+        }
+
+    # Tier B — time-decay or structural edge + at least ok liquidity
+    if edge_type in ("text", "oracle", "time_decay", "structural") and ok_liq:
         return {
             "tier": "B",
             "stake": APP_CONFIG["tier_b_stake"],
-            "reason": f"{edge_type} edge + good liquidity"
+            "reason": f"{edge_type} edge + OK liquidity"
         }
 
     return {
@@ -1362,6 +1417,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     .edge-text { background: #e0e7ff; color: #4338ca; }
     .edge-oracle { background: #fce7f3; color: #be185d; }
     .edge-time_decay { background: #ccfbf1; color: #0f766e; }
+    .edge-structural { background: #fef3c7; color: #92400e; }
+    .edge-asymmetric { background: #f3e8ff; color: #7c3aed; }
     .edge-none { background: #f3f4f6; color: #6b7280; }
 
     .check-yes { color: #047857; font-weight: 700; }
