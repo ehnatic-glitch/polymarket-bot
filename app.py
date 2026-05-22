@@ -1082,7 +1082,7 @@ def markets():
     category_filter = request.args.get("category", "").strip()
     wallet = request.args.get("wallet", "").strip()
 
-    raw_markets = fetch_active_markets(limit=1000)
+    raw_markets = fetch_active_markets(limit=500)
 
     # Open clusters from wallet (pre Correlation Check)
     open_clusters = {}
