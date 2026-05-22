@@ -536,7 +536,7 @@ def kill_switch_check(market, edge_type, edge_reason, liquidity, volume24, yes_p
 # ============================================================================
 
 def classify_tier(edge_type, oracle_risk, liquidity, volume24, catalyst_confidence,
-                  yes_price, kill_switch_pass):
+                  yes_price, no_price, side_hint, kill_switch_pass):
     """
     Klasifikuje trh do Tier A / B / C / PASS.
     A (30 USDC): clear text/oracle edge + strong catalyst + excellent liquidity
@@ -549,6 +549,27 @@ def classify_tier(edge_type, oracle_risk, liquidity, volume24, catalyst_confiden
 
     if oracle_risk == "High":
         return {"tier": "PASS", "stake": 0.0, "reason": "High oracle risk"}
+
+    # R/R sanity check — drahé NO má príliš slabý upside vs downside
+    # NO @ 0.80 → R/R 0.25:1 (max zisk 0.20, max strata 0.80)
+    # NO @ 0.90 → R/R 0.11:1 (max zisk 0.10, max strata 0.90)
+    # Hranica 0.80: vyžaduje P(NO win) >= ~83% aby bol expected value pozitívny
+    if (side_hint == "NO" and isinstance(no_price, (int, float)) and no_price >= 0.80
+            and edge_type != "asymmetric"):
+        return {
+            "tier": "PASS",
+            "stake": 0.0,
+            "reason": f"NO @ {no_price:.3f} = R/R {(1 - no_price) / no_price:.2f}:1 — tenké, vyžaduje P>83%"
+        }
+
+    # R/R sanity check pre YES strane — drahé YES bez special edge
+    if (side_hint == "YES" and isinstance(yes_price, (int, float)) and yes_price >= 0.85
+            and edge_type not in ("text", "oracle")):
+        return {
+            "tier": "PASS",
+            "stake": 0.0,
+            "reason": f"YES @ {yes_price:.3f} = tenké R/R bez špecifického edge"
+        }
 
     excellent_liq = liquidity >= 500000 and volume24 >= 100000
     good_liq = liquidity >= 250000 and volume24 >= 50000
@@ -844,23 +865,32 @@ def score_market_v2(market, open_clusters=None):
     ks = kill_switch_check(market, edge_type, edge_reason, liquidity, volume24,
                            yes_price, open_clusters)
 
-    # Pillar 2: Tier
-    tier_info = classify_tier(edge_type, oracle_risk, liquidity, volume24,
-                              catalyst_confidence, yes_price, ks["overall_pass"])
-
-    # Side selection — pre time-decay NO je default, pre centovky YES
-    if tier_info["tier"] == "C":
+    # Side selection FIRST — v2.0 logic with NO bias (~75% Polymarket markets resolve NO)
+    if edge_type == "asymmetric":
         side = "YES"
         entry_price = yes_price
-    elif edge_type == "time_decay":
+    elif edge_type in ("time_decay", "structural"):
+        # NO bias — base rate Polymarket = 75% NO wins
         side = "NO"
         entry_price = no_price
-    elif isinstance(yes_price, (int, float)) and yes_price > 0.6:
+    elif edge_type in ("text", "oracle"):
+        # Pre text/oracle edge: default NO (text edge typicky exploituje slovíčko
+        # ktoré spôsobí NO resolution aj keď udalosť "morálne" prebehla)
+        side = "NO"
+        entry_price = no_price
+    elif isinstance(yes_price, (int, float)) and yes_price > 0.50:
+        # Generic NO bias pre drahé YES
         side = "NO"
         entry_price = no_price
     else:
-        side = "YES"
-        entry_price = yes_price
+        # Fallback
+        side = "NO"
+        entry_price = no_price
+
+    # Pillar 2: Tier (with side hint for R/R check)
+    tier_info = classify_tier(edge_type, oracle_risk, liquidity, volume24,
+                              catalyst_confidence, yes_price, no_price, side,
+                              ks["overall_pass"])
 
     # Pillar 3: Exit Plan
     exit_plan = build_exit_plan(tier_info, side, entry_price, days_to_end)
