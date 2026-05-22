@@ -397,9 +397,9 @@ def detect_edge_type(question, days_to_end, yes_price):
     if has_milestone and has_text_deadline and days_to_end is not None and days_to_end <= 120:
         return "time_decay", f"Milestone + explicit deadline ({int(days_to_end)} dní)"
 
-    # Out-by markets (politician/leader out by date)
-    if "out by" in q and days_to_end is not None and days_to_end <= 120:
-        return "time_decay", f"Out-by deadline ({int(days_to_end)} dní) → status quo bias"
+    # Out-by markets (politician/leader out by/before date)
+    if ("out by" in q or "out before" in q) and days_to_end is not None and days_to_end <= 240:
+        return "time_decay", f"Out-by/before deadline ({int(days_to_end)} dní) → status quo bias"
 
     # ----- STRUCTURAL TIME DECAY (implicit from endDate) -----
     # Market má endDate do 90 dní + milestone keyword (aj bez "by Month" v texte)
