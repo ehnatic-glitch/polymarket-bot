@@ -1082,7 +1082,7 @@ def markets():
     category_filter = request.args.get("category", "").strip()
     wallet = request.args.get("wallet", "").strip()
 
-    raw_markets = fetch_active_markets(limit=250)
+    raw_markets = fetch_active_markets(limit=1000)
 
     # Open clusters from wallet (pre Correlation Check)
     open_clusters = {}
@@ -1092,11 +1092,19 @@ def markets():
         open_clusters = portfolio_summary["clusters_count"]
 
     scored_list = []
+    now = datetime.now(timezone.utc)
     for m in raw_markets:
         if m.get("active") is not True or m.get("closed") is True:
             continue
         if to_float(m.get("liquidity")) < min_liquidity:
             continue
+
+        # Pre-filter: skip markets with >270 days to end (opportunity cost)
+        end = parse_date(m.get("endDate"))
+        if end:
+            days = (end - now).total_seconds() / 86400
+            if days > 270:
+                continue
 
         try:
             scored = score_market_v2(m, open_clusters=open_clusters)
@@ -1542,23 +1550,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       </div>
     </div>
 
-    <!-- PORTFOLIO STATUS -->
-    <div class="card">
-      <h2>Portfolio Status</h2>
-      <div class="portfolio-bar" id="portfolioBar">
-        <div class="stat"><div class="stat-label">Bankroll</div><div class="stat-value">500</div><div class="stat-sub">USDC</div></div>
-        <div class="stat"><div class="stat-label">Otvorené pozície</div><div class="stat-value" id="posCount">— / 7</div><div class="stat-sub">CORE 3 + SANDBOX 4</div></div>
-        <div class="stat"><div class="stat-label">Expozícia</div><div class="stat-value" id="exposureVal">— / 200</div><div class="stat-sub">USDC</div></div>
-        <div class="stat"><div class="stat-label">Voľný kapitál</div><div class="stat-value" id="freeCapital">—</div><div class="stat-sub">USDC</div></div>
-      </div>
-
-      <div class="wallet-row">
-        <input id="walletInput" placeholder="Vlož svoju Polymarket proxy wallet (0x...) pre live portfolio monitoring" />
-        <button onclick="setWallet()">Aktivovať</button>
-      </div>
-
-      <div id="positionsList"></div>
-    </div>
+    
 
     <!-- FILTERS -->
     <div class="card">
@@ -1656,7 +1648,6 @@ document.addEventListener('DOMContentLoaded', () => {
 async function loadAll() {
   document.getElementById('lastUpdate').textContent = 'Načítavam...';
   await Promise.all([
-    loadPortfolio(),
     loadMarkets(),
     loadLeaderboard(),
   ]);
@@ -1672,64 +1663,6 @@ function setWallet() {
 // ============================================================================
 // Portfolio
 // ============================================================================
-async function loadPortfolio() {
-  try {
-    const url = '/portfolio-status' + (walletAddr ? '?wallet=' + encodeURIComponent(walletAddr) : '');
-    const r = await fetch(url);
-    const data = await r.json();
-    cachedPortfolio = data;
-    renderPortfolio(data);
-  } catch (err) {
-    console.error('Portfolio load failed:', err);
-  }
-}
-
-function renderPortfolio(data) {
-  const cur = data.current || {};
-  const limits = data.limits || {};
-  const comp = data.compliance || {};
-
-  document.getElementById('posCount').textContent = (cur.position_count || 0) + ' / ' + (limits.max_active_positions || 7);
-  document.getElementById('exposureVal').textContent = Math.round(cur.total_exposure_usdc || 0) + ' / ' + (limits.max_total_exposure_usdc || 200);
-  document.getElementById('freeCapital').textContent = Math.round(cur.available_exposure_usdc || 200);
-
-  // Color states
-  const posStat = document.getElementById('posCount').closest('.stat');
-  const expStat = document.getElementById('exposureVal').closest('.stat');
-  const freeStat = document.getElementById('freeCapital').closest('.stat');
-  posStat.className = 'stat ' + (cur.position_count >= limits.max_active_positions ? 'alert' :
-                                  cur.position_count >= limits.max_active_positions - 1 ? 'warn' : 'ok');
-  expStat.className = 'stat ' + (cur.total_exposure_usdc >= limits.max_total_exposure_usdc ? 'alert' :
-                                  cur.total_exposure_usdc >= limits.max_total_exposure_usdc * 0.75 ? 'warn' : 'ok');
-  freeStat.className = 'stat ' + (cur.available_exposure_usdc < 30 ? 'alert' : 'ok');
-
-  // Positions list
-  const posBox = document.getElementById('positionsList');
-  if (!data.positions || data.positions.length === 0) {
-    posBox.innerHTML = data.note ? '<p class="small muted" style="margin-top:10px;">' + data.note + '</p>' :
-                                   '<p class="small muted" style="margin-top:10px;">Žiadne otvorené pozície.</p>';
-    return;
-  }
-
-  let html = '<table class="pos-table"><thead><tr>' +
-             '<th>Trh</th><th>Strana</th><th>Shares</th><th>Hodnota</th><th>Avg cena</th><th>PnL</th><th>Klaster</th>' +
-             '</tr></thead><tbody>';
-  data.positions.forEach(p => {
-    const pnl = p.cashPnl || 0;
-    const pnlClass = pnl >= 0 ? 'check-yes' : 'check-no';
-    html += '<tr>' +
-            '<td>' + escapeHtml(p.title || '').substring(0, 60) + '</td>' +
-            '<td>' + escapeHtml(p.outcome || '') + '</td>' +
-            '<td>' + fmtNum(p.size, 1) + '</td>' +
-            '<td>' + fmtNum(p.value, 2) + ' USDC</td>' +
-            '<td>' + fmtNum(p.avgPrice, 3) + '</td>' +
-            '<td class="' + pnlClass + '">' + (pnl >= 0 ? '+' : '') + fmtNum(pnl, 2) + '</td>' +
-            '<td class="small muted">' + escapeHtml(p.cluster || '') + '</td>' +
-            '</tr>';
-  });
-  html += '</tbody></table>';
-  posBox.innerHTML = html;
-}
 
 // ============================================================================
 // Candidates
