@@ -40,8 +40,8 @@ APP_CONFIG = {
     "tier_c_stake_default": 8.0,  # pre centovky < 5¢
 
     # Scanning defaults
-    "default_min_liquidity": 100000.0,
-    "default_min_volume24": 25000.0,
+    "default_min_liquidity": 75000.0,
+    "default_min_volume24": 15000.0,
 
     # Whale detection
     "whale_trade_min_notional": 200000.0,
@@ -536,16 +536,17 @@ def kill_switch_check(market, edge_type, edge_reason, liquidity, volume24, yes_p
 # ============================================================================
 
 def classify_tier(edge_type, oracle_risk, liquidity, volume24, catalyst_confidence,
-                  yes_price, no_price, side_hint, kill_switch_pass):
+                  yes_price, no_price, side_hint, kill_switch_pass,
+                  category=None, days_to_end=None):
     """
     Klasifikuje trh do Tier A / B / C / PASS.
-    A (30 USDC): clear text/oracle edge + strong catalyst + excellent liquidity
-    B (15 USDC): time-decay setups, decent liquidity
-    C (max 10 USDC): asymetrické centovky < 5¢
-    PASS: nič z toho
     """
     if not kill_switch_pass:
         return {"tier": "PASS", "stake": 0.0, "reason": "Kill-Switch fail"}
+
+    # HARD BLOCK: Šport — smerová lotéria
+    if category == "Sports":
+        return {"tier": "PASS", "stake": 0.0, "reason": "Sport = smerová lotéria, 1/N tímov"}
 
     if oracle_risk == "High":
         return {"tier": "PASS", "stake": 0.0, "reason": "High oracle risk"}
@@ -573,10 +574,13 @@ def classify_tier(edge_type, oracle_risk, liquidity, volume24, catalyst_confiden
 
     excellent_liq = liquidity >= 500000 and volume24 >= 100000
     good_liq = liquidity >= 250000 and volume24 >= 50000
-    ok_liq = liquidity >= 100000 and volume24 >= 25000
+    ok_liq = liquidity >= 75000 and volume24 >= 15000
 
-    # Tier C — Asymmetric centovka (< 5¢) — explicit v2.0 SANDBOX bucket
+    # Tier C — Asymmetric centovka (< 5¢), MAX 270 dní
     if edge_type == "asymmetric" and ok_liq:
+        if days_to_end is not None and days_to_end > 270:
+            return {"tier": "PASS", "stake": 0.0,
+                    "reason": f"Asymmetric @ {yes_price:.3f}, ale {int(days_to_end)} dní = opportunity cost"}
         return {
             "tier": "C",
             "stake": APP_CONFIG["tier_c_stake_default"],
@@ -890,7 +894,8 @@ def score_market_v2(market, open_clusters=None):
     # Pillar 2: Tier (with side hint for R/R check)
     tier_info = classify_tier(edge_type, oracle_risk, liquidity, volume24,
                               catalyst_confidence, yes_price, no_price, side,
-                              ks["overall_pass"])
+                              ks["overall_pass"],
+                              category=category, days_to_end=days_to_end)
 
     # Pillar 3: Exit Plan
     exit_plan = build_exit_plan(tier_info, side, entry_price, days_to_end)
@@ -1105,13 +1110,15 @@ def markets():
 
         scored_list.append(scored)
 
-    # Sort: Tier A first, B, C, then PASS. Within tier by liquidity desc.
+    # Sort: Tier A first, B, C, then PASS. Geopolitics+Politics priority.
     tier_order = {"A": 0, "B": 1, "C": 2, "PASS": 3}
+    category_priority = {"Geopolitics": 0, "Politics": 0, "Crypto": 1,
+                         "Other": 2, "Narrative": 3, "Sports": 9}
     scored_list.sort(key=lambda x: (
         tier_order.get(x["tier"], 99),
+        category_priority.get(x.get("category", "Other"), 5),
         -to_float(x["liquidity"]),
     ))
-
     return jsonify({
         "count": len(scored_list[:limit]),
         "markets": scored_list[:limit],
@@ -1571,10 +1578,12 @@ DASHBOARD_HTML = r"""<!doctype html>
         <div class="filter">
           <label>Min likvidita</label>
           <select id="minLiquidity">
-            <option value="50000">50 000</option>
-            <option value="100000" selected>100 000</option>
-            <option value="250000">250 000</option>
-            <option value="500000">500 000</option>
+            <option value="50000">50 000 (tenké)</option>
+            <option value="75000" selected>75 000 (default)</option>
+            <option value="100000">100 000 (safe)</option>
+            <option value="150000">150 000 (prísne)</option>
+            <option value="250000">250 000 (Tier A)</option>
+            <option value="500000">500 000 (excellent)</option>
           </select>
         </div>
         <div class="filter">
