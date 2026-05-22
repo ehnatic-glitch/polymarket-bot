@@ -1099,6 +1099,10 @@ def markets():
         if to_float(m.get("liquidity")) < min_liquidity:
             continue
 
+        # Pre-filter: skip Sports (vždy PASS = strata času)
+        if categorize_market(m.get("question", "")) == "Sports":
+            continue
+
         # Pre-filter: skip markets with >270 days to end (opportunity cost)
         end = parse_date(m.get("endDate"))
         if end:
