@@ -1641,7 +1641,6 @@ let lastCheckResult = null;
 // Boot
 // ============================================================================
 document.addEventListener('DOMContentLoaded', () => {
-  document.getElementById('walletInput').value = walletAddr;
   loadAll();
 });
 
