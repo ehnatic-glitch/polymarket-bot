@@ -551,7 +551,7 @@ def information_edge_test(question):
     generic_commodity = [
         "crude oil", "oil price", "wti", "brent", "natural gas",
         "gasoline price", "gold price", "silver price", "copper price",
-     ]  
+    ]  
     if any(s in q for s in generic_macro):
         return {"forcePass": True,
                 "reason": ("PROTOKOL 3: Generic macro print (CPI/GDP/Fed/jobs) — "
@@ -561,7 +561,7 @@ def information_edge_test(question):
                 "reason": ("PROTOKOL 3: Smerová crypto cenová stávka — lotéria bez "
                            "info edge (framework: IMMEDIATE PASS). AUTO PASS.")}
      if any(s in q for s in generic_commodity):
-        return {"forcePass": True, "reason": "PROTOKOL 3 / Pilier 1: Smerova komoditna cena (ropa/plyn/zlato) - loteria, framework: IMMEDIATE PASS. AUTO PASS."}
+         return {"forcePass": True, "reason": "PROTOKOL 3 / Pilier 1: Smerova komoditna cena (ropa/plyn/zlato) - loteria, framework: IMMEDIATE PASS. AUTO PASS."}
     return {"forcePass": False, "reason": "PROTOKOL 3: Nie je generic sentiment - edge test pokracuje."}
 def detect_catalyst(question, days_to_end):
     q = (question or "").lower()
