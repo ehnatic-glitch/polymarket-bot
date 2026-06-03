@@ -39,8 +39,8 @@ APP_CONFIG = {
     "tier_c_stake_default": 8.0,  # pre centovky < 5¢
 
     # Scanning defaults
-    "default_min_liquidity": 75000.0,
-    "default_min_volume24": 15000.0,
+    "default_min_liquidity": 50000.0,
+    "default_min_volume24": 10000.0,
 
     # Whale detection
     "whale_trade_min_notional": 200000.0,
@@ -1704,8 +1704,8 @@ DASHBOARD_HTML = r"""<!doctype html>
         <div class="filter">
           <label>Min likvidita</label>
           <select id="minLiquidity">
-            <option value="50000">50 000 (tenké)</option>
-            <option value="75000" selected>75 000 (default)</option>
+            <option value="25000">50 000 (tenké)</option>
+            <option value="50000" selected>75 000 (default)</option>
             <option value="100000">100 000 (safe)</option>
             <option value="150000">150 000 (prísne)</option>
             <option value="250000">250 000 (Tier A)</option>
