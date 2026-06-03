@@ -560,7 +560,7 @@ def information_edge_test(question):
         return {"forcePass": True,
                 "reason": ("PROTOKOL 3: Smerová crypto cenová stávka — lotéria bez "
                            "info edge (framework: IMMEDIATE PASS). AUTO PASS.")}
-        if any(s in q for s in generic_commodity):
+     if any(s in q for s in generic_commodity):
         return {"forcePass": True,
                 "reason": ("PROTOKOL 3 / Pilier 1: Smerová komoditná cena (ropa/plyn/zlato) — "
                            "lotéria, framework menuje 'oil price' ako IMMEDIATE PASS. AUTO PASS.")}
