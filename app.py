@@ -548,7 +548,7 @@ def information_edge_test(question):
         "bitcoin price", "btc price", "ethereum price", "eth price",
         "will btc reach", "will bitcoin hit", "will eth", "will btc hit",
         "crude oil", "oil price", "wti", "brent", "natural gas",
-    ]    ]
+    ]    
     generic_commodity = [
         "crude oil", "oil price", "wti", "brent", "natural gas",
         "gasoline price", "gold price", "silver price", "copper price",
