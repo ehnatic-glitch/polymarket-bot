@@ -687,7 +687,7 @@ def classify_tier(edge_type, oracle_risk, liquidity, volume24, catalyst_confiden
 
     excellent_liq = liquidity >= 500000 and volume24 >= 100000
     good_liq = liquidity >= 250000 and volume24 >= 50000
-    ok_liq = liquidity >= 75000 and volume24 >= 15000
+    ok_liq = liquidity >= 50000 and volume24 >= 10000
 
     # Tier C — Asymmetric centovka (< 5¢), MAX 270 dní
     if edge_type == "asymmetric" and ok_liq:
