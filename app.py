@@ -561,13 +561,8 @@ def information_edge_test(question):
                 "reason": ("PROTOKOL 3: Smerová crypto cenová stávka — lotéria bez "
                            "info edge (framework: IMMEDIATE PASS). AUTO PASS.")}
      if any(s in q for s in generic_commodity):
-        return {"forcePass": True,
-                "reason": ("PROTOKOL 3 / Pilier 1: Smerová komoditná cena (ropa/plyn/zlato) — "
-                           "lotéria, framework menuje 'oil price' ako IMMEDIATE PASS. AUTO PASS.")}
-        return {"forcePass": False,
-            "reason": "PROTOKOL 3: Nie je generic sentiment — edge test pokračuje."}
-
-
+        return {"forcePass": True, "reason": "PROTOKOL 3 / Pilier 1: Smerova komoditna cena (ropa/plyn/zlato) - loteria, framework: IMMEDIATE PASS. AUTO PASS."}
+    return {"forcePass": False, "reason": "PROTOKOL 3: Nie je generic sentiment - edge test pokracuje."}
 def detect_catalyst(question, days_to_end):
     q = (question or "").lower()
     if any(k in q for k in ["vote", "voting", "election", "runoff"]):
