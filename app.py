@@ -174,18 +174,45 @@ def get_yes_no_prices(market):
     return yes_price, no_price
 
 
-def fetch_active_markets(limit=250):
-    """Fetch active markets from gamma-api."""
-    try:
-        r = requests.get(
-            f"{GAMMA_BASE}/markets",
-            params={"limit": limit, "active": "true", "closed": "false"},
-            timeout=20,
-        )
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return []
+def fetch_active_markets(limit=800):
+    """Fetch active markets z gamma-api — STRANKOVANE + zoradene podla likvidity."""
+    collected = []
+    page_size = 100          # Gamma strop na stranku
+    max_pages = 15           # ~1500 trhov; /markets rate limit = 300/10s
+    liq_floor = 500.0        # pod touto likviditou dalsie stranky nemaju zmysel
+    offset = 0
+    for _ in range(max_pages):
+        try:
+            r = requests.get(
+                f"{GAMMA_BASE}/markets",
+                params={
+                    "limit": page_size,
+                    "offset": offset,
+                    "active": "true",
+                    "closed": "false",
+                    "order": "liquidity",
+                    "ascending": "false",
+                },
+                timeout=20,
+            )
+            r.raise_for_status()
+            batch = r.json()
+        except Exception:
+            break
+        if not isinstance(batch, list) or not batch:
+            break
+        collected.extend(batch)
+        offset += page_size
+        if len(batch) < page_size:
+            break
+        try:
+            if to_float(batch[-1].get("liquidity")) < liq_floor:
+                break
+        except Exception:
+            pass
+        if limit and len(collected) >= limit:
+            break
+    return collected
 
 
 def fetch_market_by_slug(slug):
@@ -1147,7 +1174,7 @@ def markets():
     category_filter = request.args.get("category", "").strip()
     wallet = request.args.get("wallet", "").strip()
 
-    raw_markets = fetch_active_markets(limit=500)
+    raw_markets = fetch_active_markets(limit=800)
 
     # Open clusters from wallet (pre Correlation Check)
     open_clusters = {}
@@ -1185,6 +1212,8 @@ def markets():
         if category_filter and scored["category"] != category_filter:
             continue
 
+        if to_float(scored.get("daysToEnd")) < 0:
+            continue
         scored_list.append(scored)
 
     # Sort: Tier A first, B, C, then PASS. Geopolitics+Politics priority.
