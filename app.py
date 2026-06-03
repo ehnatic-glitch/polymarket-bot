@@ -347,7 +347,35 @@ def normalize_trade(item):
 # ============================================================================
 # CATEGORIZATION & EDGE DETECTION
 # ============================================================================
-
+def is_sports_market(question, slug=None):
+    """Robustná detekcia športu — zápasové formáty, skóre, turnaje, esport.
+    Šport = hard block (framework), radšej over-block ako pustiť trade.
+    """
+    q = (question or "").lower()
+    s = (slug or "").lower()
+    sport_slug_prefixes = (
+        "wta-", "atp-", "fif-", "nba-", "nfl-", "mlb-", "nhl-", "epl-",
+        "ucl-", "uefa-", "lal-", "bun-", "ser-", "lig-", "mls-", "ufc-",
+        "box-", "f1-", "nas-", "mma-", "ncaa", "iem-", "esl-", "blast-",
+        "cs2-", "csgo-", "lol-", "dota-", "val-",
+    )
+    if s.startswith(sport_slug_prefixes):
+        return True
+    if any(tok in s for tok in ("-total-", "-spread-", "-o-u-", "-ml-", "-pt5")):
+        return True
+    if "o/u" in q or "over/under" in q:
+        return True
+    if re.search(r"\bvs\.?\b", q) and re.search(
+            r"\b(o/u|total|spread|win|beat|defeat|score|goals|points)\b", q):
+        return True
+    if re.search(r"win on \d{4}-\d{2}-\d{2}", q):
+        return True
+    esports_kw = ["iem ", "esl pro", "blast premier", "the international",
+                  "worlds 2026", "major 2026", "valorant", "counter-strike"]
+    if any(k in q for k in esports_kw):
+        return True
+    return False
+    
 def categorize_market(question):
     q = (question or "").lower()
     sports_kw = ["world cup", "nba finals", "nfl", "mlb", "stanley cup", "champions league",
@@ -520,6 +548,10 @@ def information_edge_test(question):
         "bitcoin price", "btc price", "ethereum price", "eth price",
         "will btc reach", "will bitcoin hit", "will eth", "will btc hit",
     ]
+    generic_commodity = [
+        "crude oil", "oil price", "wti", "brent", "natural gas",
+        "gasoline price", "gold price", "silver price", "copper price",
+     ]  
     if any(s in q for s in generic_macro):
         return {"forcePass": True,
                 "reason": ("PROTOKOL 3: Generic macro print (CPI/GDP/Fed/jobs) — "
@@ -528,7 +560,11 @@ def information_edge_test(question):
         return {"forcePass": True,
                 "reason": ("PROTOKOL 3: Smerová crypto cenová stávka — lotéria bez "
                            "info edge (framework: IMMEDIATE PASS). AUTO PASS.")}
-    return {"forcePass": False,
+        if any(s in q for s in generic_commodity):
+        return {"forcePass": True,
+                "reason": ("PROTOKOL 3 / Pilier 1: Smerová komoditná cena (ropa/plyn/zlato) — "
+                           "lotéria, framework menuje 'oil price' ako IMMEDIATE PASS. AUTO PASS.")}
+        return {"forcePass": False,
             "reason": "PROTOKOL 3: Nie je generic sentiment — edge test pokračuje."}
 
 
@@ -943,6 +979,8 @@ def score_market_v2(market, open_clusters=None):
         days_to_end = (end_date - now).total_seconds() / 86400
 
     category = categorize_market(raw_question)
+    if is_sports_market(raw_question, market.get("slug")):
+        category = "Sports"
     edge_type, edge_reason = detect_edge_type(raw_question, days_to_end, yes_price)
     oracle_risk = oracle_risk_level(raw_question)
     catalyst_type, catalyst_confidence = detect_catalyst(raw_question, days_to_end)
