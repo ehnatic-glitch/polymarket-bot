@@ -21,8 +21,7 @@ app = Flask(__name__)
 # ============================================================================
 
 APP_CONFIG = {
-    "version": "v2.0 Lean",
-    "title": "Polymarket Sniper v2.0",
+    "version": "v2.0 Lean + 3 protokoly",
 
     # Bankroll (v2.0 fixne)
     "bankroll_usdc": 500.0,
@@ -355,6 +354,11 @@ def detect_edge_type(question, days_to_end, yes_price):
     """
     q = (question or "").lower()
 
+    # PROTOKOL 3 — Information Edge Test (generic macro/crypto sentiment = PASS)
+    p3 = information_edge_test(question)
+    if p3.get("forcePass"):
+        return None, p3["reason"]
+
     # Pure directional lottery indicators → no edge
     directional_kw = ["up or down", "5 minutes", "hourly", "daily", "minute",
                       "this week", "today"]
@@ -447,6 +451,58 @@ def oracle_risk_level(question):
     if any(k in q for k in high_kw): return "High"
     if any(k in q for k in medium_kw): return "Medium"
     return "Low"
+
+
+# ============================================================================
+# COGNITIVE-BIAS PROTOKOLY (COGNITIVE_BIAS guardrails PDF)
+# ============================================================================
+
+def flag_unverified_sources(description, resolution_source):
+    """PROTOKOL 1 — Zero-Tolerance Verification.
+    Ak description/resolutionSource obsahuje 'soft' tvrdenia (smart money,
+    on-chain analysis, reportedly...) bez primárneho zdroja → flag = NOISE.
+    """
+    combined = f"{description or ''} {resolution_source or ''}".lower()
+    unverified = [
+        "smart money", "whale flow", "on-chain analysis", "analysts say",
+        "sources say", "reportedly", "rumored", "insider", "leaked",
+        "according to reports", "market sentiment", "social sentiment",
+    ]
+    hits = [s for s in unverified if s in combined]
+    if hits:
+        return {
+            "flagged": True,
+            "signals": hits,
+            "note": (f"PROTOKOL 1: Neoverené signály ({', '.join(hits)}). "
+                     f"Vyžaduj primárny zdroj s timestampom, inak TREAT AS NOISE."),
+        }
+    return {"flagged": False, "signals": [], "note": "PROTOKOL 1: Žiadne neoverené signály."}
+
+
+def information_edge_test(question):
+    """PROTOKOL 3 — Information Edge Test.
+    Generic macro print alebo smerová crypto cena → AUTO PASS
+    (žiadny informačný edge nad konsenzom profíkov).
+    """
+    q = (question or "").lower()
+    generic_macro = [
+        "inflation", "cpi", "gdp", "unemployment", "fed rate", "interest rate",
+        "recession", "jobs report", "core cpi", "rate cut", "rate hike",
+    ]
+    generic_crypto = [
+        "bitcoin price", "btc price", "ethereum price", "eth price",
+        "will btc reach", "will bitcoin hit", "will eth", "will btc hit",
+    ]
+    if any(s in q for s in generic_macro):
+        return {"forcePass": True,
+                "reason": ("PROTOKOL 3: Generic macro print (CPI/GDP/Fed/jobs) — "
+                           "profíci oceňujú konsenzom, žiadny info edge. AUTO PASS.")}
+    if any(s in q for s in generic_crypto):
+        return {"forcePass": True,
+                "reason": ("PROTOKOL 3: Smerová crypto cenová stávka — lotéria bez "
+                           "info edge (framework: IMMEDIATE PASS). AUTO PASS.")}
+    return {"forcePass": False,
+            "reason": "PROTOKOL 3: Nie je generic sentiment — edge test pokračuje."}
 
 
 def detect_catalyst(question, days_to_end):
@@ -865,6 +921,12 @@ def score_market_v2(market, open_clusters=None):
     catalyst_type, catalyst_confidence = detect_catalyst(raw_question, days_to_end)
     cluster = detect_cluster(raw_question, category)
 
+    # PROTOKOL 1 — over neoverené zdroje v description / resolutionSource
+    protocol1 = flag_unverified_sources(
+        market.get("description"),
+        market.get("resolutionSource") or market.get("resolution_source"),
+    )
+
     # Pillar 1: Kill-Switch
     ks = kill_switch_check(market, edge_type, edge_reason, liquidity, volume24,
                            yes_price, open_clusters)
@@ -921,6 +983,9 @@ def score_market_v2(market, open_clusters=None):
 
         # Pillar 1
         "killSwitch": ks,
+
+        # Protokol 1 — verifikácia zdrojov
+        "protocol1": protocol1,
 
         # Pillar 2
         "tier": tier_info["tier"],
@@ -1326,6 +1391,10 @@ def portfolio_status():
         },
         "positions": portfolio["positions"],
         "clusters_count": portfolio["clusters_count"],
+        "protocol2": ("PROTOKOL 2 (No Retrospective Justification): Drž pozíciu LEN ak "
+                      "pôvodná téza žije. Binárka: objavili sa TVRDÉ, overené fakty čo "
+                      "VYVRACAJÚ tézu? ÁNO → predaj na stratu. NIE → drž podľa plánu. "
+                      "NEHĽADAJ nové komfortné dôkazy na ospravedlnenie straty."),
     })
 
 
