@@ -1260,6 +1260,7 @@ def markets():
     ))
     return jsonify({
         "count": len(scored_list[:limit]),
+        "fetchedAt": datetime.now(timezone.utc).isoformat(),
         "markets": scored_list[:limit],
         "portfolio": portfolio_summary,
         "filters": {
@@ -1768,6 +1769,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 // ============================================================================
 let walletAddr = localStorage.getItem('polywallet') || '';
 let cachedMarkets = [];
+let lastFetchedAt = null;
 let cachedPortfolio = null;
 let selectedMarket = null;
 let lastCheckResult = null;
@@ -1817,6 +1819,7 @@ async function loadMarkets() {
     const r = await fetch(url);
     const data = await r.json();
     cachedMarkets = data.markets || [];
+    lastFetchedAt = data.fetchedAt || null;
     renderCandidates(cachedMarkets);
     renderWatchlist(cachedMarkets);
   } catch (err) {
@@ -1834,12 +1837,19 @@ function renderCandidates(markets) {
 
   let html = '<table class="cand-table"><thead><tr>' +
              '<th>Tier</th><th>Edge</th><th>Otázka</th><th>YES</th><th>NO</th>' +
-             '<th>Dni</th><th>Vol 24h</th><th>Likvidita</th><th>Oracle</th>' +
+             '<th>Dni</th><th>Vol 24h</th><th>Likvidita</th><th>Oracle</th><th>Vek</th>' +
              '</tr></thead><tbody>';
   markets.forEach((m, idx) => {
     const tierCls = 'tier-' + m.tier;
     const edgeCls = m.edgeType ? 'edge-' + m.edgeType : 'edge-none';
     const edgeText = m.edgeType || '—';
+    const ageSec = lastFetchedAt ? Math.max(0, (Date.now() - new Date(lastFetchedAt).getTime()) / 1000) : null;
+    let ageText = '—', ageClass = 'muted';
+    if (ageSec !== null) {
+      if (ageSec < 60) { ageText = 'pred ' + Math.round(ageSec) + ' s'; ageClass = 'check-yes'; }
+      else if (ageSec < 600) { ageText = 'pred ' + Math.round(ageSec / 60) + ' min'; ageClass = ''; }
+      else { ageText = 'pred ' + Math.round(ageSec / 60) + ' min ⚠'; ageClass = 'check-no'; }
+    }
     html += '<tr class="clickable" onclick="selectMarket(' + idx + ')">' +
             '<td><span class="badge ' + tierCls + '">' + m.tier + '</span></td>' +
             '<td><span class="badge ' + edgeCls + '">' + edgeText + '</span></td>' +
@@ -1851,6 +1861,7 @@ function renderCandidates(markets) {
             '<td>' + Math.round(m.liquidity || 0).toLocaleString('sk-SK') + '</td>' +
             '<td class="' + (m.oracleRisk === 'High' ? 'check-no' : m.oracleRisk === 'Medium' ? '' : 'check-yes') + '">' +
               m.oracleRisk + '</td>' +
+            '<td class="small ' + ageClass + '">' + ageText + '</td>' +
             '</tr>';
   });
   html += '</tbody></table>';
