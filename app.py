@@ -547,7 +547,8 @@ def information_edge_test(question):
     generic_crypto = [
         "bitcoin price", "btc price", "ethereum price", "eth price",
         "will btc reach", "will bitcoin hit", "will eth", "will btc hit",
-    ]
+        "crude oil", "oil price", "wti", "brent", "natural gas",
+    ]    ]
     generic_commodity = [
         "crude oil", "oil price", "wti", "brent", "natural gas",
         "gasoline price", "gold price", "silver price", "copper price",
@@ -560,9 +561,7 @@ def information_edge_test(question):
         return {"forcePass": True,
                 "reason": ("PROTOKOL 3: Smerová crypto cenová stávka — lotéria bez "
                            "info edge (framework: IMMEDIATE PASS). AUTO PASS.")}
-     if any(s in q for s in generic_commodity):
-         return {"forcePass": True, "reason": "PROTOKOL 3 / Pilier 1: Smerova komoditna cena (ropa/plyn/zlato) - loteria, framework: IMMEDIATE PASS. AUTO PASS."}
-    return {"forcePass": False, "reason": "PROTOKOL 3: Nie je generic sentiment - edge test pokracuje."}
+    return {"forcePass": False, "reason": "PROTOKOL 3: Nie je generic sentiment — edge test pokračuje."}
 def detect_catalyst(question, days_to_end):
     q = (question or "").lower()
     if any(k in q for k in ["vote", "voting", "election", "runoff"]):
