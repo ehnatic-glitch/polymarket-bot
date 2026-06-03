@@ -22,6 +22,7 @@ app = Flask(__name__)
 
 APP_CONFIG = {
     "version": "v2.0 Lean + 3 protokoly",
+    "title": "Polymarket Sniper v2.0",
 
     # Bankroll (v2.0 fixne)
     "bankroll_usdc": 500.0,
