@@ -1746,14 +1746,6 @@ DASHBOARD_HTML = r"""<!doctype html>
         <h3>📈 Watchlist (Tier A/B kandidáti)</h3>
         <div id="watchlistBox" class="compact-list"><div class="muted small">Načítavam...</div></div>
       </div>
-      <div class="card side-panel">
-        <h3>🐋 Whale flow (vybraný market)</h3>
-        <div id="whaleBox" class="compact-list"><div class="muted small">Klikni na market v tabuľke</div></div>
-      </div>
-      <div class="card side-panel">
-        <h3>🏆 Leaderboard</h3>
-        <div id="leaderboardBox" class="compact-list"><div class="muted small">Načítavam...</div></div>
-      </div>
     </div>
 
     <!-- ALERTS -->
@@ -1784,8 +1776,8 @@ document.addEventListener('DOMContentLoaded', () => {
 async function loadAll() {
   document.getElementById('lastUpdate').textContent = 'Načítavam...';
   await Promise.all([
+    loadPortfolio(),
     loadMarkets(),
-    loadLeaderboard(),
   ]);
   document.getElementById('lastUpdate').textContent = 'Aktualizované ' + new Date().toLocaleTimeString('sk-SK');
 }
@@ -1903,7 +1895,6 @@ function selectMarket(idx) {
     '<div class="loading"><div class="spin"></div> Analyzujem + volám pre-trade-check...</div>';
 
   renderDetail(selectedMarket);
-  loadWhaleFlow(selectedMarket.slug);
   autoPreTradeCheck(selectedMarket);
 
   panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
