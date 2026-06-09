@@ -1776,7 +1776,6 @@ document.addEventListener('DOMContentLoaded', () => {
 async function loadAll() {
   document.getElementById('lastUpdate').textContent = 'Načítavam...';
   await Promise.all([
-    loadPortfolio(),
     loadMarkets(),
   ]);
   document.getElementById('lastUpdate').textContent = 'Aktualizované ' + new Date().toLocaleTimeString('sk-SK');
