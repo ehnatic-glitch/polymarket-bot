@@ -1032,6 +1032,7 @@ def score_market_v2(market, open_clusters=None):
         # Market basics
         "question": raw_question,
         "slug": market.get("slug"),
+        "description": (market.get("description") or "")[:1500],
         "yesPrice": yes_price,
         "noPrice": no_price,
         "liquidity": liquidity,
@@ -1909,7 +1910,12 @@ function renderDetail(m) {
   const ep = m.exitPlan || {};
   const da = m.devilsAdvocate || {};
 
-  let html = '<div class="detail-grid">';
+  let html = '';
+  if (m.description) {
+    html += '<div class="detail-section" style="margin-bottom:12px;"><h4>📰 Kontext trhu</h4>' +
+            '<div style="font-size:13px;white-space:pre-wrap;">' + escapeHtml(m.description) + '</div></div>';
+  }
+  html += '<div class="detail-grid">';
 
   // Kill-Switch
   html += '<div class="detail-section"><h4>🔒 Pillar 1: Kill-Switch</h4>';
